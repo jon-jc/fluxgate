@@ -1,0 +1,154 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A force-push or a rapid follow-up commit should cancel the run it supersedes
+# rather than queue behind it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `git describe` can resolve a version for ldflags.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          # Checking the whole tree rather than naming go.sum explicitly: the
+          # file does not exist until the first dependency lands, and `git diff`
+          # on a missing path is a fatal error rather than a clean result.
+          if ! git diff --quiet; then
+            echo "::error::go.mod/go.sum are not tidy; run 'make tidy' and commit the result"
+            git diff --stat
+            exit 1
+          fi
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: make build
+
+      # The race detector needs cgo, which is why this runs on Linux rather
+      # than in the developer's Windows shell.
+      - name: Test (race)
+        run: go test -race -count=1 -covermode=atomic -coverprofile=coverage.out -timeout 10m ./...
+
+      - name: Coverage summary
+        run: |
+          go tool cover -func=coverage.out | tail -n 25
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')
+          echo "### Coverage: ${total}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+          args: --timeout=5m
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  docker:
+    name: Container image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only: publishing happens from the deployment workflow, not from
+      # every pull request.
+      - name: Build ingest-api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile
+          build-args: |
+            SERVICE=ingest-api
+          push: false
+          load: true
+          tags: fluxgate/ingest-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        run: |
+          docker run -d --name fluxgate -p 8080:8080 \
+            -e ENVIRONMENT=dev fluxgate/ingest-api:ci
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "container is live"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::container never became live"
+              docker logs fluxgate
+              exit 1
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://localhost:8080/readyz | tee /dev/stderr | grep -q '"ok"'
+          curl -fsS http://localhost:8080/v1/version | tee /dev/stderr | grep -q '"version"'
+          docker rm -f fluxgate
