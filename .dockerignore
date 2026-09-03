@@ -1,0 +1,12 @@
+.git
+.github
+.gitignore
+.dockerignore
+bin/
+dist/
+docs/
+deploy/
+*.md
+!README.md
+coverage.out
+coverage.html

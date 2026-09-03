@@ -1,0 +1,19 @@
+# Normalise line endings on checkout so a Windows workstation and a Linux
+# container agree byte-for-byte. Shell scripts and Dockerfiles with CRLF
+# endings fail at runtime with errors that point nowhere useful.
+* text=auto eol=lf
+
+*.go     text eol=lf diff=golang
+*.mod    text eol=lf
+*.sum    text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.sh     text eol=lf
+*.sql    text eol=lf
+*.tf     text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+
+# Generated files are excluded from diffs and language statistics.
+*.pb.go linguist-generated=true
+go.sum  linguist-generated=true

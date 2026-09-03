@@ -1,0 +1,45 @@
+# Binaries and build output
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace / vendor
+/vendor/
+go.work
+go.work.sum
+
+# Coverage and profiling artifacts
+coverage.out
+coverage.html
+*.prof
+*.pprof
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
+
+# Terraform state and local plugin cache
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local tooling caches
+/.cache/
+/tmp/
