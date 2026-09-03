@@ -46,6 +46,7 @@ func TestLoadOverrides(t *testing.T) {
 		"SERVICE_NAME":             "fluxgate-test",
 		"ENVIRONMENT":              "prod",
 		"API_KEYS":                 `[{"key_id":"k1","tenant_id":"t","secret_sha256":"x"}]`,
+		"GCP_PROJECT_ID":           "fluxgate-test",
 		"HTTP_ADDR":                ":9999",
 		"HTTP_READ_HEADER_TIMEOUT": "2s",
 		"HTTP_HANDLER_TIMEOUT":     "3s",
@@ -261,8 +262,9 @@ func TestAuthRequiresAKeySourceWhenEnabled(t *testing.T) {
 	for _, source := range []string{"API_KEYS", "API_KEYS_FILE"} {
 		t.Run(source, func(t *testing.T) {
 			if _, err := load(env(map[string]string{
-				"ENVIRONMENT": "prod",
-				source:        "value",
+				"ENVIRONMENT":    "prod",
+				"GCP_PROJECT_ID": "fluxgate-test",
+				source:           "value",
 			})); err != nil {
 				t.Errorf("load with %s set: %v", source, err)
 			}

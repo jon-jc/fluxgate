@@ -78,6 +78,67 @@ jobs:
           path: coverage.out
           retention-days: 7
 
+  integration:
+    name: Integration (Pub/Sub emulator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # Run as a plain container rather than a `services:` entry: the emulator
+      # image needs a command override to bind 0.0.0.0, and `services:` cannot
+      # supply one. Binding to localhost inside the container would accept the
+      # published connection and then refuse it, which looks exactly like a
+      # broken client.
+      - name: Start the Pub/Sub emulator
+        run: |
+          docker run -d --name pubsub -p 8681:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators pubsub start \
+              --host-port=0.0.0.0:8085 --project=fluxgate-test
+
+          for i in $(seq 1 60); do
+            if timeout 1 bash -c '</dev/tcp/localhost/8681' 2>/dev/null; then
+              echo "emulator accepting connections"
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::the emulator never became reachable"
+              docker logs pubsub
+              exit 1
+            fi
+            sleep 1
+          done
+
+      # The race detector matters most here: the subscriber dispatches messages
+      # concurrently, which is where a data race would actually live.
+      - name: Integration tests
+        env:
+          PUBSUB_EMULATOR_HOST: localhost:8681
+        run: go test -race -count=1 -timeout 10m ./internal/pubsubx/...
+
+      # A skip here would mean the integration tests silently stopped running,
+      # which is worse than them failing: the suite would go green while
+      # covering nothing.
+      - name: Assert the tests actually ran
+        env:
+          PUBSUB_EMULATOR_HOST: localhost:8681
+        run: |
+          output=$(go test -count=1 -v -run TestPublishAndReceive ./internal/pubsubx/...)
+          echo "$output"
+          if echo "$output" | grep -q "SKIP"; then
+            echo "::error::integration tests were skipped; the emulator was not detected"
+            exit 1
+          fi
+
+      - name: Emulator logs on failure
+        if: failure()
+        run: docker logs pubsub
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -131,34 +192,64 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # A deployed tier must refuse to start without credentials. Asserting the
-      # failure here means the safeguard is exercised on every commit, rather
-      # than being trusted to still work the next time someone edits config.
-      - name: Refuses to boot unauthenticated
+      # Deployed tiers must refuse to start misconfigured. Asserting each
+      # failure here exercises the safeguards on every commit rather than
+      # trusting them to still work the next time someone edits config.
+      - name: Refuses to boot misconfigured
         run: |
-          if docker run --rm -e ENVIRONMENT=prod fluxgate/ingest-api:ci 2>&1 \
-              | tee /dev/stderr | grep -q 'API_KEYS'; then
-            echo "confirmed: the prod tier will not start without API keys"
-          else
-            echo "::error::the prod tier started (or failed for the wrong reason) with no API keys"
-            exit 1
-          fi
+          output=$(docker run --rm -e ENVIRONMENT=prod fluxgate/ingest-api:ci 2>&1 || true)
+          echo "$output"
 
-      - name: Smoke test the image
+          # No credentials: an open ingest endpoint would let anyone write into
+          # any tenant's data.
+          echo "$output" | grep -q 'API_KEYS' \
+            || { echo "::error::prod started, or failed for the wrong reason, with no API keys"; exit 1; }
+
+          # No transport: the in-memory sink would acknowledge batches and then
+          # discard them.
+          echo "$output" | grep -q 'GCP_PROJECT_ID' \
+            || { echo "::error::prod started, or failed for the wrong reason, with no transport configured"; exit 1; }
+
+          output=$(docker run --rm \
+            -e ENVIRONMENT=prod -e PUBSUB_ENABLED=false \
+            fluxgate/ingest-api:ci 2>&1 || true)
+          echo "$output" | grep -q 'PUBSUB_ENABLED' \
+            || { echo "::error::prod accepted PUBSUB_ENABLED=false"; exit 1; }
+
+          echo "confirmed: every production safeguard refuses to boot"
+
+      - name: Smoke test the image against a real broker
         run: |
           SECRET=ci-smoke-secret
           DIGEST=$(printf %s "$SECRET" | sha256sum | cut -d' ' -f1)
+          PROJECT=fluxgate-ci
 
-          docker run -d --name fluxgate -p 8080:8080 \
+          docker network create fluxgate-ci
+
+          docker run -d --name pubsub --network fluxgate-ci -p 8681:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators pubsub start \
+              --host-port=0.0.0.0:8085 --project="$PROJECT"
+
+          for i in $(seq 1 60); do
+            timeout 1 bash -c '</dev/tcp/localhost/8681' 2>/dev/null && break
+            if [ "$i" = "60" ]; then
+              echo "::error::the emulator never became reachable"
+              docker logs pubsub
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker run -d --name fluxgate --network fluxgate-ci -p 8080:8080 \
             -e ENVIRONMENT=dev \
+            -e GCP_PROJECT_ID="$PROJECT" \
+            -e PUBSUB_EMULATOR_HOST=pubsub:8085 \
             -e API_KEYS="[{\"key_id\":\"ci\",\"tenant_id\":\"ci-tenant\",\"secret_sha256\":\"$DIGEST\"}]" \
             fluxgate/ingest-api:ci
 
           for i in $(seq 1 30); do
-            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
-              echo "container is live"
-              break
-            fi
+            curl -fsS http://localhost:8080/healthz >/dev/null 2>&1 && break
             if [ "$i" = "30" ]; then
               echo "::error::container never became live"
               docker logs fluxgate
@@ -167,7 +258,9 @@ jobs:
             sleep 1
           done
 
-          curl -fsS http://localhost:8080/readyz | tee /dev/stderr | grep -q '"ok"'
+          # Readiness must now report the transport, not just the process.
+          curl -fsS http://localhost:8080/readyz | tee /dev/stderr | grep -q 'pubsub-publisher' \
+            || { echo "::error::readiness does not report the transport"; docker logs fluxgate; exit 1; }
           curl -fsS http://localhost:8080/v1/version | tee /dev/stderr | grep -q '"version"'
 
           # Unauthenticated writes must be refused.
@@ -180,16 +273,16 @@ jobs:
             exit 1
           fi
 
-          # A real batch, over the real auth path, with one deliberately bad
+          # A real batch over the real auth path, with one deliberately bad
           # point to prove partial success survives the container build.
-          body='{"points":[
-            {"metric":"ci.smoke","kind":"counter","value":1},
-            {"metric":"9 invalid","kind":"gauge","value":1}
-          ]}'
           response=$(curl -fsS -X POST http://localhost:8080/v1/ingest \
             -H "Authorization: Bearer fxg_ci_$SECRET" \
             -H 'Content-Type: application/json' \
-            -d "$body")
+            -H 'X-Request-Id: cismoke001' \
+            -d '{"points":[
+                  {"metric":"ci.smoke","kind":"counter","value":1},
+                  {"metric":"9 invalid","kind":"gauge","value":1}
+                ]}')
           echo "$response"
 
           echo "$response" | grep -q '"accepted":1' \
@@ -197,4 +290,32 @@ jobs:
           echo "$response" | grep -q '"rejected":1' \
             || { echo "::error::expected 1 rejected point"; exit 1; }
 
-          docker rm -f fluxgate
+          # The decisive assertion: the batch actually reached the broker.
+          # A 202 that leaves no message on the subscription would mean the
+          # service is acknowledging data it never delivered.
+          for i in $(seq 1 15); do
+            pulled=$(curl -fsS -X POST \
+              "http://localhost:8681/v1/projects/$PROJECT/subscriptions/telemetry-aggregator:pull" \
+              -H 'Content-Type: application/json' \
+              -d '{"maxMessages":10,"returnImmediately":true}')
+
+            if echo "$pulled" | grep -q 'cismoke001'; then
+              echo "$pulled"
+              break
+            fi
+            if [ "$i" = "15" ]; then
+              echo "$pulled"
+              echo "::error::no message on the subscription, or the request ID did not survive the queue"
+              docker logs fluxgate
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "confirmed: the image published to a real broker, request ID intact"
+
+      - name: Container logs on failure
+        if: failure()
+        run: |
+          docker logs fluxgate 2>&1 || true
+          docker logs pubsub 2>&1 || true

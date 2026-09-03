@@ -59,6 +59,26 @@ cover-html: cover ## Open the coverage report in a browser
 	$(GO) tool cover -html=coverage.out -o coverage.html
 	@echo "wrote coverage.html"
 
+.PHONY: up
+up: ## Start the local stack (Pub/Sub emulator + ingest API)
+	docker compose -f deploy/docker-compose.yml up -d --build
+	@echo ""
+	@echo "  ingest API:  http://localhost:8080"
+	@echo "  emulator:    localhost:8681"
+	@echo "  API key:     fxg_local_local-dev-secret"
+
+.PHONY: down
+down: ## Stop the local stack and discard its state
+	docker compose -f deploy/docker-compose.yml down -v
+
+.PHONY: emulator
+emulator: ## Start only the Pub/Sub emulator, for running tests against
+	docker compose -f deploy/docker-compose.yml up -d pubsub
+
+.PHONY: test-integration
+test-integration: emulator ## Run the tests that need a real broker
+	PUBSUB_EMULATOR_HOST=localhost:8681 $(GO) test -count=1 -timeout 10m ./internal/pubsubx/...
+
 .PHONY: bench
 bench: ## Run benchmarks
 	$(GO) test -run '^$$' -bench . -benchmem ./...

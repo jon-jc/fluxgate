@@ -9,8 +9,11 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -23,12 +26,33 @@ import (
 	"github.com/jon-jc/fluxgate/internal/idempotency"
 	"github.com/jon-jc/fluxgate/internal/ingest"
 	"github.com/jon-jc/fluxgate/internal/observability"
+	"github.com/jon-jc/fluxgate/internal/pubsubx"
 	"github.com/jon-jc/fluxgate/internal/ratelimit"
+	"github.com/jon-jc/fluxgate/internal/resilience"
 	"github.com/jon-jc/fluxgate/internal/telemetry"
 	"github.com/jon-jc/fluxgate/internal/version"
 )
 
+// healthcheck runs the process as a probe instead of a server.
+//
+// The runtime image is distroless: no shell, no curl, nothing an orchestrator
+// could exec to test the service. Having the binary probe itself is the
+// standard answer, and it keeps the image free of tools an attacker would
+// otherwise inherit on breaking in.
+var healthcheck = flag.Bool("healthcheck", false,
+	"probe the local readiness endpoint and exit 0 if healthy")
+
 func main() {
+	flag.Parse()
+
+	if *healthcheck {
+		if err := probe(); err != nil {
+			fmt.Fprintln(os.Stderr, "unhealthy:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if err := run(); err != nil {
 		// Configuration can fail before a logger exists, so this last-resort
 		// path writes plainly to stderr rather than assuming structured
@@ -66,9 +90,14 @@ func run() error {
 		return err
 	}
 
-	// The sink is in-memory for now; the Pub/Sub publisher replaces it in the
-	// next milestone without the handler changing.
-	sink := ingest.NewMemorySink()
+	sink, closeSink, err := buildSink(ctx, cfg, logger, health)
+	if err != nil {
+		return err
+	}
+	// Flushing happens after the server has drained, so a batch accepted a
+	// moment before SIGTERM is still delivered rather than dying with the
+	// process.
+	defer closeSink()
 
 	handler := api.NewRouter(api.Deps{
 		Config: cfg,
@@ -150,4 +179,119 @@ func buildAuth(cfg config.Config, logger *slog.Logger) (auth.Options, error) {
 		slog.Any("tenants", store.TenantIDs()))
 
 	return auth.Options{Store: store}, nil
+}
+
+// buildSink resolves where accepted batches go, returning a cleanup function.
+//
+// The in-memory sink acknowledges a batch and then loses it on the next
+// restart, which is the right trade on a laptop and unacceptable anywhere
+// else. Configuration validation already refuses it on staging and prod; the
+// warning here is for the tiers where it is merely surprising.
+func buildSink(
+	ctx context.Context, cfg config.Config, logger *slog.Logger, health *observability.Health,
+) (ingest.Sink, func(), error) {
+	if !cfg.PubSub.Enabled {
+		logger.Warn("using the in-memory sink; accepted batches are NOT durable",
+			slog.String("env", string(cfg.Environment)))
+		return ingest.NewMemorySink(), func() {}, nil
+	}
+
+	client, err := pubsubx.NewClient(ctx, pubsubx.Config{
+		ProjectID:    cfg.PubSub.ProjectID,
+		EmulatorHost: cfg.PubSub.EmulatorHost,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("connect to pub/sub: %w", err)
+	}
+
+	if cfg.PubSub.Bootstrap {
+		topo := pubsubx.DefaultTopology(
+			cfg.PubSub.ProjectID,
+			cfg.PubSub.RawTopic,
+			cfg.PubSub.DeadLetterTopic,
+			cfg.PubSub.AggregatorSubscription)
+
+		if bootstrapErr := pubsubx.Ensure(ctx, client, topo, logger); bootstrapErr != nil {
+			_ = client.Close()
+			return nil, nil, fmt.Errorf("bootstrap pub/sub topology: %w", bootstrapErr)
+		}
+	}
+
+	publisher, err := pubsubx.NewPublisher(client, pubsubx.PublisherOptions{
+		Topic:                  cfg.PubSub.RawTopic,
+		PublishTimeout:         cfg.PubSub.PublishTimeout,
+		BatchDelay:             cfg.PubSub.BatchDelay,
+		BatchCount:             cfg.PubSub.BatchCount,
+		MaxOutstandingMessages: cfg.PubSub.MaxOutstandingMessages,
+		MaxOutstandingBytes:    cfg.PubSub.MaxOutstandingBytes,
+		Breaker: resilience.Options{
+			FailureThreshold: cfg.PubSub.BreakerFailureThreshold,
+			Cooldown:         cfg.PubSub.BreakerCooldown,
+		},
+		Logger: logger,
+	})
+	if err != nil {
+		_ = client.Close()
+		return nil, nil, fmt.Errorf("build publisher: %w", err)
+	}
+
+	// Readiness now reflects the transport: an instance that cannot publish
+	// should be taken out of rotation rather than accepting batches it will
+	// only reject.
+	health.Register(publisher)
+
+	logger.Info("publishing to pub/sub",
+		slog.String("project", cfg.PubSub.ProjectID),
+		slog.String("topic", cfg.PubSub.RawTopic),
+		slog.String("emulator", cfg.PubSub.EmulatorHost))
+
+	cleanup := func() {
+		publisher.Close()
+		if err := client.Close(); err != nil {
+			logger.Warn("closing pub/sub client", slog.Any("error", err))
+		}
+	}
+	return publisher, cleanup, nil
+}
+
+// probe checks the local readiness endpoint.
+//
+// It reads the same configuration the server does, so a service moved to a
+// different port stays probeable without the healthcheck being updated
+// separately and silently drifting out of sync.
+func probe() error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	host, port, err := net.SplitHostPort(cfg.HTTP.Addr)
+	if err != nil {
+		return fmt.Errorf("parse listen address %q: %w", cfg.HTTP.Addr, err)
+	}
+	// A listener bound to every interface is still reached over the loopback.
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+
+	url := "http://" + net.JoinHostPort(host, port) + api.PathReadiness
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s returned %s", api.PathReadiness, resp.Status)
+	}
+	return nil
 }

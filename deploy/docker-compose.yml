@@ -1,0 +1,66 @@
+# Local development stack.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#   export PUBSUB_EMULATOR_HOST=localhost:8681
+#   make run
+#
+# The emulator holds everything in memory, so `down` is a clean slate. Topics
+# and subscriptions are re-created at startup by the service's bootstrap, which
+# is enabled automatically whenever an emulator host is configured.
+
+name: fluxgate
+
+services:
+  pubsub:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    container_name: fluxgate-pubsub
+    command:
+      - gcloud
+      - beta
+      - emulators
+      - pubsub
+      - start
+      # 0.0.0.0 rather than localhost: the default binds inside the container
+      # only, so the published port would accept connections and then refuse
+      # them, which looks exactly like a broken client.
+      - --host-port=0.0.0.0:8085
+      - --project=fluxgate-local
+    ports:
+      - "8681:8085"
+    healthcheck:
+      # The emulator has no health endpoint; a TCP connect is the honest check.
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8085' || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  ingest-api:
+    build:
+      context: ..
+      dockerfile: build/docker/Dockerfile
+      args:
+        SERVICE: ingest-api
+    container_name: fluxgate-ingest-api
+    depends_on:
+      pubsub:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      ENVIRONMENT: dev
+      LOG_FORMAT: text
+      LOG_LEVEL: debug
+      GCP_PROJECT_ID: fluxgate-local
+      PUBSUB_EMULATOR_HOST: pubsub:8085
+      # Credentials for the compose stack only. The secret is
+      # "local-dev-secret"; the service never sees anything but this digest.
+      API_KEYS: >-
+        [{"key_id":"local","tenant_id":"acme",
+          "secret_sha256":"eb26d4a9a0ef04727f52fb5acc8936196ae90e23003fc5117ce8e3e28c49363f"}]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/service", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
