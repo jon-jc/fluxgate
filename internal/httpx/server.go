@@ -115,11 +115,11 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		return nil
 	case <-ctx.Done():
-		return s.drain(log, serveErr)
+		return s.drain(ctx, log, serveErr)
 	}
 }
 
-func (s *Server) drain(log *slog.Logger, serveErr <-chan error) error {
+func (s *Server) drain(ctx context.Context, log *slog.Logger, serveErr <-chan error) error {
 	if s.opts.OnDrain != nil {
 		s.opts.OnDrain()
 	}
@@ -136,10 +136,12 @@ func (s *Server) drain(log *slog.Logger, serveErr <-chan error) error {
 	log.Info("shutting down http server",
 		slog.Duration("drain_timeout", s.opts.Shutdown.DrainTimeout))
 
-	// Shutdown must not inherit the already-cancelled parent context, or it
-	// would return instantly and defeat the drain.
+	// Shutdown must not inherit the parent's cancellation -- it has already
+	// fired, and Shutdown would return instantly and defeat the drain. Deriving
+	// from it with WithoutCancel keeps any context values (trace IDs, and
+	// whatever later milestones attach) while dropping only the cancellation.
 	shutdownCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(context.Background()), s.opts.Shutdown.DrainTimeout)
+		context.WithoutCancel(ctx), s.opts.Shutdown.DrainTimeout)
 	defer cancel()
 
 	if err := s.srv.Shutdown(shutdownCtx); err != nil {

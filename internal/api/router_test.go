@@ -43,7 +43,7 @@ func do(t *testing.T, h http.Handler, method, path string) *httptest.ResponseRec
 	t.Helper()
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	h.ServeHTTP(rec, httptest.NewRequest(method, path, http.NoBody))
 	return rec
 }
 

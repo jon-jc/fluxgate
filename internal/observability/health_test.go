@@ -25,7 +25,7 @@ func probe(t *testing.T, h http.Handler) *httptest.ResponseRecorder {
 	t.Helper()
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/probe", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/probe", http.NoBody))
 	return rec
 }
 

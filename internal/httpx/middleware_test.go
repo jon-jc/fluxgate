@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,14 +19,14 @@ import (
 
 // captureLogs returns a logger writing JSON into buf, plus a helper that
 // decodes the records emitted so far.
-func captureLogs(t *testing.T) (*slog.Logger, func() []map[string]any) {
+func captureLogs(t *testing.T) (logger *slog.Logger, records func() []map[string]any) {
 	t.Helper()
 
 	var (
 		mu  sync.Mutex
 		buf bytes.Buffer
 	)
-	logger := slog.New(slog.NewJSONHandler(&lockedWriter{mu: &mu, w: &buf},
+	logger = slog.New(slog.NewJSONHandler(&lockedWriter{mu: &mu, w: &buf},
 		&slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	return logger, func() []map[string]any {
@@ -75,7 +76,7 @@ func TestChainAppliesOutermostFirst(t *testing.T) {
 			order = append(order, "handler")
 		}))
 
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody))
 
 	want := []string{"a", "b", "c", "handler"}
 	if strings.Join(order, ",") != strings.Join(want, ",") {
@@ -90,7 +91,7 @@ func TestRequestIDGeneratesAndEchoes(t *testing.T) {
 	}))
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", http.NoBody))
 
 	if seen == "" {
 		t.Fatal("no request ID in context")
@@ -114,7 +115,7 @@ func TestRequestIDIsUniquePerRequest(t *testing.T) {
 	}))
 
 	for range 128 {
-		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody))
 	}
 }
 
@@ -124,7 +125,7 @@ func TestRequestIDPropagatesInboundValue(t *testing.T) {
 		seen = RequestIDFromContext(r.Context())
 	}))
 
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 	r.Header.Set(HeaderRequestID, "upstream-trace-1")
 	h.ServeHTTP(httptest.NewRecorder(), r)
 
@@ -148,7 +149,7 @@ func TestRequestIDRejectsHostileInboundValues(t *testing.T) {
 				seen = RequestIDFromContext(r.Context())
 			}))
 
-			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 			r.Header.Set(HeaderRequestID, hostile)
 			h.ServeHTTP(httptest.NewRecorder(), r)
 
@@ -168,7 +169,7 @@ func TestRealIPIgnoresForwardedHeaderWhenUntrusted(t *testing.T) {
 		seen = ClientIPFromContext(r.Context())
 	}))
 
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 	r.RemoteAddr = "203.0.113.9:44321"
 	r.Header.Set("X-Forwarded-For", "1.2.3.4")
 	h.ServeHTTP(httptest.NewRecorder(), r)
@@ -186,7 +187,7 @@ func TestRealIPUsesLeftmostForwardedEntryWhenTrusted(t *testing.T) {
 		seen = ClientIPFromContext(r.Context())
 	}))
 
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 	r.RemoteAddr = "10.0.0.1:44321"
 	r.Header.Set("X-Forwarded-For", "1.2.3.4, 10.0.0.2, 10.0.0.1")
 	h.ServeHTTP(httptest.NewRecorder(), r)
@@ -202,7 +203,7 @@ func TestRealIPFallsBackWhenForwardedValueIsGarbage(t *testing.T) {
 		seen = ClientIPFromContext(r.Context())
 	}))
 
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 	r.RemoteAddr = "10.0.0.1:44321"
 	r.Header.Set("X-Forwarded-For", "not-an-ip")
 	h.ServeHTTP(httptest.NewRecorder(), r)
@@ -220,7 +221,7 @@ func TestRecovererConvertsPanicToProblem(t *testing.T) {
 			panic("index out of range")
 		}))
 
-	r := httptest.NewRequest(http.MethodGet, "/v1/boom", nil)
+	r := httptest.NewRequest(http.MethodGet, "/v1/boom", http.NoBody)
 	r = r.WithContext(observability.ContextWithLogger(r.Context(), logger))
 
 	rec := httptest.NewRecorder()
@@ -255,7 +256,9 @@ func TestRecovererRepanicsOnAbortHandler(t *testing.T) {
 	// http.ErrAbortHandler is the documented way to abandon a response; it must
 	// keep propagating so net/http closes the connection.
 	defer func() {
-		if rec := recover(); rec != http.ErrAbortHandler {
+		rec := recover()
+		err, ok := rec.(error)
+		if !ok || !errors.Is(err, http.ErrAbortHandler) {
 			t.Errorf("recovered %v, want http.ErrAbortHandler to propagate", rec)
 		}
 	}()
@@ -263,7 +266,7 @@ func TestRecovererRepanicsOnAbortHandler(t *testing.T) {
 	h := Recoverer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic(http.ErrAbortHandler)
 	}))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody))
 }
 
 func TestAccessLogSeverityTracksOutcome(t *testing.T) {
@@ -285,7 +288,7 @@ func TestAccessLogSeverityTracksOutcome(t *testing.T) {
 					w.WriteHeader(tc.status)
 				}))
 
-			r := httptest.NewRequest(http.MethodGet, "/v1/thing", nil)
+			r := httptest.NewRequest(http.MethodGet, "/v1/thing", http.NoBody)
 			r = r.WithContext(observability.ContextWithLogger(r.Context(), logger))
 			h.ServeHTTP(httptest.NewRecorder(), r)
 
@@ -320,7 +323,7 @@ func TestAccessLogSkipsHealthyProbesButLogsFailingOnes(t *testing.T) {
 					w.WriteHeader(tc.status)
 				}))
 
-			r := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+			r := httptest.NewRequest(http.MethodGet, "/readyz", http.NoBody)
 			r = r.WithContext(observability.ContextWithLogger(r.Context(), logger))
 			h.ServeHTTP(httptest.NewRecorder(), r)
 
@@ -340,7 +343,7 @@ func TestAccessLogPromotesSlowRequests(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		}))
 
-	r := httptest.NewRequest(http.MethodGet, "/v1/slow", nil)
+	r := httptest.NewRequest(http.MethodGet, "/v1/slow", http.NoBody)
 	r = r.WithContext(observability.ContextWithLogger(r.Context(), logger))
 	h.ServeHTTP(httptest.NewRecorder(), r)
 
@@ -362,7 +365,7 @@ func TestAccessLogRecordsBytesWritten(t *testing.T) {
 			_, _ = io.WriteString(w, body)
 		}))
 
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 	r = r.WithContext(observability.ContextWithLogger(r.Context(), logger))
 	h.ServeHTTP(httptest.NewRecorder(), r)
 
@@ -388,7 +391,7 @@ func TestRequestTimeoutSetsDeadline(t *testing.T) {
 			handlerErr = r.Context().Err()
 		}))
 
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody))
 
 	if handlerErr != context.DeadlineExceeded {
 		t.Errorf("context error = %v, want DeadlineExceeded", handlerErr)
@@ -401,7 +404,7 @@ func TestRequestTimeoutIsANoOpWhenDisabled(t *testing.T) {
 	h := RequestTimeout(0)(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		_, hasDeadline = r.Context().Deadline()
 	}))
-	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", http.NoBody))
 
 	if hasDeadline {
 		t.Error("a zero timeout must not impose a deadline")
@@ -428,7 +431,7 @@ func TestSecurityHeaders(t *testing.T) {
 	h := SecurityHeaders(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", http.NoBody))
 
 	want := map[string]string{
 		"X-Content-Type-Options": "nosniff",
@@ -463,7 +466,7 @@ func TestResponseRecorderPreservesFlusher(t *testing.T) {
 		}))
 
 	logger, _ := captureLogs(t)
-	r := httptest.NewRequest(http.MethodGet, "/v1/stream", nil)
+	r := httptest.NewRequest(http.MethodGet, "/v1/stream", http.NoBody)
 	r = r.WithContext(observability.ContextWithLogger(r.Context(), logger))
 	h.ServeHTTP(httptest.NewRecorder(), r)
 

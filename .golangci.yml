@@ -66,6 +66,10 @@ linters:
           - gosec
           - unparam
           - revive
+          # noctx wants httptest.NewRequestWithContext everywhere. The rule
+          # exists so production code propagates cancellation; a test building
+          # a request literal has nothing to propagate.
+          - noctx
 
 formatters:
   enable:

@@ -326,7 +326,7 @@ func asAPIError(ctx context.Context, err error) *Error {
 // DecodeJSON reads a JSON request body into dst, rejecting anything ambiguous.
 //
 // Unknown fields are an error rather than a silent no-op: a client that sends
-// "timestmap" deserves to hear about the typo immediately instead of debugging
+// "streem_id" deserves to hear about the typo immediately instead of debugging
 // why its data never arrived. The diagnostics name the offending field and
 // byte offset so the caller can fix the payload without guesswork.
 func DecodeJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) error {

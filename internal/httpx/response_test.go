@@ -32,7 +32,7 @@ func TestHandlerRendersReturnedError(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/streams/x", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/streams/x", http.NoBody))
 
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
@@ -58,7 +58,7 @@ func TestHandlerSuccessWritesNoProblem(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/ingest", http.NoBody))
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", rec.Code)
@@ -79,7 +79,7 @@ func TestWriteErrorHidesInternalCause(t *testing.T) {
 	secret := errors.New("dial tcp 10.0.0.7:5432: connection refused")
 
 	rec := httptest.NewRecorder()
-	WriteError(rec, httptest.NewRequest(http.MethodGet, "/", nil), Internal(secret))
+	WriteError(rec, httptest.NewRequest(http.MethodGet, "/", http.NoBody), Internal(secret))
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500", rec.Code)
@@ -96,7 +96,7 @@ func TestWriteErrorHidesInternalCause(t *testing.T) {
 
 func TestWriteErrorSetsRetryAfterForRetryableErrors(t *testing.T) {
 	rec := httptest.NewRecorder()
-	WriteError(rec, httptest.NewRequest(http.MethodGet, "/", nil),
+	WriteError(rec, httptest.NewRequest(http.MethodGet, "/", http.NoBody),
 		RateLimited("Quota exhausted."))
 
 	if rec.Code != http.StatusTooManyRequests {
@@ -108,7 +108,7 @@ func TestWriteErrorSetsRetryAfterForRetryableErrors(t *testing.T) {
 }
 
 func TestWriteErrorIncludesRequestID(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody)
 	r = r.WithContext(ContextWithRequestID(r.Context(), "abc123"))
 
 	rec := httptest.NewRecorder()
@@ -150,7 +150,7 @@ func TestWriteErrorMapsWellKnownErrors(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			WriteError(rec, httptest.NewRequest(http.MethodGet, "/", nil), tc.err)
+			WriteError(rec, httptest.NewRequest(http.MethodGet, "/", http.NoBody), tc.err)
 			if rec.Code != tc.want {
 				t.Errorf("status = %d, want %d (body=%s)", rec.Code, tc.want, rec.Body)
 			}
@@ -162,7 +162,7 @@ func TestWriteErrorStaysSilentWhenClientDisconnected(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	r := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
+	r := httptest.NewRequest(http.MethodGet, "/", http.NoBody).WithContext(ctx)
 	rec := httptest.NewRecorder()
 
 	WriteError(rec, r, context.Canceled)
@@ -239,7 +239,7 @@ func TestDecodeJSON(t *testing.T) {
 		},
 		{
 			name:       "unknown field",
-			body:       `{"stream":"cpu","timestmap":1}`,
+			body:       `{"stream":"cpu","streem_id":1}`,
 			wantStatus: http.StatusUnprocessableEntity,
 		},
 		{
@@ -301,7 +301,7 @@ func TestDecodeJSONEnforcesSizeLimit(t *testing.T) {
 	}
 
 	rec := httptest.NewRecorder()
-	WriteError(rec, httptest.NewRequest(http.MethodPost, "/", nil), err)
+	WriteError(rec, httptest.NewRequest(http.MethodPost, "/", http.NoBody), err)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("status = %d, want 413", rec.Code)
 	}
@@ -337,7 +337,7 @@ func TestNoContent(t *testing.T) {
 // truncated body.
 func TestWriteJSONReportsMarshalFailure(t *testing.T) {
 	rec := httptest.NewRecorder()
-	err := WriteJSON(rec, httptest.NewRequest(http.MethodGet, "/", nil),
+	err := WriteJSON(rec, httptest.NewRequest(http.MethodGet, "/", http.NoBody),
 		http.StatusOK, map[string]any{"bad": make(chan int)})
 
 	if err == nil {
@@ -374,7 +374,7 @@ func deadlineErr(t *testing.T) error {
 
 func TestExpiredContextRendersGatewayTimeout(t *testing.T) {
 	rec := httptest.NewRecorder()
-	WriteError(rec, httptest.NewRequest(http.MethodGet, "/", nil), deadlineErr(t))
+	WriteError(rec, httptest.NewRequest(http.MethodGet, "/", http.NoBody), deadlineErr(t))
 
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want 504", rec.Code)

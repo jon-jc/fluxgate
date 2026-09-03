@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -157,6 +158,8 @@ func remoteIP(remoteAddr string) string {
 // take down a process serving thousands of healthy ones.
 func Recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// nolint:contextcheck // WriteError reads the context off the request;
+		// there is no separate context to thread through the deferred closure.
 		defer func() {
 			rec := recover()
 			if rec == nil {
@@ -165,8 +168,10 @@ func Recoverer(next http.Handler) http.Handler {
 
 			// http.ErrAbortHandler is the documented way for a handler to
 			// abandon a response deliberately; re-panicking preserves that
-			// contract and lets net/http close the connection quietly.
-			if rec == http.ErrAbortHandler {
+			// contract and lets net/http close the connection quietly. The
+			// errors.Is check also catches a wrapped sentinel, which a
+			// middleware between here and the handler may well have produced.
+			if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 				panic(rec)
 			}
 
@@ -314,6 +319,8 @@ type responseRecorder struct {
 	wroteHeader bool
 }
 
+// WriteHeader records the status code before forwarding it, and ignores any
+// stray second call so the recorded status matches what the client received.
 func (rr *responseRecorder) WriteHeader(code int) {
 	if rr.wroteHeader {
 		// net/http already warns about a duplicate WriteHeader; swallowing it
@@ -325,6 +332,8 @@ func (rr *responseRecorder) WriteHeader(code int) {
 	rr.ResponseWriter.WriteHeader(code)
 }
 
+// Write tallies the response size, defaulting the status to 200 for a handler
+// that writes a body without calling WriteHeader first.
 func (rr *responseRecorder) Write(b []byte) (int, error) {
 	if !rr.wroteHeader {
 		rr.WriteHeader(http.StatusOK)
