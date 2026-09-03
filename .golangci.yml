@@ -1,0 +1,85 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - bodyclose      # unclosed response bodies leak connections under load
+    - contextcheck   # a dropped context breaks cancellation and tracing
+    - copyloopvar
+    - durationcheck
+    - errorlint      # comparisons that break on wrapped errors
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - noctx          # outbound calls without a context cannot be cancelled
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - wastedassign
+
+  settings:
+    errcheck:
+      # Deliberate discards are written as `_ =`; anything else must be handled.
+      check-type-assertions: true
+      check-blank: false
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment  # readability wins over a few padding bytes here
+    revive:
+      rules:
+        - name: exported
+          arguments: [checkPrivateReceivers]
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: indent-error-flow
+        - name: unexported-return
+        - name: var-naming
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - hugeParam       # config structs are passed by value on purpose
+        - whyNoLint
+    gosec:
+      excludes:
+        - G104  # duplicated by errcheck, with better messages
+
+  exclusions:
+    generated: lax
+    rules:
+      # Test code is allowed to be blunter than production code.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - unparam
+          - revive
+          # noctx wants httptest.NewRequestWithContext everywhere. The rule
+          # exists so production code propagates cancellation; a test building
+          # a request literal has nothing to propagate.
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/jon-jc/fluxgate
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
