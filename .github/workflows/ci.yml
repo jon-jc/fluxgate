@@ -131,10 +131,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # A deployed tier must refuse to start without credentials. Asserting the
+      # failure here means the safeguard is exercised on every commit, rather
+      # than being trusted to still work the next time someone edits config.
+      - name: Refuses to boot unauthenticated
+        run: |
+          if docker run --rm -e ENVIRONMENT=prod fluxgate/ingest-api:ci 2>&1 \
+              | tee /dev/stderr | grep -q 'API_KEYS'; then
+            echo "confirmed: the prod tier will not start without API keys"
+          else
+            echo "::error::the prod tier started (or failed for the wrong reason) with no API keys"
+            exit 1
+          fi
+
       - name: Smoke test the image
         run: |
+          SECRET=ci-smoke-secret
+          DIGEST=$(printf %s "$SECRET" | sha256sum | cut -d' ' -f1)
+
           docker run -d --name fluxgate -p 8080:8080 \
-            -e ENVIRONMENT=dev fluxgate/ingest-api:ci
+            -e ENVIRONMENT=dev \
+            -e API_KEYS="[{\"key_id\":\"ci\",\"tenant_id\":\"ci-tenant\",\"secret_sha256\":\"$DIGEST\"}]" \
+            fluxgate/ingest-api:ci
 
           for i in $(seq 1 30); do
             if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
@@ -151,4 +169,32 @@ jobs:
 
           curl -fsS http://localhost:8080/readyz | tee /dev/stderr | grep -q '"ok"'
           curl -fsS http://localhost:8080/v1/version | tee /dev/stderr | grep -q '"version"'
+
+          # Unauthenticated writes must be refused.
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -X POST http://localhost:8080/v1/ingest \
+            -H 'Content-Type: application/json' -d '{"points":[]}')
+          if [ "$status" != "401" ]; then
+            echo "::error::unauthenticated ingest returned $status, want 401"
+            docker logs fluxgate
+            exit 1
+          fi
+
+          # A real batch, over the real auth path, with one deliberately bad
+          # point to prove partial success survives the container build.
+          body='{"points":[
+            {"metric":"ci.smoke","kind":"counter","value":1},
+            {"metric":"9 invalid","kind":"gauge","value":1}
+          ]}'
+          response=$(curl -fsS -X POST http://localhost:8080/v1/ingest \
+            -H "Authorization: Bearer fxg_ci_$SECRET" \
+            -H 'Content-Type: application/json' \
+            -d "$body")
+          echo "$response"
+
+          echo "$response" | grep -q '"accepted":1' \
+            || { echo "::error::expected 1 accepted point"; exit 1; }
+          echo "$response" | grep -q '"rejected":1' \
+            || { echo "::error::expected 1 rejected point"; exit 1; }
+
           docker rm -f fluxgate

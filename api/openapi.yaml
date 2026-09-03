@@ -1,0 +1,462 @@
+openapi: 3.1.0
+
+info:
+  title: Fluxgate Ingest API
+  version: "1.0.0"
+  summary: High-volume telemetry ingestion.
+  description: |
+    Fluxgate accepts batches of metric points and hands them to an asynchronous
+    aggregation pipeline.
+
+    ## Error format
+
+    Every failure — including a 404 from the router itself — is an RFC 9457
+    problem document with `Content-Type: application/problem+json`. Branch on
+    the stable `code` field rather than on the prose in `detail`.
+
+    ## Partial success
+
+    `POST /v1/ingest` is deliberately partial-success. A batch containing one
+    invalid point admits the rest and reports the failure, because a single
+    misbehaving call site in a client should not be able to blind an entire
+    service's telemetry. Check `rejected` and `errors` on every 202; a 202 does
+    not mean every point was accepted.
+
+    ## Retries
+
+    A request that times out may or may not have been processed. Send an
+    `Idempotency-Key` and repeat the identical body: the original outcome is
+    replayed rather than the batch being counted twice. Reusing a key with a
+    different body is a 409, because replaying the first response would
+    silently discard the second batch.
+  license:
+    name: MIT
+    url: https://github.com/jon-jc/fluxgate/blob/main/LICENSE
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Ingestion
+    description: Submitting telemetry.
+  - name: Operations
+    description: Probes and build metadata. Not part of the versioned contract.
+
+paths:
+  /v1/ingest:
+    post:
+      tags: [Ingestion]
+      operationId: ingestPoints
+      summary: Submit a batch of metric points.
+      description: |
+        Accepts up to 1000 points per request. Points are validated
+        individually; valid ones are admitted even when others in the same
+        batch fail.
+
+        Quota is metered in points per second, not requests per second, so
+        batching does not change how much of a tenant's allowance a given
+        volume of data consumes.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: |
+            An opaque, client-chosen identifier for this batch. Repeating a
+            request with the same key and the same body replays the original
+            response instead of processing the batch again.
+          schema:
+            type: string
+            maxLength: 255
+            pattern: '^[\x21-\x7e]+$'
+          example: batch-2026-09-03T12:00:00Z-0001
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestRequest'
+            examples:
+              mixed:
+                summary: Three points of different kinds
+                value:
+                  points:
+                    - metric: http.request.duration_ms
+                      kind: histogram
+                      value: 12.5
+                      timestamp: "2026-09-03T12:00:00Z"
+                      labels:
+                        service: checkout
+                        region: us-central1
+                    - metric: http.requests
+                      kind: counter
+                      value: 1
+                      labels:
+                        service: checkout
+                        status: "200"
+                    - metric: queue.depth
+                      kind: gauge
+                      value: 42
+      responses:
+        '202':
+          description: |
+            The batch was accepted for delivery. Inspect `rejected` and
+            `errors`: some points may have been dropped.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/XRequestId'
+            X-RateLimit-Limit:
+              $ref: '#/components/headers/XRateLimitLimit'
+            X-RateLimit-Remaining:
+              $ref: '#/components/headers/XRateLimitRemaining'
+            X-RateLimit-Reset:
+              $ref: '#/components/headers/XRateLimitReset'
+            Idempotency-Replayed:
+              description: Present and `true` when this response was replayed from a stored outcome.
+              schema:
+                type: string
+                enum: ["true"]
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+              examples:
+                allAccepted:
+                  summary: Every point admitted
+                  value:
+                    batch_id: 9f2c1a4be6d84f0fa1c3e7b25d908146
+                    accepted: 3
+                    rejected: 0
+                partial:
+                  summary: One point rejected
+                  value:
+                    batch_id: 9f2c1a4be6d84f0fa1c3e7b25d908146
+                    accepted: 2
+                    rejected: 1
+                    errors:
+                      - field: points.1.metric
+                        message: "contains \" \" at position 4; use letters, digits, '_', '.' and '-', starting with a letter or '_'"
+        '400':
+          description: The body could not be parsed, or a header was malformed.
+          $ref: '#/components/responses/Problem'
+        '401':
+          description: Missing or invalid credentials.
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: The `Idempotency-Key` was already used with a different body.
+          $ref: '#/components/responses/Problem'
+        '413':
+          description: The request body exceeded the size limit.
+          $ref: '#/components/responses/Problem'
+        '415':
+          description: The `Content-Type` was not `application/json`.
+          $ref: '#/components/responses/Problem'
+        '422':
+          description: |
+            The batch was structurally valid but semantically unusable: it was
+            empty, exceeded the point limit, or every point failed validation.
+          $ref: '#/components/responses/Problem'
+        '429':
+          description: |
+            The tenant's quota is exhausted. `Retry-After` says when to try
+            again; its absence means the batch is larger than the burst
+            allowance will ever hold and must be split instead.
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: |
+            The batch could not be handed to the pipeline and was **not**
+            stored. Retry with the same `Idempotency-Key`.
+          $ref: '#/components/responses/Problem'
+        '504':
+          description: The request exceeded its processing deadline.
+          $ref: '#/components/responses/Problem'
+
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: liveness
+      summary: Liveness probe.
+      description: |
+        Reports whether the process is running. Performs no dependency checks
+        by design: a database outage should drain an instance, not restart it.
+      security: []
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeStatus'
+
+  /readyz:
+    get:
+      tags: [Operations]
+      operationId: readiness
+      summary: Readiness probe.
+      description: Reports whether this instance should receive traffic.
+      security: []
+      responses:
+        '200':
+          description: Ready to serve.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeStatus'
+        '503':
+          description: |
+            Draining, or a dependency check failed. The `checks` map names the
+            failing dependency.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProbeStatus'
+
+  /v1/version:
+    get:
+      tags: [Operations]
+      operationId: version
+      summary: Build provenance of the running binary.
+      security: []
+      responses:
+        '200':
+          description: Build metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VersionInfo'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An API key in the form `fxg_<key id>_<secret>`, sent as
+        `Authorization: Bearer fxg_...`.
+
+        The server stores only a SHA-256 digest of the secret. Every
+        authentication failure returns an identical 401 regardless of cause, so
+        a probing client cannot use the response to tell a valid key ID from an
+        invalid one.
+
+  headers:
+    XRequestId:
+      description: Correlation ID, echoed on every response. Quote it when reporting a problem.
+      schema:
+        type: string
+    XRateLimitLimit:
+      description: The sustained allowance in points per second.
+      schema:
+        type: number
+    XRateLimitRemaining:
+      description: Points still available in the burst allowance.
+      schema:
+        type: integer
+    XRateLimitReset:
+      description: Seconds until the allowance is fully replenished.
+      schema:
+        type: integer
+
+  responses:
+    Problem:
+      description: An RFC 9457 problem document.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/XRequestId'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Missing or invalid credentials.
+      headers:
+        WWW-Authenticate:
+          description: The Bearer challenge.
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    RateLimited:
+      description: Quota exhausted.
+      headers:
+        Retry-After:
+          description: |
+            Seconds to wait before retrying. Absent when retrying cannot help
+            because the batch exceeds the burst allowance.
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    IngestRequest:
+      type: object
+      required: [points]
+      additionalProperties: false
+      properties:
+        points:
+          type: array
+          minItems: 1
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/Point'
+
+    Point:
+      type: object
+      required: [metric, kind, value]
+      additionalProperties: false
+      description: |
+        Unknown fields are rejected rather than ignored, so a typo such as
+        `timestmap` is reported immediately instead of silently dropping data.
+      properties:
+        metric:
+          type: string
+          maxLength: 200
+          pattern: '^[a-zA-Z_][a-zA-Z0-9_.\-]*$'
+          description: Dotted metric name. Must start with a letter or underscore.
+          example: http.request.duration_ms
+        kind:
+          type: string
+          enum: [gauge, counter, histogram]
+          description: |
+            `gauge` moves in any direction, `counter` is a monotonic total and
+            must not be negative, `histogram` is an observation to be bucketed.
+        value:
+          type: number
+          format: double
+          description: |
+            Must be finite. NaN and the infinities are rejected: a single one
+            poisons every aggregate it reaches, with nothing left to identify
+            which point caused it.
+          example: 12.5
+        timestamp:
+          type: string
+          format: date-time
+          description: |
+            RFC 3339. Defaults to the arrival time when omitted. May be up to
+            5 minutes in the future to tolerate client clock drift, and up to
+            7 days in the past — older data arrives after its aggregation
+            window has closed.
+        labels:
+          type: object
+          maxProperties: 20
+          additionalProperties:
+            type: string
+            maxLength: 256
+          propertyNames:
+            pattern: '^[a-zA-Z_][a-zA-Z0-9_]*$'
+            maxLength: 64
+          description: |
+            Dimensions to break the metric down by. The 20-label ceiling is the
+            tightest limit in the API: cardinality is multiplicative, and an
+            unbounded label set is the fastest way to make a time-series store
+            unqueryable. Keys beginning `__` are reserved by the platform.
+
+    IngestResponse:
+      type: object
+      required: [batch_id, accepted, rejected]
+      properties:
+        batch_id:
+          type: string
+          description: Identifies the accepted batch downstream.
+        accepted:
+          type: integer
+          description: Points admitted to the pipeline.
+        rejected:
+          type: integer
+          description: Points that failed validation. Always exact.
+        errors:
+          type: array
+          maxItems: 100
+          description: |
+            The individual failures, capped at 100 entries so a response cannot
+            dwarf the request that produced it.
+          items:
+            $ref: '#/components/schemas/FieldError'
+        errors_truncated:
+          type: boolean
+          description: True when `errors` lists fewer entries than `rejected`.
+
+    FieldError:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: Dotted path to the offending value, including the batch index.
+          example: points.3.labels.service
+        message:
+          type: string
+          description: What the submitter must change.
+
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+          description: Human-readable explanation. Do not branch on this.
+        code:
+          type: string
+          description: Stable machine-readable identifier. Branch on this.
+          enum:
+            - bad_request
+            - validation_failed
+            - unauthorized
+            - forbidden
+            - not_found
+            - method_not_allowed
+            - conflict
+            - payload_too_large
+            - unsupported_media_type
+            - rate_limited
+            - timeout
+            - service_unavailable
+            - internal_error
+        request_id:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    ProbeStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, draining, degraded]
+        checks:
+          type: object
+          additionalProperties:
+            type: string
+          description: Per-dependency result; `ok` or the failure reason.
+
+    VersionInfo:
+      type: object
+      properties:
+        version:
+          type: string
+        commit:
+          type: string
+        build_date:
+          type: string
+        go_version:
+          type: string
+        platform:
+          type: string

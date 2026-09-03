@@ -10,6 +10,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -53,6 +54,40 @@ type Config struct {
 	Log LogConfig
 	// Shutdown holds graceful-termination settings.
 	Shutdown ShutdownConfig
+	// Auth holds credential settings.
+	Auth AuthConfig
+	// Ingest holds the ingestion limits and quotas.
+	Ingest IngestConfig
+}
+
+// AuthConfig configures API key authentication.
+type AuthConfig struct {
+	// Disabled turns authentication off entirely. Only permitted on the local
+	// and dev tiers; validation rejects it anywhere else.
+	Disabled bool
+	// Keys is the raw JSON key document. It takes precedence over KeysFile.
+	Keys string
+	// KeysFile is a path to the key document, which is how a secret manager
+	// mounts credentials into a container.
+	KeysFile string
+}
+
+// IngestConfig configures the ingestion endpoint.
+type IngestConfig struct {
+	// MaxPointsPerBatch caps how many observations one request may carry.
+	MaxPointsPerBatch int
+	// MaxClockSkew is how far into the future a timestamp may be.
+	MaxClockSkew time.Duration
+	// MaxBackfill is how far into the past a timestamp may be.
+	MaxBackfill time.Duration
+	// RateLimitPointsPerSecond is the default sustained per-tenant rate. A key
+	// may override it.
+	RateLimitPointsPerSecond float64
+	// RateLimitBurst is the default per-tenant burst allowance.
+	RateLimitBurst int
+	// IdempotencyTTL is how long a completed outcome is replayable. Zero
+	// disables idempotency handling.
+	IdempotencyTTL time.Duration
 }
 
 // HTTPConfig configures the public HTTP listener.
@@ -113,9 +148,12 @@ type lookupFunc func(string) (string, bool)
 func load(lookup lookupFunc) (Config, error) {
 	l := &loader{lookup: lookup}
 
+	// The tier is resolved first because a few defaults depend on it.
+	env := Environment(l.str("ENVIRONMENT", string(EnvLocal)))
+
 	cfg := Config{
 		Service:     l.str("SERVICE_NAME", "fluxgate-ingest-api"),
-		Environment: Environment(l.str("ENVIRONMENT", string(EnvLocal))),
+		Environment: env,
 		HTTP: HTTPConfig{
 			Addr:               l.str("HTTP_ADDR", ":8080"),
 			ReadHeaderTimeout:  l.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
@@ -134,6 +172,23 @@ func load(lookup lookupFunc) (Config, error) {
 		Shutdown: ShutdownConfig{
 			GracePeriod:  l.duration("SHUTDOWN_GRACE_PERIOD", 5*time.Second),
 			DrainTimeout: l.duration("SHUTDOWN_DRAIN_TIMEOUT", 25*time.Second),
+		},
+		Auth: AuthConfig{
+			// Local development defaults to no authentication so that a fresh
+			// clone runs with no setup. Every other tier defaults to requiring
+			// it, and validation makes disabling it impossible on staging and
+			// prod regardless of what the environment says.
+			Disabled: l.boolean("AUTH_DISABLED", env == EnvLocal),
+			Keys:     l.str("API_KEYS", ""),
+			KeysFile: l.str("API_KEYS_FILE", ""),
+		},
+		Ingest: IngestConfig{
+			MaxPointsPerBatch:        l.integer("INGEST_MAX_POINTS_PER_BATCH", 1000),
+			MaxClockSkew:             l.duration("INGEST_MAX_CLOCK_SKEW", 5*time.Minute),
+			MaxBackfill:              l.duration("INGEST_MAX_BACKFILL", 7*24*time.Hour),
+			RateLimitPointsPerSecond: l.float("RATE_LIMIT_POINTS_PER_SECOND", 10_000),
+			RateLimitBurst:           l.integer("RATE_LIMIT_BURST", 20_000),
+			IdempotencyTTL:           l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 		},
 	}
 
@@ -181,6 +236,51 @@ func (c Config) validate(l *loader) {
 	}
 	if c.Shutdown.DrainTimeout <= 0 {
 		l.reject("SHUTDOWN_DRAIN_TIMEOUT", "must be greater than zero")
+	}
+
+	c.validateAuth(l)
+	c.validateIngest(l)
+}
+
+func (c Config) validateAuth(l *loader) {
+	// Shipping an unauthenticated ingest endpoint would let anyone write into
+	// any tenant's data. Making that impossible to configure is worth more than
+	// any amount of documentation warning against it.
+	if c.Auth.Disabled && c.Environment.IsProduction() {
+		l.reject("AUTH_DISABLED",
+			"must not be true on the "+string(c.Environment)+" tier; authentication is mandatory outside local and dev")
+		return
+	}
+	if c.Auth.Disabled {
+		return
+	}
+
+	if c.Auth.Keys == "" && c.Auth.KeysFile == "" {
+		l.reject("API_KEYS",
+			"is required (or set API_KEYS_FILE) unless AUTH_DISABLED is true")
+	}
+}
+
+func (c Config) validateIngest(l *loader) {
+	if c.Ingest.MaxPointsPerBatch <= 0 {
+		l.reject("INGEST_MAX_POINTS_PER_BATCH", "must be greater than zero")
+	}
+	if c.Ingest.RateLimitPointsPerSecond <= 0 {
+		l.reject("RATE_LIMIT_POINTS_PER_SECOND", "must be greater than zero")
+	}
+	if c.Ingest.RateLimitBurst <= 0 {
+		l.reject("RATE_LIMIT_BURST", "must be greater than zero")
+	}
+	// A burst below one batch means a full-sized batch can never be admitted,
+	// no matter how long the client waits -- a quota that rejects every
+	// conforming request is a misconfiguration, not a policy.
+	if c.Ingest.RateLimitBurst > 0 && c.Ingest.MaxPointsPerBatch > c.Ingest.RateLimitBurst {
+		l.reject("RATE_LIMIT_BURST", fmt.Sprintf(
+			"must be at least INGEST_MAX_POINTS_PER_BATCH (%d), or a full batch can never be admitted",
+			c.Ingest.MaxPointsPerBatch))
+	}
+	if c.Ingest.MaxBackfill <= 0 {
+		l.reject("INGEST_MAX_BACKFILL", "must be greater than zero")
 	}
 }
 
@@ -267,6 +367,36 @@ func (l *loader) boolean(key string, def bool) bool {
 		return def
 	}
 	return b
+}
+
+func (l *loader) integer(key string, def int) int {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		l.reject(key, fmt.Sprintf("%q is not a valid integer", v))
+		return def
+	}
+	return n
+}
+
+func (l *loader) float(key string, def float64) float64 {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		l.reject(key, fmt.Sprintf("%q is not a valid number", v))
+		return def
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		l.reject(key, fmt.Sprintf("%q is not a finite number", v))
+		return def
+	}
+	return f
 }
 
 // byteUnits are matched longest-suffix-first so that "KB" is not mistaken for

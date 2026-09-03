@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jon-jc/fluxgate/internal/auth"
 	"github.com/jon-jc/fluxgate/internal/config"
 	"github.com/jon-jc/fluxgate/internal/httpx"
 	"github.com/jon-jc/fluxgate/internal/observability"
@@ -21,6 +22,10 @@ type Deps struct {
 	Config config.Config
 	Logger *slog.Logger
 	Health *observability.Health
+	// Auth configures credential checking for the authenticated route group.
+	Auth auth.Options
+	// Ingest supplies the collaborators for POST /v1/ingest.
+	Ingest IngestDeps
 }
 
 // Probe paths are mounted outside the versioned namespace because
@@ -42,6 +47,14 @@ func NewRouter(deps Deps) http.Handler {
 
 	mux.Handle("GET /v1/version", httpx.Handler(handleVersion))
 
+	// Everything that touches tenant data goes through authentication. Applying
+	// it per-route rather than to the whole mux keeps the probes reachable by an
+	// orchestrator that holds no credentials, and makes the authenticated set
+	// something a reviewer can see at a glance rather than infer from a path
+	// prefix convention.
+	authenticated := auth.Middleware(deps.Auth)
+	mux.Handle("POST /v1/ingest", authenticated(handleIngest(deps.Ingest)))
+
 	// ServeMux's implicit 404 is a plain-text body, which would make this the
 	// only endpoint in the API that does not speak problem+json. Registering a
 	// catch-all also shadows the mux's own 405 handling, so the fallback has to
@@ -59,6 +72,9 @@ func NewRouter(deps Deps) http.Handler {
 			SlowRequestThreshold: 1 * time.Second,
 		}),
 		httpx.SecurityHeaders,
+		// Applied above the route table so the challenge accompanies every 401
+		// the API can produce, not only those raised inside the auth middleware.
+		auth.WWWAuthenticate,
 		httpx.RequestTimeout(deps.Config.HTTP.HandlerTimeout),
 		httpx.MaxBytes(deps.Config.HTTP.MaxRequestBytes),
 	)
