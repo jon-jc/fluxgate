@@ -78,6 +78,67 @@ jobs:
           path: coverage.out
           retention-days: 7
 
+  integration:
+    name: Integration (Pub/Sub emulator)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # Run as a plain container rather than a `services:` entry: the emulator
+      # image needs a command override to bind 0.0.0.0, and `services:` cannot
+      # supply one. Binding to localhost inside the container would accept the
+      # published connection and then refuse it, which looks exactly like a
+      # broken client.
+      - name: Start the Pub/Sub emulator
+        run: |
+          docker run -d --name pubsub -p 8681:8085 \
+            gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
+            gcloud beta emulators pubsub start \
+              --host-port=0.0.0.0:8085 --project=fluxgate-test
+
+          for i in $(seq 1 60); do
+            if timeout 1 bash -c '</dev/tcp/localhost/8681' 2>/dev/null; then
+              echo "emulator accepting connections"
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::the emulator never became reachable"
+              docker logs pubsub
+              exit 1
+            fi
+            sleep 1
+          done
+
+      # The race detector matters most here: the subscriber dispatches messages
+      # concurrently, which is where a data race would actually live.
+      - name: Integration tests
+        env:
+          PUBSUB_EMULATOR_HOST: localhost:8681
+        run: go test -race -count=1 -timeout 10m ./internal/pubsubx/...
+
+      # A skip here would mean the integration tests silently stopped running,
+      # which is worse than them failing: the suite would go green while
+      # covering nothing.
+      - name: Assert the tests actually ran
+        env:
+          PUBSUB_EMULATOR_HOST: localhost:8681
+        run: |
+          output=$(go test -count=1 -v -run TestPublishAndReceive ./internal/pubsubx/...)
+          echo "$output"
+          if echo "$output" | grep -q "SKIP"; then
+            echo "::error::integration tests were skipped; the emulator was not detected"
+            exit 1
+          fi
+
+      - name: Emulator logs on failure
+        if: failure()
+        run: docker logs pubsub
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

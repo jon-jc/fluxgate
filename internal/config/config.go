@@ -58,6 +58,48 @@ type Config struct {
 	Auth AuthConfig
 	// Ingest holds the ingestion limits and quotas.
 	Ingest IngestConfig
+	// PubSub holds the event transport settings.
+	PubSub PubSubConfig
+}
+
+// PubSubConfig configures the Pub/Sub transport.
+type PubSubConfig struct {
+	// Enabled selects the durable transport over the in-memory sink. Defaults
+	// to false only on the local tier with no emulator configured.
+	Enabled bool
+	// ProjectID owns the topics and subscriptions.
+	ProjectID string
+	// EmulatorHost points at a local emulator instead of the real service.
+	// Empty falls back to PUBSUB_EMULATOR_HOST.
+	EmulatorHost string
+	// Bootstrap creates any missing topics and subscriptions at startup. It is
+	// for local development and tests; deployed topology comes from Terraform.
+	Bootstrap bool
+
+	// RawTopic carries accepted batches from the edge.
+	RawTopic string
+	// DeadLetterTopic receives messages that exhaust their delivery attempts.
+	DeadLetterTopic string
+	// AggregatorSubscription is the working subscription on RawTopic.
+	AggregatorSubscription string
+
+	// PublishTimeout bounds a single publish including client-side retries.
+	PublishTimeout time.Duration
+	// BatchDelay is how long the client accumulates messages before sending.
+	BatchDelay time.Duration
+	// BatchCount is how many messages accumulate before sending.
+	BatchCount int
+	// MaxOutstandingMessages caps buffered messages awaiting publish; exceeding
+	// it sheds load rather than growing without bound.
+	MaxOutstandingMessages int
+	// MaxOutstandingBytes caps the memory held by buffered messages.
+	MaxOutstandingBytes int
+
+	// BreakerFailureThreshold is how many consecutive publish failures trip
+	// the circuit breaker.
+	BreakerFailureThreshold int
+	// BreakerCooldown is how long the breaker fails fast before probing.
+	BreakerCooldown time.Duration
 }
 
 // AuthConfig configures API key authentication.
@@ -151,6 +193,11 @@ func load(lookup lookupFunc) (Config, error) {
 	// The tier is resolved first because a few defaults depend on it.
 	env := Environment(l.str("ENVIRONMENT", string(EnvLocal)))
 
+	// PUBSUB_EMULATOR_HOST is the variable the Google client libraries already
+	// read, so it is honoured here rather than inventing a second name that
+	// could disagree with it.
+	emulator := l.str("PUBSUB_EMULATOR_HOST", "")
+
 	cfg := Config{
 		Service:     l.str("SERVICE_NAME", "fluxgate-ingest-api"),
 		Environment: env,
@@ -189,6 +236,31 @@ func load(lookup lookupFunc) (Config, error) {
 			RateLimitPointsPerSecond: l.float("RATE_LIMIT_POINTS_PER_SECOND", 10_000),
 			RateLimitBurst:           l.integer("RATE_LIMIT_BURST", 20_000),
 			IdempotencyTTL:           l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
+		},
+		PubSub: PubSubConfig{
+			// Anything past the local tier publishes for real. An emulator
+			// host is taken as an explicit request for the durable path, since
+			// nobody points at an emulator expecting the in-memory sink.
+			Enabled:      l.boolean("PUBSUB_ENABLED", env != EnvLocal || emulator != ""),
+			ProjectID:    l.str("GCP_PROJECT_ID", ""),
+			EmulatorHost: emulator,
+			// Creating topology needs admin permissions at runtime, which is a
+			// far larger blast radius than publish-and-subscribe. Allowed only
+			// where an emulator is in play.
+			Bootstrap: l.boolean("PUBSUB_BOOTSTRAP", emulator != ""),
+
+			RawTopic:               l.str("PUBSUB_TOPIC_RAW", "telemetry-raw"),
+			DeadLetterTopic:        l.str("PUBSUB_TOPIC_DLQ", "telemetry-dlq"),
+			AggregatorSubscription: l.str("PUBSUB_SUBSCRIPTION_AGGREGATOR", "telemetry-aggregator"),
+
+			PublishTimeout:         l.duration("PUBSUB_PUBLISH_TIMEOUT", 10*time.Second),
+			BatchDelay:             l.duration("PUBSUB_BATCH_DELAY", 10*time.Millisecond),
+			BatchCount:             l.integer("PUBSUB_BATCH_COUNT", 100),
+			MaxOutstandingMessages: l.integer("PUBSUB_MAX_OUTSTANDING_MESSAGES", 1000),
+			MaxOutstandingBytes:    int(l.bytes("PUBSUB_MAX_OUTSTANDING_BYTES", 64<<20)),
+
+			BreakerFailureThreshold: l.integer("PUBSUB_BREAKER_FAILURE_THRESHOLD", 5),
+			BreakerCooldown:         l.duration("PUBSUB_BREAKER_COOLDOWN", 10*time.Second),
 		},
 	}
 
@@ -240,6 +312,45 @@ func (c Config) validate(l *loader) {
 
 	c.validateAuth(l)
 	c.validateIngest(l)
+	c.validatePubSub(l)
+}
+
+func (c Config) validatePubSub(l *loader) {
+	// The in-memory sink accepts a batch, answers 202 and then discards it on
+	// the next restart. That is fine for a laptop and catastrophic in
+	// production, where it would report success for data nobody ever receives.
+	if !c.PubSub.Enabled {
+		if c.Environment.IsProduction() {
+			l.reject("PUBSUB_ENABLED",
+				"must not be false on the "+string(c.Environment)+
+					" tier; the in-memory sink acknowledges batches it then discards")
+		}
+		return
+	}
+
+	if c.PubSub.ProjectID == "" {
+		l.reject("GCP_PROJECT_ID", "is required when PUBSUB_ENABLED is true")
+	}
+	if c.PubSub.RawTopic == "" {
+		l.reject("PUBSUB_TOPIC_RAW", "must not be empty")
+	}
+	if c.PubSub.PublishTimeout <= 0 {
+		l.reject("PUBSUB_PUBLISH_TIMEOUT", "must be greater than zero")
+	}
+	if c.PubSub.MaxOutstandingMessages <= 0 {
+		l.reject("PUBSUB_MAX_OUTSTANDING_MESSAGES", "must be greater than zero")
+	}
+	if c.PubSub.BreakerFailureThreshold <= 0 {
+		l.reject("PUBSUB_BREAKER_FAILURE_THRESHOLD", "must be greater than zero")
+	}
+	// Creating topics and subscriptions requires admin credentials at runtime.
+	// Granting those to a request-serving process is a blast radius nobody
+	// should accept in exchange for saving a Terraform apply.
+	if c.PubSub.Bootstrap && c.Environment.IsProduction() {
+		l.reject("PUBSUB_BOOTSTRAP",
+			"must not be true on the "+string(c.Environment)+
+				" tier; deployed topology belongs in Terraform, not in a runtime admin call")
+	}
 }
 
 func (c Config) validateAuth(l *loader) {

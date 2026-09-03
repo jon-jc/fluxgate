@@ -37,6 +37,62 @@ flowchart LR
 
 Each milestone lands as its own reviewed pull request.
 
+## The event transport
+
+Accepted batches are published to Pub/Sub and consumed asynchronously. The
+whole path -- validation, publish, broker, consume -- is exercised in CI against
+a real emulator rather than a mock.
+
+**A 202 is a durability guarantee, not a hopeful one.** `Publish` waits for the
+broker to acknowledge the message before the handler returns. The faster
+alternative, accepting into an in-process buffer and replying 202 immediately,
+is quietly dishonest: it reports success for data that a crash, a deploy or an
+OOM kill silently discards. Client-side batching is what keeps that honesty
+from costing throughput.
+
+**Load is shed, not buffered.** Publisher flow control signals an error rather
+than blocking. A blocked publish holds an HTTP connection open with no upper
+bound, so a slow broker quietly converts into an exhausted server; rejecting
+the request lets the client retry against an instance that has capacity.
+
+**A circuit breaker turns an outage into a fast 503.** The problem with a
+dependency being down is not the failure, it is the queue behind it: every
+publish waits out its full timeout holding a connection, a goroutine and a
+request worth of memory. After a few consecutive failures the breaker opens and
+fails immediately, then admits a limited number of probes after a cooldown --
+enough to notice recovery, not enough to knock over a broker that is only just
+coming back. Readiness reads the breaker rather than making its own probe call,
+so an instance that cannot publish leaves rotation instead of accepting batches
+it will only reject.
+
+**Message ordering is deliberately off.** It would pin publishing to one region
+and serialise delivery per key. Every aggregation downstream is sum, count, min
+or max, all commutative, so ordering would be a throughput ceiling bought in
+exchange for nothing.
+
+**Retryable and permanent failures are different things.** A consumer whose
+database blinked must retry; a consumer handed a body that is not valid JSON
+must not, because the thousandth attempt fails exactly like the first while
+burning quota. Permanent failures are nacked straight through to a dead-letter
+queue, where the payload is preserved and inspectable. Every working
+subscription the bootstrap creates has a dead-letter policy attached, because
+one without it redelivers a poisoned message forever.
+
+**Attributes are a routing surface, not decoration.** Pub/Sub subscription
+filters can only match on attributes, so tenant, schema version, batch ID and
+point count travel there as well as in the body: a per-tenant subscription can
+be filtered server-side without every consumer deserialising messages it is
+about to discard. The request ID rides along too, which is what lets a trace
+continue from the HTTP edge into an aggregator running minutes later on a
+different machine.
+
+**The envelope is versioned JSON.** At this message size the bandwidth saving
+of a binary format is immaterial next to the operational cost of a payload an
+engineer cannot read straight off a dead-letter queue at 3am. The schema
+version is the hedge: consumers reject a version they were not written for
+rather than guessing, so changing encodings later is a version bump, not a
+rewrite.
+
 ## The ingest endpoint
 
 `POST /v1/ingest` takes a batch of metric points. The full contract is in
@@ -164,11 +220,43 @@ Skipping step 2 is the usual cause of a handful of 502s on every deploy.
 
 ## Quick start
 
-Requires Go 1.25 or newer.
+The full stack -- Pub/Sub emulator and the ingest API -- comes up with one
+command. Requires Docker.
 
 ```bash
 git clone https://github.com/jon-jc/fluxgate.git
 cd fluxgate
+make up
+```
+
+Send a batch through the real broker:
+
+```bash
+curl -X POST localhost:8080/v1/ingest \
+  -H 'Authorization: Bearer fxg_local_local-dev-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[{"metric":"queue.depth","kind":"gauge","value":42}]}'
+```
+
+```json
+{"batch_id":"7f0c8e8327d609ba5917480caeea6a7b","accepted":1,"rejected":0}
+```
+
+Readiness reports the transport too:
+
+```bash
+curl -s localhost:8080/readyz
+# {"status":"ok","checks":{"pubsub-publisher":"ok"}}
+```
+
+`make down` discards the stack and its state.
+
+### Without Docker
+
+Requires Go 1.25 or newer. Runs against the in-memory sink with authentication
+off:
+
+```bash
 make run
 ```
 
@@ -203,13 +291,19 @@ pivot with.
 ## Development
 
 ```bash
-make help        # list every target
-make test        # unit tests with the race detector
-make cover       # coverage profile and per-package summary
-make lint        # golangci-lint
-make vulncheck   # known vulnerabilities in dependencies
-make ci          # what the pipeline enforces
+make help              # list every target
+make test              # unit tests with the race detector
+make test-integration  # tests that need a real broker (starts the emulator)
+make cover             # coverage profile and per-package summary
+make lint              # golangci-lint
+make vulncheck         # known vulnerabilities in dependencies
+make ci                # what the pipeline enforces
 ```
+
+The Pub/Sub tests skip themselves when `PUBSUB_EMULATOR_HOST` is unset, so
+`go test ./...` stays green without Docker. CI runs them against a real
+emulator under the race detector, and fails the build if they report a skip --
+a suite that silently stops covering anything is worse than one that fails.
 
 `make test` needs cgo for the race detector. On a machine without a C toolchain,
 use `make test-short` locally — CI runs the race detector on Linux regardless.
@@ -227,11 +321,18 @@ The ones that most often need changing:
 | `AUTH_DISABLED` | `true` on `local`, else `false` | Validation **refuses** `true` on staging and prod |
 | `API_KEYS` / `API_KEYS_FILE` | — | Required whenever authentication is on |
 | `RATE_LIMIT_POINTS_PER_SECOND` | `10000` | Per tenant; a key may override it |
+| `PUBSUB_ENABLED` | `false` on `local`, else `true` | Validation **refuses** `false` on staging and prod |
+| `GCP_PROJECT_ID` | -- | Required when the transport is enabled |
+| `PUBSUB_EMULATOR_HOST` | -- | Setting it also enables the transport and topology bootstrap |
 | `HTTP_TRUST_PROXY_HEADER` | `false` | Enable only behind a proxy that rewrites `X-Forwarded-For` |
 
-An unauthenticated ingest endpoint would let anyone write into any tenant's
-data, so `AUTH_DISABLED=true` on a staging or production tier is a boot failure
-rather than a documented warning.
+Two settings are boot failures rather than documented warnings, because both
+would be silently catastrophic. `AUTH_DISABLED=true` on a deployed tier lets
+anyone write into any tenant's data, and `PUBSUB_ENABLED=false` there means the
+service acknowledges batches it then discards. `PUBSUB_BOOTSTRAP=true` is
+refused for a third reason: creating topology needs runtime admin credentials,
+a far larger blast radius than publish-and-subscribe, and deployed topology
+belongs in Terraform.
 
 ### Issuing an API key
 
@@ -262,10 +363,13 @@ internal/httpx/         handler contract, error envelope, middleware, server
 internal/idempotency/   replaying outcomes for retried requests
 internal/ingest/        the sink seam between HTTP and the delivery pipeline
 internal/observability/ logging and health probes
+internal/pubsubx/       envelope, publisher, subscriber runtime, topology
 internal/ratelimit/     sharded token-bucket throttling
+internal/resilience/    circuit breaker
 internal/telemetry/     the metric domain model and its validation rules
 internal/version/       build provenance
 build/docker/           multi-stage Dockerfile shared by every service
+deploy/                 docker-compose stack for local development
 ```
 
 ## License
