@@ -323,13 +323,11 @@ func asAPIError(ctx context.Context, err error) *Error {
 	return Internal(err)
 }
 
-// DecodeJSON reads a JSON request body into dst, rejecting anything ambiguous.
+// RequireJSONContentType rejects a request that declares a non-JSON body.
 //
-// Unknown fields are an error rather than a silent no-op: a client that sends
-// "streem_id" deserves to hear about the typo immediately instead of debugging
-// why its data never arrived. The diagnostics name the offending field and
-// byte offset so the caller can fix the payload without guesswork.
-func DecodeJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) error {
+// An absent Content-Type is tolerated: plenty of minimal clients omit it, and
+// the decoder will reject the body anyway if it is not actually JSON.
+func RequireJSONContentType(r *http.Request) error {
 	if ct := r.Header.Get("Content-Type"); ct != "" && !isJSONContentType(ct) {
 		return &Error{
 			Status:  http.StatusUnsupportedMediaType,
@@ -337,10 +335,38 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any)
 			Message: "Content-Type must be application/json.",
 		}
 	}
+	return nil
+}
 
+// ReadBody reads the entire request body, enforcing maxBytes.
+//
+// Handlers that need the raw bytes -- to fingerprint a payload for
+// idempotency, say -- use this and then UnmarshalJSON, rather than decoding
+// from the stream and losing the original representation.
+func ReadBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
 
-	dec := json.NewDecoder(r.Body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		// MaxBytesError is mapped to 413 by asAPIError; anything else here is
+		// a truncated or aborted upload.
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return nil, err
+		}
+		return nil, BadRequest("Request body could not be read.").WithCause(err)
+	}
+	return body, nil
+}
+
+// UnmarshalJSON decodes data into dst, rejecting anything ambiguous.
+//
+// Unknown fields are an error rather than a silent no-op: a client that sends
+// "streem_id" deserves to hear about the typo immediately instead of debugging
+// why its data never arrived. The diagnostics name the offending field and
+// byte offset so the caller can fix the payload without guesswork.
+func UnmarshalJSON(data []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 
 	if err := dec.Decode(dst); err != nil {
@@ -353,6 +379,19 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any)
 		return BadRequest("Request body must contain exactly one JSON document.")
 	}
 	return nil
+}
+
+// DecodeJSON reads a JSON request body into dst.
+func DecodeJSON(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) error {
+	if err := RequireJSONContentType(r); err != nil {
+		return err
+	}
+
+	body, err := ReadBody(w, r, maxBytes)
+	if err != nil {
+		return err
+	}
+	return UnmarshalJSON(body, dst)
 }
 
 func decodeError(err error) error {

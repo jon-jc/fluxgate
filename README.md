@@ -27,8 +27,8 @@ flowchart LR
 
 | Milestone | Scope | State |
 | --------- | ----- | ----- |
-| 1 | Service foundation: config, logging, HTTP middleware, probes, graceful shutdown, CI | In review |
-| 2 | Ingest API: metric model, validation, API-key auth, per-tenant rate limiting, OpenAPI | Planned |
+| 1 | Service foundation: config, logging, HTTP middleware, probes, graceful shutdown, CI | Merged |
+| 2 | Ingest API: metric model, validation, API-key auth, per-tenant rate limiting, OpenAPI | In review |
 | 3 | Pub/Sub layer: batched publisher, subscriber runtime, retries, DLQ, emulator harness | Planned |
 | 4 | Aggregator: windowing, watermarks, duplicate suppression, Postgres rollups | Planned |
 | 5 | Query API and alerting: time-series queries, SSE live tail, rule evaluation | Planned |
@@ -37,7 +37,73 @@ flowchart LR
 
 Each milestone lands as its own reviewed pull request.
 
-## What is implemented today
+## The ingest endpoint
+
+`POST /v1/ingest` takes a batch of metric points. The full contract is in
+[api/openapi.yaml](api/openapi.yaml); the decisions behind it are below.
+
+```bash
+curl -X POST localhost:8080/v1/ingest   -H 'Authorization: Bearer fxg_k1_<secret>'   -H 'Content-Type: application/json'   -d '{"points":[
+        {"metric":"http.request.duration_ms","kind":"histogram","value":12.5,
+         "labels":{"service":"checkout","region":"us-central1"}},
+        {"metric":"queue.depth","kind":"gauge","value":42}
+      ]}'
+```
+
+```json
+{"batch_id":"9f2c1a4be6d84f0fa1c3e7b25d908146","accepted":2,"rejected":0}
+```
+
+**Partial success is the point.** A batch with one bad point admits the other
+999 and reports the failure with its exact index. Rejecting the whole batch
+would let a single misbehaving call site in a client silently blind an entire
+service's telemetry — and telemetry is exactly what you need working when
+something is going wrong. A 202 does not mean everything was accepted; check
+`rejected`.
+
+```json
+{"batch_id":"47f5...","accepted":1,"rejected":2,"errors":[
+  {"field":"points.1.metric","message":"contains \"9\" at position 0; use letters, digits, '_', '.' and '-', starting with a letter or '_'"},
+  {"field":"points.2.labels.__tenant","message":"uses the reserved \"__\" prefix"}
+]}
+```
+
+**Validation protects specific downstream resources**, and the tightest rule is
+the 20-label ceiling: cardinality is multiplicative, and an unbounded label set
+is the fastest way to make a time-series store unqueryable. Non-finite values
+are rejected because a single NaN turns a whole window's mean into NaN with
+nothing left to identify which point caused it. Timestamps may run 5 minutes
+ahead — client clocks drift, and rejecting those senders loses real data — but
+not 7 days behind, since that data arrives after its aggregation window has
+closed. Labels prefixed `__` are reserved, so a tenant cannot forge a system
+dimension and write into another tenant's series.
+
+**Quota is metered in points per second, not requests per second.** A thousand
+points in one batch and a thousand single-point requests place identical load
+on everything downstream, so charging per request would let a caller evade its
+allowance simply by batching. The limiter is a sharded token bucket: a fixed
+window would admit a double-rate spike across its boundary, which is precisely
+the traffic shape that overwhelms a downstream service. Denials carry
+`Retry-After` — unless waiting cannot help, because the batch is larger than the
+burst will ever hold, in which case the response says to split it instead.
+
+**Retries are safe.** A client that times out cannot tell whether its batch
+landed. Send `Idempotency-Key` and repeat the identical body: the original
+response is replayed rather than the data being counted twice. Reusing a key
+with a *different* body is a 409 — replaying the first response there would
+silently discard the second batch.
+
+**Authentication is bearer API keys** in the form `fxg_<key id>_<secret>`. Only
+a SHA-256 digest is stored, so a leaked configuration file does not hand anyone
+working credentials. Every failure returns a byte-identical 401 regardless of
+cause: a client that could distinguish "unknown key" from "bad secret" has an
+oracle for enumerating valid key IDs. Verification runs a constant-time
+comparison against a placeholder digest even when the key ID does not exist, so
+timing does not leak what the response body refuses to.
+
+The tenant always comes from the credential, never from the request body.
+
+## The foundation
 
 Milestone 1 is the substrate every service in the platform is built on.
 
@@ -153,23 +219,53 @@ use `make test-short` locally — CI runs the race detector on Linux regardless.
 Every setting has a working default; an empty environment boots correctly. See
 [.env.example](.env.example) for the full list with defaults and constraints.
 
-The two that most often need changing:
+The ones that most often need changing:
 
 | Variable | Default | Notes |
 | -------- | ------- | ----- |
 | `ENVIRONMENT` | `local` | `local`, `dev`, `staging` or `prod` |
+| `AUTH_DISABLED` | `true` on `local`, else `false` | Validation **refuses** `true` on staging and prod |
+| `API_KEYS` / `API_KEYS_FILE` | — | Required whenever authentication is on |
+| `RATE_LIMIT_POINTS_PER_SECOND` | `10000` | Per tenant; a key may override it |
 | `HTTP_TRUST_PROXY_HEADER` | `false` | Enable only behind a proxy that rewrites `X-Forwarded-For` |
+
+An unauthenticated ingest endpoint would let anyone write into any tenant's
+data, so `AUTH_DISABLED=true` on a staging or production tier is a boot failure
+rather than a documented warning.
+
+### Issuing an API key
+
+The service stores only the digest, so generate the secret yourself and keep it:
+
+```bash
+SECRET=$(openssl rand -hex 32)
+echo "give this to the client: fxg_k1_$SECRET"
+printf %s "$SECRET" | sha256sum | cut -d' ' -f1
+```
+
+Put the digest in the key document:
+
+```json
+[{"key_id":"k1","tenant_id":"acme","secret_sha256":"<digest>",
+  "rate_limit_per_second":5000,"burst":10000}]
+```
 
 ## Repository layout
 
 ```
-cmd/ingest-api/        service entrypoint
-internal/api/          route table and handler wiring
-internal/config/       environment configuration and validation
-internal/httpx/        handler contract, error envelope, middleware, server
+api/openapi.yaml        the public API contract
+cmd/ingest-api/         service entrypoint
+internal/api/           route table and request handlers
+internal/auth/          API key verification and tenant resolution
+internal/config/        environment configuration and validation
+internal/httpx/         handler contract, error envelope, middleware, server
+internal/idempotency/   replaying outcomes for retried requests
+internal/ingest/        the sink seam between HTTP and the delivery pipeline
 internal/observability/ logging and health probes
-internal/version/      build provenance
-build/docker/          multi-stage Dockerfile shared by every service
+internal/ratelimit/     sharded token-bucket throttling
+internal/telemetry/     the metric domain model and its validation rules
+internal/version/       build provenance
+build/docker/           multi-stage Dockerfile shared by every service
 ```
 
 ## License

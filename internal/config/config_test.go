@@ -45,6 +45,7 @@ func TestLoadOverrides(t *testing.T) {
 	cfg, err := load(env(map[string]string{
 		"SERVICE_NAME":             "fluxgate-test",
 		"ENVIRONMENT":              "prod",
+		"API_KEYS":                 `[{"key_id":"k1","tenant_id":"t","secret_sha256":"x"}]`,
 		"HTTP_ADDR":                ":9999",
 		"HTTP_READ_HEADER_TIMEOUT": "2s",
 		"HTTP_HANDLER_TIMEOUT":     "3s",
@@ -205,6 +206,116 @@ func TestEnvironmentIsProduction(t *testing.T) {
 	} {
 		if got := env.IsProduction(); got != want {
 			t.Errorf("%s.IsProduction() = %v, want %v", env, got, want)
+		}
+	}
+}
+
+// TestAuthDefaultsOffOnlyLocally keeps a fresh clone runnable with no setup,
+// without letting that convenience follow the code to a deployed tier.
+func TestAuthDefaultsOffOnlyLocally(t *testing.T) {
+	local, err := load(env(map[string]string{"ENVIRONMENT": "local"}))
+	if err != nil {
+		t.Fatalf("local: %v", err)
+	}
+	if !local.Auth.Disabled {
+		t.Error("local tier requires credentials by default; a fresh clone should just run")
+	}
+
+	// Every other tier defaults to requiring credentials, so omitting them is
+	// a boot failure rather than a silently open endpoint.
+	if _, err := load(env(map[string]string{"ENVIRONMENT": "dev"})); err == nil {
+		t.Error("dev tier booted with no API keys and no explicit AUTH_DISABLED")
+	}
+}
+
+// TestAuthCannotBeDisabledInProduction is the safeguard that matters most: an
+// unauthenticated ingest endpoint would let anyone write into any tenant's
+// data, so it must be impossible to configure rather than merely discouraged.
+func TestAuthCannotBeDisabledInProduction(t *testing.T) {
+	for _, tier := range []string{"staging", "prod"} {
+		t.Run(tier, func(t *testing.T) {
+			_, err := load(env(map[string]string{
+				"ENVIRONMENT":   tier,
+				"AUTH_DISABLED": "true",
+			}))
+			if err == nil {
+				t.Fatalf("AUTH_DISABLED=true was accepted on the %s tier", tier)
+			}
+			if !strings.Contains(err.Error(), "AUTH_DISABLED") {
+				t.Errorf("error does not mention AUTH_DISABLED:\n%v", err)
+			}
+		})
+	}
+}
+
+func TestAuthRequiresAKeySourceWhenEnabled(t *testing.T) {
+	_, err := load(env(map[string]string{"ENVIRONMENT": "prod"}))
+	if err == nil {
+		t.Fatal("expected an error when authentication is on but no keys are configured")
+	}
+	if !strings.Contains(err.Error(), "API_KEYS") {
+		t.Errorf("error does not mention API_KEYS:\n%v", err)
+	}
+
+	// Either source satisfies the requirement.
+	for _, source := range []string{"API_KEYS", "API_KEYS_FILE"} {
+		t.Run(source, func(t *testing.T) {
+			if _, err := load(env(map[string]string{
+				"ENVIRONMENT": "prod",
+				source:        "value",
+			})); err != nil {
+				t.Errorf("load with %s set: %v", source, err)
+			}
+		})
+	}
+}
+
+// TestBurstMustAdmitAFullBatch rejects a quota that would refuse every
+// conforming request no matter how long the client waited.
+func TestBurstMustAdmitAFullBatch(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"INGEST_MAX_POINTS_PER_BATCH": "1000",
+		"RATE_LIMIT_BURST":            "500",
+	}))
+	if err == nil {
+		t.Fatal("a burst smaller than one batch was accepted")
+	}
+	if !strings.Contains(err.Error(), "RATE_LIMIT_BURST") {
+		t.Errorf("error does not mention RATE_LIMIT_BURST:\n%v", err)
+	}
+}
+
+func TestIngestDefaults(t *testing.T) {
+	cfg, err := load(env(nil))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if cfg.Ingest.MaxPointsPerBatch != 1000 {
+		t.Errorf("MaxPointsPerBatch = %d, want 1000", cfg.Ingest.MaxPointsPerBatch)
+	}
+	if cfg.Ingest.MaxClockSkew != 5*time.Minute {
+		t.Errorf("MaxClockSkew = %v, want 5m", cfg.Ingest.MaxClockSkew)
+	}
+	if cfg.Ingest.RateLimitPointsPerSecond != 10_000 {
+		t.Errorf("RateLimitPointsPerSecond = %g, want 10000", cfg.Ingest.RateLimitPointsPerSecond)
+	}
+	if cfg.Ingest.IdempotencyTTL != 24*time.Hour {
+		t.Errorf("IdempotencyTTL = %v, want 24h", cfg.Ingest.IdempotencyTTL)
+	}
+}
+
+func TestLoaderNumericParsing(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"INGEST_MAX_POINTS_PER_BATCH":  "lots",
+		"RATE_LIMIT_POINTS_PER_SECOND": "fast",
+	}))
+	if err == nil {
+		t.Fatal("expected an error for unparseable numbers")
+	}
+	for _, want := range []string{"INGEST_MAX_POINTS_PER_BATCH", "RATE_LIMIT_POINTS_PER_SECOND"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %s:\n%v", want, err)
 		}
 	}
 }
