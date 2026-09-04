@@ -23,23 +23,6 @@ flowchart LR
     Q -->|REST + SSE| C
 ```
 
-## Status
-
-| Milestone | Scope | State |
-| --------- | ----- | ----- |
-| 1 | Service foundation: config, logging, HTTP middleware, probes, graceful shutdown, CI | Merged |
-| 2 | Ingest API: metric model, validation, API-key auth, per-tenant rate limiting, OpenAPI | Merged |
-| 3 | Pub/Sub layer: batched publisher, subscriber runtime, retries, DLQ, emulator harness | Merged |
-| 4 | Aggregator: windowing, watermarks, duplicate suppression, Postgres rollups | Merged |
-| 5 | Query API: time-series queries, label filtering, percentiles, SSE live tail | Merged |
-| 6 | Observability: distributed tracing across the broker, Prometheus metrics, dashboards | Merged |
-| 7 | Deployment: Terraform for GCP, least-privilege IAM, alert policies, decision records | Merged |
-
-All seven milestones are merged. Each landed as its own reviewed pull request,
-so the history reads as a sequence of decisions rather than one large drop.
-
-Alerting was deliberately dropped from the plan rather than quietly left
-promised; [ADR 7](docs/adr/0007-deferred-alerting.md) records why.
 
 ## Deploying
 
