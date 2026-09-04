@@ -420,9 +420,22 @@ jobs:
             -e POSTGRES_DB=fluxgate \
             postgres:17-alpine
 
-          for i in $(seq 1 60); do
-            docker exec postgres pg_isready -U fluxgate -d fluxgate >/dev/null 2>&1 && break
-            if [ "$i" = "60" ]; then
+          # pg_isready is not sufficient on its own: the official image runs a
+          # temporary server during initdb that answers it, then restarts. A
+          # real query, three times consecutively, is what actually proves the
+          # database a client will connect to is up.
+          ready=0
+          for i in $(seq 1 90); do
+            if docker exec postgres psql -U fluxgate -d fluxgate -c 'SELECT 1' >/dev/null 2>&1; then
+              ready=$((ready + 1))
+              if [ "$ready" -ge 3 ]; then
+                echo "postgres is accepting queries"
+                break
+              fi
+            else
+              ready=0
+            fi
+            if [ "$i" = "90" ]; then
               echo "::error::postgres never became ready"
               docker logs postgres
               exit 1

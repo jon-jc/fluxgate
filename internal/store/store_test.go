@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -566,5 +567,56 @@ func TestOpenFailsFastOnABadDSN(t *testing.T) {
 	}, discardLogger())
 	if err == nil {
 		t.Error("Open succeeded against an unreachable database")
+	}
+}
+
+// TestOpenRetriesAStartingDatabase covers the ordinary race between a service
+// and its database starting together: Postgres reports itself ready during
+// initialisation, before the server a client will actually reach is listening.
+// Failing immediately turns that into a crash loop.
+func TestOpenRetriesAStartingDatabase(t *testing.T) {
+	// Nothing is listening on this port, so every attempt fails and the
+	// elapsed time reveals whether retries happened at all.
+	started := time.Now()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	_, err := store.Open(ctx, store.Config{
+		DSN:            "postgres://nobody:nobody@127.0.0.1:1/none?sslmode=disable",
+		ConnectTimeout: 200 * time.Millisecond,
+		ConnectRetries: 3,
+	}, discardLogger())
+
+	if err == nil {
+		t.Fatal("Open succeeded against a port with nothing listening")
+	}
+	// Two waits between three attempts: roughly one second plus two.
+	if elapsed := time.Since(started); elapsed < 2*time.Second {
+		t.Errorf("gave up after %v; the retries did not happen", elapsed)
+	}
+	if !strings.Contains(err.Error(), "3 attempts") {
+		t.Errorf("error = %v, want it to report how many attempts were made", err)
+	}
+}
+
+// TestOpenStopsRetryingWhenCancelled keeps a shutdown from waiting out the full
+// retry budget.
+func TestOpenStopsRetryingWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	_, err := store.Open(ctx, store.Config{
+		DSN:            "postgres://nobody:nobody@127.0.0.1:1/none?sslmode=disable",
+		ConnectTimeout: 100 * time.Millisecond,
+		ConnectRetries: 20,
+	}, discardLogger())
+
+	if err == nil {
+		t.Fatal("Open succeeded against a port with nothing listening")
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Errorf("took %v; cancellation did not stop the retries", elapsed)
 	}
 }

@@ -37,6 +37,15 @@ type Config struct {
 	MaxConnIdleTime time.Duration
 	// ConnectTimeout bounds the initial connection.
 	ConnectTimeout time.Duration
+	// ConnectRetries is how many times to retry the initial connection before
+	// giving up.
+	//
+	// A service and its database often start together, and Postgres reports
+	// itself ready during initialisation before the real server is listening.
+	// Failing immediately turns that ordinary race into a crash loop, which an
+	// orchestrator then papers over with restarts and backoff -- slower and
+	// noisier than simply waiting a moment.
+	ConnectRetries int
 }
 
 func (c *Config) applyDefaults() {
@@ -54,6 +63,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ConnectTimeout <= 0 {
 		c.ConnectTimeout = 10 * time.Second
+	}
+	if c.ConnectRetries <= 0 {
+		c.ConnectRetries = 5
 	}
 }
 
@@ -93,12 +105,9 @@ func Open(ctx context.Context, cfg Config, log *slog.Logger) (*DB, error) {
 		return nil, fmt.Errorf("store: create pool: %w", err)
 	}
 
-	pingCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
-	defer cancel()
-
-	if err := pool.Ping(pingCtx); err != nil {
+	if err := waitForDatabase(ctx, pool, cfg, log); err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("store: ping: %w", err)
+		return nil, err
 	}
 
 	log.Info("connected to postgres",
@@ -107,6 +116,54 @@ func Open(ctx context.Context, cfg Config, log *slog.Logger) (*DB, error) {
 		slog.Int("max_conns", int(cfg.MaxConns)))
 
 	return &DB{pool: pool, log: log}, nil
+}
+
+// waitForDatabase verifies the connection, retrying a startup race.
+//
+// The ping is not ceremony: pgxpool connects lazily, so without it a
+// misconfigured DSN would surface as a failure on the first real query, long
+// after the process reported itself started. The retries exist for a different
+// reason -- a database that is starting is not a database that is
+// misconfigured, and the two deserve different responses.
+func waitForDatabase(ctx context.Context, pool *pgxpool.Pool, cfg Config, log *slog.Logger) error {
+	var lastErr error
+
+	for attempt := 1; attempt <= cfg.ConnectRetries; attempt++ {
+		pingCtx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
+		err := pool.Ping(pingCtx)
+		cancel()
+
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		// The caller is shutting down; there is no point waiting.
+		if ctx.Err() != nil {
+			return fmt.Errorf("store: ping: %w", err)
+		}
+		if attempt == cfg.ConnectRetries {
+			break
+		}
+
+		// Linear rather than exponential: the wait is for a database finishing
+		// its own startup, which takes a predictable few seconds, not for a
+		// contended resource that needs backing away from.
+		delay := time.Duration(attempt) * time.Second
+		log.Warn("database not reachable yet; retrying",
+			slog.Int("attempt", attempt),
+			slog.Int("of", cfg.ConnectRetries),
+			slog.Duration("retry_in", delay),
+			slog.Any("error", err))
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("store: ping: %w", ctx.Err())
+		case <-time.After(delay):
+		}
+	}
+
+	return fmt.Errorf("store: ping after %d attempts: %w", cfg.ConnectRetries, lastErr)
 }
 
 // Close releases the pool.
