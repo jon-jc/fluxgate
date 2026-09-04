@@ -15,9 +15,6 @@ flowchart LR
     I -->|bounded queue<br/>batched publish| T((telemetry.raw))
     T --> A[aggregator]
     A -->|windowed rollups| P[(Postgres)]
-    A --> AG((telemetry.aggregates))
-    AG --> AL[alerter]
-    AL --> N((telemetry.alerts))
     A -.->|poison messages| D((telemetry.dlq))
     P --> Q[query-api]
     Q -->|REST + SSE| C
@@ -643,6 +640,39 @@ mock would get wrong in agreement with its author.
 
 `make test` needs cgo for the race detector. On a machine without a C toolchain,
 use `make test-short` locally — CI runs the race detector on Linux regardless.
+
+### Fuzzing
+
+Every boundary that parses input the service does not control has a fuzz target,
+and each one asserts a property rather than merely checking for a panic:
+
+| Target | Boundary | Property held |
+| --- | --- | --- |
+| `FuzzDecodeEnvelope` | broker message | never panics; every decode failure is permanent, so a poison message reaches the dead-letter queue instead of redelivering forever |
+| `FuzzEnvelopeRoundTrip` | publish/consume | anything the edge publishes, a consumer reads back byte-identical |
+| `FuzzParse` | query string | a request Parse blesses has a non-inverted range within the limit and an aggregation the builder implements |
+| `FuzzHashLabels` | series identity | equal label sets hash equally; distinct ones never collide |
+| `FuzzWindowFor` | event-time windowing | windows tile the timeline with no gaps and no overlaps, and every point lands in the one containing it |
+| `FuzzVerify` | credentials | no token but the issued one authenticates, and a rejection returns no partial identity |
+| `FuzzParseKeys` | key document | a malformed document never yields a store that accepts a blank credential |
+| `FuzzValidatePoint` | ingest validation | a point that passes is safe for every assumption the aggregator makes without rechecking |
+
+Run one locally:
+
+```bash
+go test -run '^$' -fuzz FuzzValidatePoint -fuzztime 60s ./internal/telemetry
+```
+
+CI gives each target a bounded budget and caches the corpus between runs, so
+coverage accumulates across pull requests rather than restarting from the seeds.
+
+This was worth doing. `FuzzEnvelopeRoundTrip` found that a label value
+containing invalid UTF-8 was silently rewritten: Go's JSON decoder replaces the
+bad bytes with U+FFFD and returns no error, so the client received a `202` for a
+point this service had quietly altered, with nothing anywhere recording the
+difference. RFC 8259 requires JSON text to be UTF-8, so the fix was to reject
+it — at the HTTP edge, and again in the validator, which is the domain-level
+contract any future non-JSON ingestion path would inherit.
 
 ## Configuration
 

@@ -11,6 +11,7 @@ import (
 	"math"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Kind classifies how a value should be interpreted downstream.
@@ -292,6 +293,22 @@ func (v Validator) validateLabels(prefix string, labels map[string]string) []Vio
 			violations = append(violations, Violation{
 				Field:   field,
 				Message: fmt.Sprintf("value contains a control character at position %d", i)})
+			continue
+		}
+		// A label value crosses a process boundary as JSON, and JSON cannot
+		// carry invalid UTF-8: the encoder substitutes U+FFFD, so the value the
+		// aggregator stores is not the value the client sent, and nothing
+		// reports the difference.
+		//
+		// The HTTP edge already refuses a non-UTF-8 body, which makes this
+		// unreachable through the JSON API today. It is checked here as well
+		// because this validator is the domain-level contract -- any future
+		// ingestion path that does not happen to run through encoding/json
+		// would otherwise inherit the corruption silently.
+		if !utf8.ValidString(value) {
+			violations = append(violations, Violation{
+				Field:   field,
+				Message: "value is not valid UTF-8"})
 		}
 	}
 	return violations
