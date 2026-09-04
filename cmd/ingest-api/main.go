@@ -62,8 +62,11 @@ func main() {
 	}
 }
 
+// serviceName labels this binary's logs, metrics and traces.
+const serviceName = "fluxgate-ingest-api"
+
 func run() error {
-	cfg, err := config.Load()
+	cfg, err := config.Load(serviceName, config.Requirements{Auth: true})
 	if err != nil {
 		return err
 	}
@@ -260,7 +263,7 @@ func buildSink(
 // different port stays probeable without the healthcheck being updated
 // separately and silently drifting out of sync.
 func probe() error {
-	cfg, err := config.Load()
+	cfg, err := config.Load(serviceName, config.Requirements{Auth: true})
 	if err != nil {
 		return err
 	}

@@ -1,12 +1,15 @@
 # Local development stack.
 #
-#   docker compose -f deploy/docker-compose.yml up -d
-#   export PUBSUB_EMULATOR_HOST=localhost:8681
-#   make run
+#   make up          # emulator, Postgres, ingest API and aggregator
+#   make down        # and a clean slate
 #
-# The emulator holds everything in memory, so `down` is a clean slate. Topics
-# and subscriptions are re-created at startup by the service's bootstrap, which
-# is enabled automatically whenever an emulator host is configured.
+# The emulator holds everything in memory, so `down -v` really is a clean
+# slate. Topics and subscriptions are re-created at startup by the bootstrap,
+# which is enabled automatically whenever an emulator host is configured.
+#
+# Postgres is published on 5442 rather than 5432 so the stack does not collide
+# with a local install, or with another project's compose stack, on a common
+# port.
 
 name: fluxgate
 
@@ -35,6 +38,24 @@ services:
       retries: 10
       start_period: 10s
 
+  postgres:
+    image: postgres:17-alpine
+    container_name: fluxgate-postgres
+    environment:
+      POSTGRES_USER: fluxgate
+      POSTGRES_PASSWORD: fluxgate
+      POSTGRES_DB: fluxgate
+    ports:
+      - "5442:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fluxgate -d fluxgate"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
   ingest-api:
     build:
       context: ..
@@ -59,8 +80,50 @@ services:
         [{"key_id":"local","tenant_id":"acme",
           "secret_sha256":"eb26d4a9a0ef04727f52fb5acc8936196ae90e23003fc5117ce8e3e28c49363f"}]
     healthcheck:
+      # The runtime image is distroless, with no shell and no curl, so the
+      # binary probes itself.
       test: ["CMD", "/usr/local/bin/service", "-healthcheck"]
       interval: 10s
       timeout: 3s
       retries: 5
       start_period: 5s
+
+  aggregator:
+    build:
+      context: ..
+      dockerfile: build/docker/Dockerfile
+      args:
+        SERVICE: aggregator
+    container_name: fluxgate-aggregator
+    depends_on:
+      pubsub:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      # Probes only; the aggregator exposes no API of its own.
+      - "8081:8080"
+    environment:
+      ENVIRONMENT: dev
+      LOG_FORMAT: text
+      LOG_LEVEL: debug
+      GCP_PROJECT_ID: fluxgate-local
+      PUBSUB_EMULATOR_HOST: pubsub:8085
+      DATABASE_URL: postgres://fluxgate:fluxgate@postgres:5432/fluxgate?sslmode=disable
+      # Short windows keep the local loop tight: a rollup appears within
+      # seconds of sending a point rather than at the next minute boundary.
+      AGGREGATOR_WINDOW_SIZE: 10s
+      AGGREGATOR_ALLOWED_LATENESS: 2s
+      AGGREGATOR_FLUSH_INTERVAL: 2s
+      # A producer that stops sending would otherwise strand its last window.
+      AGGREGATOR_IDLE_TIMEOUT: 5s
+      LEDGER_RETENTION: 1h
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/service", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  postgres-data:

@@ -60,6 +60,65 @@ type Config struct {
 	Ingest IngestConfig
 	// PubSub holds the event transport settings.
 	PubSub PubSubConfig
+	// Database holds the Postgres settings.
+	Database DatabaseConfig
+	// Aggregator holds the windowing and flush settings.
+	Aggregator AggregatorConfig
+}
+
+// DatabaseConfig configures Postgres.
+type DatabaseConfig struct {
+	// DSN is the connection string.
+	DSN string
+	// MaxConns caps the pool. Size it against the database's own connection
+	// limit divided by the replica count, not against how much concurrency
+	// this process would like to have.
+	MaxConns int32
+	// MinConns keeps a floor of warm connections so a traffic spike does not
+	// pay connection setup costs on every request.
+	MinConns int32
+	// MaxConnLifetime recycles connections, so a failover or a rolling
+	// database upgrade is picked up without restarting the service.
+	MaxConnLifetime time.Duration
+	// ConnectTimeout bounds the initial connection.
+	ConnectTimeout time.Duration
+	// Migrate applies pending migrations at startup.
+	Migrate bool
+}
+
+// AggregatorConfig configures windowed aggregation.
+type AggregatorConfig struct {
+	// WindowSize is the tumbling window width. Every rollup covers exactly
+	// this much event time.
+	WindowSize time.Duration
+	// AllowedLateness is how far the watermark trails the highest observed
+	// event time. It trades freshness for tolerance of out-of-order arrival:
+	// too small and legitimate stragglers are discarded, too large and every
+	// rollup is delayed by that much before anyone can read it.
+	AllowedLateness time.Duration
+	// MaxSeries caps distinct series held across all open windows.
+	MaxSeries int
+	// IdleTimeout is how long a producer may be silent before the watermark
+	// advances on processing time, so a stream that stops does not strand its
+	// last window unwritten.
+	IdleTimeout time.Duration
+	// FlushInterval is how often closed windows are drained even with no new
+	// data. Without it a producer that goes quiet leaves its last window
+	// unwritten and its messages unacknowledged.
+	FlushInterval time.Duration
+	// MaxOutstandingMessages caps unacknowledged messages held in memory.
+	MaxOutstandingMessages int
+	// Concurrency is how many streaming pull connections to open.
+	Concurrency int
+	// RollupRetention is how long rollups are kept before pruning.
+	RollupRetention time.Duration
+	// LedgerRetention is how long delivery-ledger entries are kept. It only
+	// has to outlive the longest redelivery Pub/Sub could produce; keeping it
+	// longer grows a table forever to guard against a duplicate that can no
+	// longer arrive.
+	LedgerRetention time.Duration
+	// PruneInterval is how often retention runs.
+	PruneInterval time.Duration
 }
 
 // PubSubConfig configures the Pub/Sub transport.
@@ -177,18 +236,41 @@ type ShutdownConfig struct {
 	DrainTimeout time.Duration
 }
 
-// Load reads configuration from the process environment, applying defaults for
-// every optional value. All problems are collected and reported together so a
-// single boot attempt surfaces every misconfiguration.
-func Load() (Config, error) {
-	return load(os.LookupEnv)
+// Requirements declares which subsystems a binary cannot run without.
+//
+// Passing them in rather than having each service check its own dependencies
+// after Load returns keeps every failure in one report: an aggregator started
+// with neither a database nor credentials should be told both at once, not one
+// per redeploy.
+type Requirements struct {
+	// Auth means the process serves an authenticated API, so credentials are
+	// mandatory. A background consumer declares false: it has no callers to
+	// authenticate, and demanding an API key from it would be a boot failure
+	// over a setting it never reads.
+	Auth bool
+	// Database means the process needs Postgres.
+	Database bool
+}
+
+// Load reads configuration for the named service from the process environment,
+// applying defaults for every optional value. All problems are collected and
+// reported together so a single boot attempt surfaces every misconfiguration.
+//
+// The service name is passed by the binary rather than guessed, because a
+// wrong default is worse than none: logs and metrics from an aggregator
+// labelled as the ingest API are actively misleading during an incident.
+func Load(service string, req Requirements) (Config, error) {
+	return load(os.LookupEnv, service, req)
 }
 
 // lookupFunc mirrors os.LookupEnv so tests can supply a fake environment.
 type lookupFunc func(string) (string, bool)
 
-func load(lookup lookupFunc) (Config, error) {
-	l := &loader{lookup: lookup}
+func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
+	l := &loader{lookup: lookup, requirements: req}
+	if service == "" {
+		service = "fluxgate"
+	}
 
 	// The tier is resolved first because a few defaults depend on it.
 	env := Environment(l.str("ENVIRONMENT", string(EnvLocal)))
@@ -199,7 +281,7 @@ func load(lookup lookupFunc) (Config, error) {
 	emulator := l.str("PUBSUB_EMULATOR_HOST", "")
 
 	cfg := Config{
-		Service:     l.str("SERVICE_NAME", "fluxgate-ingest-api"),
+		Service:     l.str("SERVICE_NAME", service),
 		Environment: env,
 		HTTP: HTTPConfig{
 			Addr:               l.str("HTTP_ADDR", ":8080"),
@@ -262,6 +344,26 @@ func load(lookup lookupFunc) (Config, error) {
 			BreakerFailureThreshold: l.integer("PUBSUB_BREAKER_FAILURE_THRESHOLD", 5),
 			BreakerCooldown:         l.duration("PUBSUB_BREAKER_COOLDOWN", 10*time.Second),
 		},
+		Database: DatabaseConfig{
+			DSN:             l.str("DATABASE_URL", ""),
+			MaxConns:        l.int32("DATABASE_MAX_CONNS", 10),
+			MinConns:        l.int32("DATABASE_MIN_CONNS", 2),
+			MaxConnLifetime: l.duration("DATABASE_MAX_CONN_LIFETIME", time.Hour),
+			ConnectTimeout:  l.duration("DATABASE_CONNECT_TIMEOUT", 10*time.Second),
+			Migrate:         l.boolean("DATABASE_MIGRATE", true),
+		},
+		Aggregator: AggregatorConfig{
+			WindowSize:             l.duration("AGGREGATOR_WINDOW_SIZE", time.Minute),
+			AllowedLateness:        l.duration("AGGREGATOR_ALLOWED_LATENESS", 30*time.Second),
+			MaxSeries:              l.integer("AGGREGATOR_MAX_SERIES", 100_000),
+			IdleTimeout:            l.duration("AGGREGATOR_IDLE_TIMEOUT", 30*time.Second),
+			FlushInterval:          l.duration("AGGREGATOR_FLUSH_INTERVAL", 15*time.Second),
+			MaxOutstandingMessages: l.integer("AGGREGATOR_MAX_OUTSTANDING_MESSAGES", 1000),
+			Concurrency:            l.integer("AGGREGATOR_CONCURRENCY", 2),
+			RollupRetention:        l.duration("ROLLUP_RETENTION", 30*24*time.Hour),
+			LedgerRetention:        l.duration("LEDGER_RETENTION", 24*time.Hour),
+			PruneInterval:          l.duration("PRUNE_INTERVAL", time.Hour),
+		},
 	}
 
 	// Cloud Run and several other managed platforms inject the listener port
@@ -313,6 +415,61 @@ func (c Config) validate(l *loader) {
 	c.validateAuth(l)
 	c.validateIngest(l)
 	c.validatePubSub(l)
+	c.validateDatabase(l)
+	c.validateAggregator(l)
+}
+
+func (c Config) validateDatabase(l *loader) {
+	if c.Database.DSN == "" {
+		if l.requirements.Database {
+			l.reject("DATABASE_URL", "is required by this service")
+		}
+		return
+	}
+	if c.Database.MaxConns <= 0 {
+		l.reject("DATABASE_MAX_CONNS", "must be greater than zero")
+	}
+	if c.Database.MinConns > c.Database.MaxConns {
+		l.reject("DATABASE_MIN_CONNS", "must not exceed DATABASE_MAX_CONNS")
+	}
+}
+
+func (c Config) validateAggregator(l *loader) {
+	if !l.requirements.Database {
+		// Only the aggregator uses these; validating them everywhere would
+		// reject an ingest API over settings it never reads.
+		return
+	}
+
+	if c.Aggregator.WindowSize <= 0 {
+		l.reject("AGGREGATOR_WINDOW_SIZE", "must be greater than zero")
+	}
+	if c.Aggregator.MaxSeries <= 0 {
+		l.reject("AGGREGATOR_MAX_SERIES", "must be greater than zero")
+	}
+	if c.Aggregator.FlushInterval <= 0 {
+		l.reject("AGGREGATOR_FLUSH_INTERVAL", "must be greater than zero")
+	}
+	// A flush interval longer than the window means a closed window waits for
+	// the timer rather than being written promptly, so every rollup is stale by
+	// up to that difference before anyone can read it.
+	if c.Aggregator.WindowSize > 0 && c.Aggregator.FlushInterval > c.Aggregator.WindowSize {
+		l.reject("AGGREGATOR_FLUSH_INTERVAL", fmt.Sprintf(
+			"must not exceed AGGREGATOR_WINDOW_SIZE (%s), or rollups are stale by the difference",
+			c.Aggregator.WindowSize))
+	}
+	// The ledger must outlive the redeliveries it exists to suppress. Pruning
+	// it sooner would let a redelivered batch be counted a second time.
+	if c.Aggregator.LedgerRetention < c.Aggregator.WindowSize {
+		l.reject("LEDGER_RETENTION",
+			"must be at least AGGREGATOR_WINDOW_SIZE, or a redelivery could be counted twice")
+	}
+	if c.Aggregator.RollupRetention <= 0 {
+		l.reject("ROLLUP_RETENTION", "must be greater than zero")
+	}
+	if c.Aggregator.PruneInterval <= 0 {
+		l.reject("PRUNE_INTERVAL", "must be greater than zero")
+	}
 }
 
 func (c Config) validatePubSub(l *loader) {
@@ -354,6 +511,10 @@ func (c Config) validatePubSub(l *loader) {
 }
 
 func (c Config) validateAuth(l *loader) {
+	if !l.requirements.Auth {
+		return
+	}
+
 	// Shipping an unauthenticated ingest endpoint would let anyone write into
 	// any tenant's data. Making that impossible to configure is worth more than
 	// any amount of documentation warning against it.
@@ -398,8 +559,9 @@ func (c Config) validateIngest(l *loader) {
 // loader reads typed values from an environment lookup, accumulating problems
 // rather than failing on the first one.
 type loader struct {
-	lookup lookupFunc
-	errs   map[string]string
+	lookup       lookupFunc
+	requirements Requirements
+	errs         map[string]string
 }
 
 func (l *loader) reject(key, reason string) {
@@ -491,6 +653,21 @@ func (l *loader) integer(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// int32 parses a value that must fit a 32-bit field, rejecting anything that
+// would silently wrap into a negative connection count.
+func (l *loader) int32(key string, def int32) int32 {
+	v, ok := l.raw(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 32)
+	if err != nil {
+		l.reject(key, fmt.Sprintf("%q is not a valid 32-bit integer", v))
+		return def
+	}
+	return int32(n)
 }
 
 func (l *loader) float(key string, def float64) float64 {
