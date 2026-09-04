@@ -348,6 +348,15 @@ func Build(req Request, rollups []store.StoredRollup, limits Limits) Result {
 			continue
 		}
 
+		// Checked before a group is created, not after. Creating one and then
+		// breaking would emit a series with an empty point list, which a chart
+		// renders as a legend entry with no line -- indistinguishable from a
+		// series that genuinely has no data in the range.
+		if limits.MaxPoints > 0 && total >= limits.MaxPoints {
+			result.Truncated = true
+			break
+		}
+
 		key := store.SeriesFingerprint(r.Labels)
 		g, exists := groups[key]
 		if !exists {
@@ -358,11 +367,6 @@ func Build(req Request, rollups []store.StoredRollup, limits Limits) Result {
 			g = &group{labels: orEmptyLabels(r.Labels)}
 			groups[key] = g
 			order = append(order, key)
-		}
-
-		if limits.MaxPoints > 0 && total >= limits.MaxPoints {
-			result.Truncated = true
-			break
 		}
 
 		g.points = append(g.points, Point{Timestamp: r.WindowStart.UTC(), Value: value})

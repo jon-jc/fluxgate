@@ -220,7 +220,7 @@ func (r *Runner) windowsFor(batch telemetry.Batch) []time.Time {
 	seen := make(map[int64]time.Time, 4)
 	for _, p := range batch.Points {
 		w := aggregate.WindowFor(p.Timestamp, size)
-		seen[w.Start.Unix()] = w.Start
+		seen[w.Start.UnixNano()] = w.Start
 	}
 
 	out := make([]time.Time, 0, len(seen))
@@ -252,7 +252,7 @@ func (r *Runner) skipSet(
 
 		// Committed covers a redelivery after a restart.
 		if committed[key] {
-			skip[start.Unix()] = struct{}{}
+			skip[start.UnixNano()] = struct{}{}
 			continue
 		}
 		// Mid-write: the answer is not knowable yet.
@@ -262,7 +262,7 @@ func (r *Runner) skipSet(
 		// Claimed covers a redelivery before the flush, when nothing is in the
 		// database yet and only this process knows.
 		if _, pending := r.claimed[key]; pending {
-			skip[start.Unix()] = struct{}{}
+			skip[start.UnixNano()] = struct{}{}
 		}
 	}
 	return skip, false
@@ -276,7 +276,7 @@ func filterBatch(batch telemetry.Batch, skip map[int64]struct{}, size time.Durat
 
 	points := make([]telemetry.Point, 0, len(batch.Points))
 	for _, p := range batch.Points {
-		if _, skipped := skip[aggregate.WindowFor(p.Timestamp, size).Start.Unix()]; skipped {
+		if _, skipped := skip[aggregate.WindowFor(p.Timestamp, size).Start.UnixNano()]; skipped {
 			continue
 		}
 		points = append(points, p)
@@ -297,9 +297,9 @@ func (r *Runner) track(d pubsubx.Delivery, batch telemetry.Batch, windows []aggr
 	}
 
 	for _, w := range windows {
-		pending.awaiting[w.Start.Unix()] = struct{}{}
+		key := w.Start.UnixNano()
 
-		key := w.Start.Unix()
+		pending.awaiting[key] = struct{}{}
 		r.inflight[key] = append(r.inflight[key], pending)
 
 		contribution := store.Contribution{
@@ -412,7 +412,7 @@ func (r *Runner) detach(windows []aggregate.Window) ([]store.Contribution, []*pe
 	)
 
 	for _, w := range windows {
-		key := w.Start.Unix()
+		key := w.Start.UnixNano()
 
 		for _, c := range r.contributions[key] {
 			contributions = append(contributions, c)
@@ -440,7 +440,7 @@ func (r *Runner) detach(windows []aggregate.Window) ([]store.Contribution, []*pe
 	// boundary keeps waiting until its last window commits.
 	for _, m := range messages {
 		for _, w := range windows {
-			delete(m.awaiting, w.Start.Unix())
+			delete(m.awaiting, w.Start.UnixNano())
 		}
 	}
 	return contributions, messages

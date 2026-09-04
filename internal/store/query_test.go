@@ -200,15 +200,15 @@ func TestChangedTailsByWriteTime(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	changed, cursor, err := db.Changed(ctx, tenant, "late.metric", before, 100)
+	changed, cursor, err := db.Changed(ctx, tenant, "late.metric", store.Cursor{Since: before}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}
 	if len(changed) != 1 {
 		t.Fatalf("got %d changes, want 1 despite the window being a day old", len(changed))
 	}
-	if !cursor.After(before) {
-		t.Errorf("cursor = %v, want it to advance past %v", cursor, before)
+	if !cursor.Since.After(before) {
+		t.Errorf("cursor = %v, want it to advance past %v", cursor.Since, before)
 	}
 
 	// The cursor must not re-deliver what it has already reported.
@@ -235,7 +235,7 @@ func TestChangedFiltersByMetric(t *testing.T) {
 		}
 	}
 
-	changed, _, err := db.Changed(ctx, tenant, "wanted.metric", before, 100)
+	changed, _, err := db.Changed(ctx, tenant, "wanted.metric", store.Cursor{Since: before}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestChangedFiltersByMetric(t *testing.T) {
 	}
 
 	// With no metric named, everything the tenant wrote is tailed.
-	all, _, err := db.Changed(ctx, tenant, "", before, 100)
+	all, _, err := db.Changed(ctx, tenant, "", store.Cursor{Since: before}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}

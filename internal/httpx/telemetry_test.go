@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/jon-jc/fluxgate/internal/observability"
 )
 
 // TestRoutePatternResolvesThroughTheMux guards a silent instrumentation bug:
@@ -82,7 +84,7 @@ func TestMetricsMiddlewareIsANoOpWithoutInstruments(t *testing.T) {
 	})
 
 	// A service running uninstrumented must still serve requests.
-	h := Metrics(nil, mux)(mux)
+	h := Metrics(nil, mux, TelemetryOptions{})(mux)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", http.NoBody))
@@ -100,7 +102,7 @@ func TestTraceMiddlewareServesTheRequest(t *testing.T) {
 
 	// With no provider installed the tracer is a no-op, and the request must
 	// pass through untouched.
-	h := Trace(mux)(mux)
+	h := Trace(mux, TelemetryOptions{})(mux)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", http.NoBody))
@@ -122,5 +124,43 @@ func TestSpanNameDoesNotRepeatTheMethod(t *testing.T) {
 	route := RoutePattern(mux, httptest.NewRequest(http.MethodPost, "/v1/ingest", http.NoBody))
 	if strings.Count(route, http.MethodPost) != 1 {
 		t.Errorf("route = %q, want the method to appear exactly once", route)
+	}
+}
+
+// TestSkippedRoutesProduceNoTelemetry keeps machine traffic out of the signal.
+//
+// An orchestrator probes readiness every few seconds and Prometheus scrapes on
+// its own interval. Tracing those buries the requests somebody actually cares
+// about, and metering the scrape endpoint means reading the metrics changes
+// them.
+func TestSkippedRoutesProduceNoTelemetry(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /readyz", func(http.ResponseWriter, *http.Request) {})
+	mux.HandleFunc("GET /metrics", func(http.ResponseWriter, *http.Request) {})
+	mux.HandleFunc("GET /v1/query", func(http.ResponseWriter, *http.Request) {})
+
+	m := observability.NewMetrics("fluxgate-test")
+	opts := TelemetryOptions{SkipRoutes: []string{"GET /readyz", "GET /metrics"}}
+
+	h := Chain(Trace(mux, opts), Metrics(m, mux, opts))(mux)
+
+	for _, path := range []string{"/readyz", "/metrics", "/readyz", "/v1/query"} {
+		h.ServeHTTP(httptest.NewRecorder(),
+			httptest.NewRequest(http.MethodGet, path, http.NoBody))
+	}
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", http.NoBody))
+	body := rec.Body.String()
+
+	for _, quiet := range []string{`route="GET /readyz"`, `route="GET /metrics"`} {
+		if strings.Contains(body, quiet) {
+			t.Errorf("%s was metered despite being skipped", quiet)
+		}
+	}
+	// The route that is not skipped still has to be measured, or the skip list
+	// would be silently swallowing everything.
+	if !strings.Contains(body, `route="GET /v1/query"`) {
+		t.Error("a normal route was not metered")
 	}
 }

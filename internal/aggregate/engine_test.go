@@ -780,3 +780,90 @@ func TestIdleAdvanceIsDisabledByDefault(t *testing.T) {
 		t.Error("the watermark advanced despite the idle fallback being off")
 	}
 }
+
+// TestSubSecondWindowsDoNotCollide covers silent data corruption.
+//
+// Windows were keyed by Unix *seconds*. Any window shorter than a second maps
+// several distinct windows onto one key, so their points merge into a single
+// rollup and the reconstructed boundaries describe none of them. Nothing
+// reports it: the totals are simply wrong.
+func TestSubSecondWindowsDoNotCollide(t *testing.T) {
+	e := New(Config{WindowSize: 250 * time.Millisecond, MaxSeries: 100})
+
+	// Four points, one per quarter-second: four distinct windows inside one
+	// second.
+	for i := range 4 {
+		e.Ingest(batchOf(point("cpu.util", float64(i+1),
+			time.Duration(i)*250*time.Millisecond, nil)))
+	}
+	// Advance well past them all.
+	e.Ingest(batchOf(point("cpu.util", 99, 5*time.Second, nil)))
+
+	rollups, windows := e.Collect()
+
+	cpu := 0
+	for i := range rollups {
+		if rollups[i].Key.Metric == "cpu.util" {
+			cpu++
+			if rollups[i].Acc.Count != 1 {
+				t.Errorf("window %s holds %d points, want 1; windows collided",
+					rollups[i].Window, rollups[i].Acc.Count)
+			}
+		}
+	}
+	if cpu != 4 {
+		t.Errorf("got %d cpu.util windows, want 4 distinct quarter-second windows", cpu)
+	}
+
+	// The reconstructed boundaries must be the real ones, not truncated to a
+	// second.
+	for _, w := range windows {
+		if got := w.End.Sub(w.Start); got != 250*time.Millisecond {
+			t.Errorf("window %s spans %v, want 250ms", w, got)
+		}
+	}
+}
+
+// TestWindowForIsAnchoredToTheEpoch: time.Truncate anchors to the zero time,
+// January 1 of year 1, which coincides with the epoch only for durations that
+// divide evenly into a day. A weekly window truncated that way lands on a
+// boundary inherited from the calendar rather than the one an operator
+// configuring "168h" would expect.
+func TestWindowForIsAnchoredToTheEpoch(t *testing.T) {
+	for _, size := range []time.Duration{
+		time.Second, 10 * time.Second, time.Minute, 5 * time.Minute,
+		time.Hour, 90 * time.Minute, 24 * time.Hour, 7 * 24 * time.Hour,
+	} {
+		t.Run(size.String(), func(t *testing.T) {
+			ts := time.Date(2026, 9, 3, 12, 40, 17, 500_000_000, time.UTC)
+			w := WindowFor(ts, size)
+
+			// The defining property: the start is a whole number of windows
+			// from the epoch.
+			if rem := w.Start.UnixNano() % size.Nanoseconds(); rem != 0 {
+				t.Errorf("window start %s is %d ns off an epoch boundary", w.Start, rem)
+			}
+			if !w.Start.After(ts) && !w.End.After(ts) {
+				t.Errorf("window %s does not contain %s", w, ts)
+			}
+			if w.Start.After(ts) {
+				t.Errorf("window %s starts after %s", w, ts)
+			}
+		})
+	}
+}
+
+// TestWindowForHandlesPreEpochTimestamps: truncation toward zero would put a
+// negative timestamp in the window *after* the one containing it.
+func TestWindowForHandlesPreEpochTimestamps(t *testing.T) {
+	ts := time.Date(1969, 12, 31, 23, 59, 30, 0, time.UTC) // 30s before the epoch
+
+	w := WindowFor(ts, time.Minute)
+
+	if w.Start.After(ts) || !w.End.After(ts) {
+		t.Errorf("window %s does not contain %s", w, ts)
+	}
+	if want := time.Date(1969, 12, 31, 23, 59, 0, 0, time.UTC); !w.Start.Equal(want) {
+		t.Errorf("start = %s, want %s", w.Start, want)
+	}
+}

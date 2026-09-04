@@ -53,19 +53,30 @@ func (f *fakeReader) Query(_ context.Context, filter store.QueryFilter) ([]store
 }
 
 func (f *fakeReader) Changed(
-	_ context.Context, _, _ string, since time.Time, _ int,
-) ([]store.StoredRollup, time.Time, error) {
+	_ context.Context, _, _ string, cursor store.Cursor, _ int,
+) ([]store.StoredRollup, store.Cursor, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.err != nil {
-		return nil, since, f.err
+		return nil, cursor, f.err
 	}
 
 	out := f.changed
 	// Deliver once, so a polling test does not loop forever on the same row.
 	f.changed = nil
-	return out, since.Add(time.Second), nil
+
+	next := cursor
+	for i := range out {
+		next = next.After(out[i], queryNow.Add(time.Second))
+	}
+	return out, next, nil
+}
+
+func (f *fakeReader) NewestWriteTime(context.Context, string) (time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return queryNow, f.err
 }
 
 func (f *fakeReader) Metrics(context.Context, string, int) ([]store.MetricSummary, error) {
