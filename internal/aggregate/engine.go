@@ -28,8 +28,32 @@ func (w Window) String() string {
 // every instance in the fleet derives identical windows from identical
 // timestamps. Anchoring to start-up would make two replicas disagree about
 // where a window begins, and their rollups would never merge.
+//
+// The arithmetic is explicit rather than time.Truncate, which anchors to the
+// zero time -- January 1 of year 1 -- not to the epoch. The two coincide only
+// for durations that divide evenly into a day, so a weekly window truncated
+// that way lands on a boundary inherited from the proleptic Gregorian calendar
+// rather than on the one an operator configuring "168h" would expect.
+//
+// Floor division rather than truncation toward zero, so timestamps before 1970
+// land in the window that contains them instead of the one after it.
 func WindowFor(ts time.Time, size time.Duration) Window {
-	start := ts.UTC().Truncate(size)
+	if size <= 0 {
+		// A non-positive window has no meaningful boundary. Returning an empty
+		// window here would silently discard data; the engine rejects this at
+		// construction, so reaching it means a caller built a Window directly.
+		size = time.Minute
+	}
+
+	nanos := ts.UTC().UnixNano()
+	step := size.Nanoseconds()
+
+	bucket := nanos / step
+	if nanos < 0 && nanos%step != 0 {
+		bucket--
+	}
+
+	start := time.Unix(0, bucket*step).UTC()
 	return Window{Start: start, End: start.Add(size)}
 }
 
@@ -127,7 +151,12 @@ type Engine struct {
 	cfg Config
 
 	mu sync.Mutex
-	// windows is keyed by window start in Unix seconds.
+	// windows is keyed by window start in Unix nanoseconds.
+	//
+	// Nanoseconds, not seconds: a sub-second window size would map several
+	// distinct windows onto one second-resolution key, merging their points
+	// into a single rollup whose reconstructed boundaries describe none of
+	// them -- silently, with no error and simply wrong totals.
 	windows map[int64]map[SeriesKey]*seriesState
 	// watermark is the event time below which no further data is expected.
 	watermark time.Time
@@ -188,10 +217,10 @@ func (e *Engine) Ingest(batch telemetry.Batch) IngestResult {
 		}
 
 		key := SeriesKeyFor(batch.TenantID, p)
-		series, ok := e.windows[window.Start.Unix()]
+		series, ok := e.windows[window.Start.UnixNano()]
 		if !ok {
 			series = make(map[SeriesKey]*seriesState)
-			e.windows[window.Start.Unix()] = series
+			e.windows[window.Start.UnixNano()] = series
 		}
 
 		state, exists := series[key]
@@ -214,7 +243,7 @@ func (e *Engine) Ingest(batch telemetry.Batch) IngestResult {
 		state.acc.Observe(p.Value, p.Timestamp.UnixNano())
 		result.Accepted++
 		e.stats.PointsAccepted++
-		seen[window.Start.Unix()] = window
+		seen[window.Start.UnixNano()] = window
 	}
 
 	result.Windows = make([]Window, 0, len(seen))
@@ -273,7 +302,7 @@ func (e *Engine) AdvanceOnIdle() bool {
 	// once, including ones a resuming producer could still legitimately fill.
 	oldest := time.Time{}
 	for start := range e.windows {
-		end := time.Unix(start, 0).UTC().Add(e.cfg.WindowSize)
+		end := time.Unix(0, start).UTC().Add(e.cfg.WindowSize)
 		if oldest.IsZero() || end.Before(oldest) {
 			oldest = end
 		}
@@ -347,8 +376,8 @@ func (e *Engine) collect(all bool) ([]Rollup, []Window) {
 	starts := make([]int64, 0, len(e.windows))
 	for start := range e.windows {
 		window := Window{
-			Start: time.Unix(start, 0).UTC(),
-			End:   time.Unix(start, 0).UTC().Add(e.cfg.WindowSize),
+			Start: time.Unix(0, start).UTC(),
+			End:   time.Unix(0, start).UTC().Add(e.cfg.WindowSize),
 		}
 		if all || !window.End.After(e.watermark) {
 			starts = append(starts, start)
@@ -367,8 +396,8 @@ func (e *Engine) collect(all bool) ([]Rollup, []Window) {
 	)
 	for _, start := range starts {
 		window := Window{
-			Start: time.Unix(start, 0).UTC(),
-			End:   time.Unix(start, 0).UTC().Add(e.cfg.WindowSize),
+			Start: time.Unix(0, start).UTC(),
+			End:   time.Unix(0, start).UTC().Add(e.cfg.WindowSize),
 		}
 		for key, state := range e.windows[start] {
 			rollups = append(rollups, Rollup{
@@ -411,8 +440,8 @@ func (e *Engine) PendingWindows() []Window {
 	windows := make([]Window, len(starts))
 	for i, start := range starts {
 		windows[i] = Window{
-			Start: time.Unix(start, 0).UTC(),
-			End:   time.Unix(start, 0).UTC().Add(e.cfg.WindowSize),
+			Start: time.Unix(0, start).UTC(),
+			End:   time.Unix(0, start).UTC().Add(e.cfg.WindowSize),
 		}
 	}
 	return windows

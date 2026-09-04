@@ -658,3 +658,60 @@ func TestIngestRejectsOversizedBody(t *testing.T) {
 		t.Errorf("status = %d, want 413 (%s)", rec.Code, rec.Body)
 	}
 }
+
+// TestInvalidUTF8IsRejectedRatherThanSilentlyAltered checks that a malformed
+// byte in a request body is refused rather than quietly rewritten.
+//
+// Go's JSON decoder replaces invalid UTF-8 with U+FFFD and returns no error, so
+// without an explicit check a client sending a malformed label value receives a
+// 202 for data the service quietly changed. They are told their point was
+// accepted; what is stored is not what they sent, and nothing anywhere reports
+// the difference.
+//
+// RFC 8259 requires JSON text to be UTF-8, so rejecting this is the standard
+// being enforced rather than an extra restriction.
+func TestInvalidUTF8IsRejectedRatherThanSilentlyAltered(t *testing.T) {
+	h := newHarness(t)
+
+	// A lone 0xDB continuation byte inside an otherwise well-formed document.
+	body := "{\"points\":[{\"metric\":\"a.b\",\"kind\":\"gauge\",\"value\":1," +
+		"\"labels\":{\"host\":\"web\xdb01\"}}]}"
+
+	rec := h.post(t, body, nil)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (%s)", rec.Code, rec.Body)
+	}
+	if h.sink.PointCount() != 0 {
+		t.Error("a point with silently altered data reached the pipeline")
+	}
+	if !strings.Contains(rec.Body.String(), "UTF-8") {
+		t.Errorf("the error does not say what is wrong: %s", rec.Body.String())
+	}
+}
+
+// TestValidMultiByteUTF8IsAccepted keeps the check from rejecting legitimate
+// text: a label value is user data, and plenty of the world's is not ASCII.
+func TestValidMultiByteUTF8IsAccepted(t *testing.T) {
+	h := newHarness(t)
+
+	body := `{"points":[{"metric":"a.b","kind":"gauge","value":1,` +
+		`"labels":{"region":"東京","team":"café","emoji":"🚀"}}]}`
+
+	rec := h.post(t, body, nil)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 (%s)", rec.Code, rec.Body)
+	}
+
+	batches := h.sink.Batches()
+	if len(batches) != 1 || len(batches[0].Points) != 1 {
+		t.Fatalf("unexpected sink contents: %+v", batches)
+	}
+	// Stored exactly as sent, byte for byte.
+	if got := batches[0].Points[0].Labels["region"]; got != "東京" {
+		t.Errorf("label = %q, want 東京", got)
+	}
+	if got := batches[0].Points[0].Labels["emoji"]; got != "🚀" {
+		t.Errorf("label = %q, want the rocket", got)
+	}
+}

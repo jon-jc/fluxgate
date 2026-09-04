@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -223,13 +224,15 @@ func send(
 	if err != nil {
 		return 0, err
 	}
-	// Drained and closed so the connection returns to the pool. Skipping this
-	// is the classic way a load generator ends up measuring connection setup.
 	defer func() { _ = resp.Body.Close() }()
 
-	if _, err := resp.Body.Read(make([]byte, 4096)); err != nil && resp.ContentLength > 0 {
-		// A partially read body is fine; the status is what matters here.
-		_ = err
+	// Drained to EOF, not merely sampled. Go returns a connection to the pool
+	// only once its body is fully read; a partial read silently retires it. A
+	// 202 enumerating rejected points easily exceeds any fixed buffer, so
+	// reading a fixed slice would make this tool measure TCP setup under
+	// exactly the conditions it exists to measure throughput under.
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		return resp.StatusCode, err
 	}
 
 	return resp.StatusCode, nil

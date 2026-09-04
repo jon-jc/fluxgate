@@ -26,22 +26,49 @@ type RouteResolver interface {
 	Handler(r *http.Request) (h http.Handler, pattern string)
 }
 
+// TelemetryOptions tunes what the tracing and metrics middleware observe.
+type TelemetryOptions struct {
+	// SkipRoutes are route patterns that produce no span and no metric.
+	//
+	// Probes and the scrape endpoint belong here. An orchestrator polls
+	// readiness every few seconds and Prometheus scrapes on its own interval,
+	// so tracing them buries real requests under machine traffic -- and
+	// metering the scrape endpoint means the act of reading metrics changes
+	// them.
+	SkipRoutes []string
+}
+
+func (o TelemetryOptions) skipSet() map[string]struct{} {
+	skip := make(map[string]struct{}, len(o.SkipRoutes))
+	for _, route := range o.SkipRoutes {
+		skip[route] = struct{}{}
+	}
+	return skip
+}
+
 // Trace starts a server span for every request, continuing an upstream trace
 // when the caller supplied one.
 //
 // It runs outside the metrics middleware so the span covers the whole
 // measured request, and inside RequestID so that a log line, a metric and a
 // span all agree on which request they describe.
-func Trace(routes RouteResolver) Middleware {
+func Trace(routes RouteResolver, opts TelemetryOptions) Middleware {
+	skip := opts.skipSet()
+
 	return func(next http.Handler) http.Handler {
-		return traceHandler(routes, next)
+		return traceHandler(routes, skip, next)
 	}
 }
 
-func traceHandler(routes RouteResolver, next http.Handler) http.Handler {
+func traceHandler(routes RouteResolver, skip map[string]struct{}, next http.Handler) http.Handler {
 	tracer := observability.Tracer(tracerName)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, quiet := skip[RoutePattern(routes, r)]; quiet {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Extract before starting: a caller that already has a trace should
 		// have this span attached to it rather than beginning a second,
 		// disconnected one.
@@ -89,12 +116,20 @@ func traceHandler(routes RouteResolver, next http.Handler) http.Handler {
 }
 
 // Metrics records request counts, latency and concurrency.
-func Metrics(m *observability.Metrics, routes RouteResolver) Middleware {
+func Metrics(m *observability.Metrics, routes RouteResolver, opts TelemetryOptions) Middleware {
+	skip := opts.skipSet()
+
 	return func(next http.Handler) http.Handler {
 		if m == nil {
 			return next
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			route := RoutePattern(routes, r)
+			if _, quiet := skip[route]; quiet {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			done := m.TrackInFlight()
 			defer done()
 
@@ -103,8 +138,7 @@ func Metrics(m *observability.Metrics, routes RouteResolver) Middleware {
 
 			next.ServeHTTP(rec, r)
 
-			m.ObserveRequest(
-				RoutePattern(routes, r), r.Method, rec.status, time.Since(start))
+			m.ObserveRequest(route, r.Method, rec.status, time.Since(start))
 		})
 	}
 }

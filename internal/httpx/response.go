@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jon-jc/fluxgate/internal/observability"
 )
@@ -366,6 +367,19 @@ func ReadBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, e
 // why its data never arrived. The diagnostics name the offending field and
 // byte offset so the caller can fix the payload without guesswork.
 func UnmarshalJSON(data []byte, dst any) error {
+	// Checked before decoding, because after decoding it is undetectable.
+	//
+	// Go's JSON decoder replaces invalid UTF-8 with U+FFFD and returns no
+	// error, so a client sending a malformed byte in a string would receive a
+	// 202 for data this service had quietly altered -- told their point was
+	// accepted, while what is stored is not what they sent. RFC 8259 requires
+	// JSON text to be UTF-8, so this enforces the standard rather than adding
+	// a restriction to it.
+	if !utf8.Valid(data) {
+		return BadRequest(
+			"Request body is not valid UTF-8. JSON text must be UTF-8 encoded.")
+	}
+
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 

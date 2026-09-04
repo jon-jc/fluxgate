@@ -73,8 +73,8 @@ func NewRouter(deps Deps) http.Handler {
 		// Tracing sits outside metrics so the span covers the whole measured
 		// request, and inside RequestID so a log line, a metric and a span all
 		// agree on which request they describe.
-		httpx.Trace(mux),
-		httpx.Metrics(deps.Metrics, mux),
+		httpx.Trace(mux, telemetryOptions(deps.Config)),
+		httpx.Metrics(deps.Metrics, mux, telemetryOptions(deps.Config)),
 		httpx.Recoverer,
 		httpx.AccessLog(httpx.AccessLogOptions{
 			SkipPaths:            []string{PathLiveness, PathReadiness},
@@ -164,4 +164,21 @@ func mountMetrics(mux *http.ServeMux, cfg config.Config, metrics *observability.
 		return
 	}
 	mux.Handle("GET "+cfg.Telemetry.MetricsPath, metrics.Handler())
+}
+
+// telemetryOptions names the routes that machines poll rather than people call.
+//
+// Readiness is probed every few seconds by the orchestrator and the scrape
+// endpoint on Prometheus's own interval. Tracing them buries the requests
+// somebody actually cares about, and metering the scrape endpoint means
+// reading the metrics changes them.
+func telemetryOptions(cfg config.Config) httpx.TelemetryOptions {
+	routes := []string{
+		"GET " + PathLiveness,
+		"GET " + PathReadiness,
+	}
+	if cfg.Telemetry.MetricsPath != "" {
+		routes = append(routes, "GET "+cfg.Telemetry.MetricsPath)
+	}
+	return httpx.TelemetryOptions{SkipRoutes: routes}
 }

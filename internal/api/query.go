@@ -22,7 +22,8 @@ import (
 // be tested without a database.
 type Reader interface {
 	Query(ctx context.Context, f store.QueryFilter) ([]store.StoredRollup, error)
-	Changed(ctx context.Context, tenantID, metric string, since time.Time, limit int) ([]store.StoredRollup, time.Time, error)
+	Changed(ctx context.Context, tenantID, metric string, cursor store.Cursor, limit int) ([]store.StoredRollup, store.Cursor, error)
+	NewestWriteTime(ctx context.Context, tenantID string) (time.Time, error)
 	Metrics(ctx context.Context, tenantID string, limit int) ([]store.MetricSummary, error)
 	LabelKeys(ctx context.Context, tenantID, metric string, limit int) ([]string, error)
 	LabelValues(ctx context.Context, tenantID, metric, label string, limit int) ([]string, error)
@@ -261,7 +262,19 @@ func streamRollups(
 
 	// Start from now: a tail is for watching what happens next, and replaying
 	// history on connect would flood a client that only wanted the live edge.
-	cursor := deps.now().UTC()
+	//
+	// "Now" is asked of the database, not of this process. Rows are stamped by
+	// the database clock, so any skew between the two would either hide events
+	// or replay history -- both silently.
+	seed, err := deps.Reader.NewestWriteTime(ctx, tenantID)
+	if err != nil {
+		// Falling back to the local clock keeps the stream working through a
+		// blip; the cost is at most a little skew on the first poll.
+		log.Warn("could not seed the stream cursor from the database",
+			slog.Any("error", err))
+		seed = deps.now().UTC()
+	}
+	cursor := store.Cursor{Since: seed}
 
 	poll := time.NewTicker(opts.PollInterval)
 	defer poll.Stop()

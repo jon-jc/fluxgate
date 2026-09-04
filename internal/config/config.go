@@ -575,8 +575,12 @@ func (c Config) validateAggregator(l *loader) {
 		return
 	}
 
-	if c.Aggregator.WindowSize <= 0 {
-		l.reject("AGGREGATOR_WINDOW_SIZE", "must be greater than zero")
+	// A sub-second window is not a useful aggregation unit here -- a single
+	// publish round trip already costs tens of milliseconds -- and it is the
+	// kind of value that looks plausible in a config file while producing
+	// rollups nobody can interpret.
+	if c.Aggregator.WindowSize < time.Second {
+		l.reject("AGGREGATOR_WINDOW_SIZE", "must be at least 1s")
 	}
 	if c.Aggregator.MaxSeries <= 0 {
 		l.reject("AGGREGATOR_MAX_SERIES", "must be greater than zero")

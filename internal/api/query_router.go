@@ -54,8 +54,8 @@ func NewQueryRouter(deps QueryRouterDeps) http.Handler {
 	stack := httpx.Chain(
 		httpx.RequestID,
 		httpx.RealIP(deps.Config.HTTP.TrustedProxyHeader),
-		httpx.Trace(mux),
-		httpx.Metrics(deps.Metrics, mux),
+		httpx.Trace(mux, telemetryOptions(deps.Config)),
+		httpx.Metrics(deps.Metrics, mux, telemetryOptions(deps.Config)),
 		httpx.Recoverer,
 		httpx.AccessLog(httpx.AccessLogOptions{
 			SkipPaths: []string{PathLiveness, PathReadiness},
