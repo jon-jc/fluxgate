@@ -228,6 +228,19 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build query-api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile
+          build-args: |
+            SERVICE=query-api
+          push: false
+          load: true
+          tags: fluxgate/query-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       # Deployed tiers must refuse to start misconfigured. Asserting each
       # failure here exercises the safeguards on every commit rather than
       # trusting them to still work the next time someone edits config.
@@ -355,5 +368,6 @@ jobs:
         run: |
           docker logs fluxgate 2>&1 || true
           docker logs aggregator 2>&1 || true
+          docker logs query-api 2>&1 || true
           docker logs pubsub 2>&1 || true
           docker logs postgres 2>&1 || true

@@ -64,6 +64,34 @@ type Config struct {
 	Database DatabaseConfig
 	// Aggregator holds the windowing and flush settings.
 	Aggregator AggregatorConfig
+	// Query holds the read API's limits.
+	Query QueryConfig
+}
+
+// QueryConfig bounds what the read API will do for one caller.
+//
+// Every limit here exists because the read path is the easy way to hurt a
+// telemetry system: a single unbounded query over a year of one-minute windows
+// across a thousand series is half a billion rows, and the client that asked
+// for it is usually a dashboard that will ask again in thirty seconds.
+type QueryConfig struct {
+	// MaxRange is the longest time span one query may cover.
+	MaxRange time.Duration
+	// MaxSeries caps the distinct series in one response.
+	MaxSeries int
+	// MaxPoints caps the total points across all series in one response.
+	MaxPoints int
+	// DefaultRange applies when the caller supplies neither bound.
+	DefaultRange time.Duration
+
+	// StreamPollInterval is how often the live tail checks for new rollups.
+	StreamPollInterval time.Duration
+	// StreamHeartbeat is how often an idle stream sends a keep-alive, so an
+	// intermediary does not close a connection it believes is dead.
+	StreamHeartbeat time.Duration
+	// StreamMaxDuration bounds one streaming connection, so a forgotten
+	// browser tab does not hold a database poller open indefinitely.
+	StreamMaxDuration time.Duration
 }
 
 // DatabaseConfig configures Postgres.
@@ -250,6 +278,10 @@ type Requirements struct {
 	Auth bool
 	// Database means the process needs Postgres.
 	Database bool
+	// PubSub means the process publishes or subscribes. A read-only service
+	// touches neither, and requiring a project of it would be a boot failure
+	// over a setting it never reads.
+	PubSub bool
 }
 
 // Load reads configuration for the named service from the process environment,
@@ -364,6 +396,16 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			LedgerRetention:        l.duration("LEDGER_RETENTION", 24*time.Hour),
 			PruneInterval:          l.duration("PRUNE_INTERVAL", time.Hour),
 		},
+		Query: QueryConfig{
+			MaxRange:     l.duration("QUERY_MAX_RANGE", 31*24*time.Hour),
+			MaxSeries:    l.integer("QUERY_MAX_SERIES", 500),
+			MaxPoints:    l.integer("QUERY_MAX_POINTS", 50_000),
+			DefaultRange: l.duration("QUERY_DEFAULT_RANGE", time.Hour),
+
+			StreamPollInterval: l.duration("QUERY_STREAM_POLL_INTERVAL", 2*time.Second),
+			StreamHeartbeat:    l.duration("QUERY_STREAM_HEARTBEAT", 20*time.Second),
+			StreamMaxDuration:  l.duration("QUERY_STREAM_MAX_DURATION", 30*time.Minute),
+		},
 	}
 
 	// Cloud Run and several other managed platforms inject the listener port
@@ -417,6 +459,34 @@ func (c Config) validate(l *loader) {
 	c.validatePubSub(l)
 	c.validateDatabase(l)
 	c.validateAggregator(l)
+	c.validateQuery(l)
+}
+
+func (c Config) validateQuery(l *loader) {
+	if c.Query.MaxSeries <= 0 {
+		l.reject("QUERY_MAX_SERIES", "must be greater than zero")
+	}
+	if c.Query.MaxPoints <= 0 {
+		l.reject("QUERY_MAX_POINTS", "must be greater than zero")
+	}
+	if c.Query.MaxRange <= 0 {
+		l.reject("QUERY_MAX_RANGE", "must be greater than zero")
+	}
+	// A default wider than the maximum would make every parameterless request
+	// fail its own validation, which is a confusing way to learn about a
+	// misconfiguration.
+	if c.Query.DefaultRange > c.Query.MaxRange {
+		l.reject("QUERY_DEFAULT_RANGE", fmt.Sprintf(
+			"must not exceed QUERY_MAX_RANGE (%s), or a request with no range would always be rejected",
+			c.Query.MaxRange))
+	}
+	// A heartbeat that never fires before the connection is closed is the same
+	// as having none, and the whole point is to keep intermediaries from
+	// reaping an idle stream.
+	if c.Query.StreamHeartbeat >= c.Query.StreamMaxDuration {
+		l.reject("QUERY_STREAM_HEARTBEAT",
+			"must be shorter than QUERY_STREAM_MAX_DURATION, or it would never fire")
+	}
 }
 
 func (c Config) validateDatabase(l *loader) {
@@ -473,6 +543,10 @@ func (c Config) validateAggregator(l *loader) {
 }
 
 func (c Config) validatePubSub(l *loader) {
+	if !l.requirements.PubSub {
+		return
+	}
+
 	// The in-memory sink accepts a batch, answers 202 and then discards it on
 	// the next restart. That is fine for a laptop and catastrophic in
 	// production, where it would report success for data nobody ever receives.

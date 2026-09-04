@@ -54,7 +54,7 @@ func main() {
 }
 
 func run() error {
-	cfg, err := config.Load(serviceName, config.Requirements{Database: true})
+	cfg, err := config.Load(serviceName, config.Requirements{Database: true, PubSub: true})
 	if err != nil {
 		return err
 	}

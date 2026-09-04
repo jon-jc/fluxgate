@@ -168,3 +168,23 @@ func histogramFromCounts(counts []int64) *histogram {
 	h.overflow = counts[len(counts)-1]
 	return h
 }
+
+// QuantileFromBuckets estimates a quantile from a stored bucket vector.
+//
+// It exists so a reader can compute percentiles from a rollup fetched out of
+// the database, without the query path re-deriving the bucket layout. The
+// boolean is false when the vector does not match this build's layout: a
+// series with no histogram, or one written under a different bucket scheme.
+// Returning zero in that case would let a dashboard render a percentile that
+// was never computed.
+func QuantileFromBuckets(counts []int64, q float64) (float64, bool) {
+	if len(counts) != histogramBuckets+3 {
+		return 0, false
+	}
+
+	h := histogramFromCounts(counts)
+	if h.total() == 0 {
+		return 0, false
+	}
+	return h.quantile(q), true
+}
