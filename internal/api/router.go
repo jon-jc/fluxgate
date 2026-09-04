@@ -26,6 +26,8 @@ type Deps struct {
 	Auth auth.Options
 	// Ingest supplies the collaborators for POST /v1/ingest.
 	Ingest IngestDeps
+	// Metrics instruments the HTTP surface. Optional.
+	Metrics *observability.Metrics
 }
 
 // Probe paths are mounted outside the versioned namespace because
@@ -47,6 +49,8 @@ func NewRouter(deps Deps) http.Handler {
 
 	mux.Handle("GET /v1/version", httpx.Handler(handleVersion))
 
+	mountMetrics(mux, deps.Config, deps.Metrics)
+
 	// Everything that touches tenant data goes through authentication. Applying
 	// it per-route rather than to the whole mux keeps the probes reachable by an
 	// orchestrator that holds no credentials, and makes the authenticated set
@@ -66,6 +70,11 @@ func NewRouter(deps Deps) http.Handler {
 		// attached to its log record.
 		httpx.RequestID,
 		httpx.RealIP(deps.Config.HTTP.TrustedProxyHeader),
+		// Tracing sits outside metrics so the span covers the whole measured
+		// request, and inside RequestID so a log line, a metric and a span all
+		// agree on which request they describe.
+		httpx.Trace(mux),
+		httpx.Metrics(deps.Metrics, mux),
 		httpx.Recoverer,
 		httpx.AccessLog(httpx.AccessLogOptions{
 			SkipPaths:            []string{PathLiveness, PathReadiness},
@@ -142,4 +151,17 @@ func allowedMethods(mux *http.ServeMux, r *http.Request) []string {
 		}
 	}
 	return allowed
+}
+
+// mountMetrics exposes the Prometheus scrape endpoint.
+//
+// It is served on the same listener as the API rather than a second port. A
+// separate admin port is the more common arrangement, but it doubles the
+// surface an orchestrator has to route and health-check for one endpoint that
+// is already unauthenticated by necessity -- a scraper holds no credentials.
+func mountMetrics(mux *http.ServeMux, cfg config.Config, metrics *observability.Metrics) {
+	if metrics == nil || !cfg.Telemetry.MetricsEnabled || cfg.Telemetry.MetricsPath == "" {
+		return
+	}
+	mux.Handle("GET "+cfg.Telemetry.MetricsPath, metrics.Handler())
 }

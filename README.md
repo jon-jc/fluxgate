@@ -31,11 +31,91 @@ flowchart LR
 | 2 | Ingest API: metric model, validation, API-key auth, per-tenant rate limiting, OpenAPI | Merged |
 | 3 | Pub/Sub layer: batched publisher, subscriber runtime, retries, DLQ, emulator harness | Merged |
 | 4 | Aggregator: windowing, watermarks, duplicate suppression, Postgres rollups | Merged |
-| 5 | Query API: time-series queries, label filtering, percentiles, SSE live tail | In review |
-| 6 | Alerting and observability: rule evaluation, OpenTelemetry, Prometheus metrics | Planned |
+| 5 | Query API: time-series queries, label filtering, percentiles, SSE live tail | Merged |
+| 6 | Observability: distributed tracing across the broker, Prometheus metrics, dashboards | In review |
 | 7 | Deployment: Terraform for Pub/Sub and Cloud Run, runbooks, architecture decision records | Planned |
 
 Each milestone lands as its own reviewed pull request.
+
+## Observability
+
+The pipeline is asynchronous and spans three processes, which makes the obvious
+question — *what happened to this point?* — the hard one. Tracing answers it.
+
+### One trace across the broker
+
+A request to the ingest API, the publish it triggers, and the aggregation that
+happens seconds later in another process are all one trace:
+
+```
+SERVICE                  SPAN                           KIND       DURATION
+fluxgate-ingest-api      POST /v1/ingest                server      12.1ms
+fluxgate-ingest-api      publish telemetry-raw          producer    12.0ms
+fluxgate-aggregator      consume telemetry-aggregator   consumer     0.6ms
+```
+
+The publisher writes W3C trace context into the Pub/Sub message attributes; the
+consumer reads it back out and starts its span as a child. Nothing is shared
+between the processes but the message itself.
+
+The propagator is installed **even when tracing is disabled**. A service that
+dropped the header because it was not itself sampling would silently break
+every trace passing through it, turning one unsampled hop into a permanently
+broken chain.
+
+Sampling is `ParentBased`: once the edge decides to record a request, every
+downstream hop honours that decision instead of re-rolling the dice and
+producing a trace with holes in it. The default ratio follows the tier — 1 on
+local and dev, 0.05 on staging and prod — because tracing every request is
+affordable while developing and ruinous at ingest volumes.
+
+**Telemetry can never take the service down.** OpenTelemetry errors are handled,
+not returned; the exporter batches rather than blocking the request path; and
+nothing in the compose stack gates a service on the collector being healthy.
+Telemetry being down costs visibility, never availability.
+
+### Metrics
+
+Every service exposes `/metrics` on its own listener. The instruments worth
+knowing about:
+
+| Metric | Why it matters |
+| --- | --- |
+| `fluxgate_aggregate_watermark_lag_seconds` | How far event time trails the wall clock. A rising line means the pipeline is falling behind, long before a queue-depth alarm would notice. |
+| `fluxgate_aggregate_tracked_series` | The number the cardinality bound applies to. Rising without traffic rising is the shape of a cardinality problem. |
+| `fluxgate_resilience_breaker_state` | 0 closed, 1 half-open, 2 open. Above zero means the edge is failing fast rather than waiting out timeouts. |
+| `fluxgate_publish_batches_total` | By outcome. Anything but `ok` means shedding, or an unhealthy broker. |
+| `fluxgate_consume_messages_total` | By outcome. `rejected` means something is heading for the dead-letter queue. |
+
+**Labels are bounded by construction.** Requests are labelled by *route pattern*
+— `POST /v1/ingest` — never by path, and every unmatched request shares one
+`unmatched` label so a scan for URLs that do not exist cannot mint a series per
+probe. Status codes are bucketed by class, because alerts are written against
+classes and the exact code is already in the access log where it can be read in
+context.
+
+That is not an incidental choice. This is a telemetry system: shipping one with
+an unbounded metric label would be a bad joke.
+
+### Logs, traces and metrics agree
+
+A request ID is generated at the edge, bound to the logger, carried in the
+response header, published as a message attribute, and re-attached by the
+consumer. Trace and span IDs are bound to the same logger. So a log line names
+the trace it belongs to, a trace names the request that produced it, and a
+metric shares the route label with both — which is what makes it possible to
+start anywhere and reach the other two.
+
+### Seeing it
+
+`make up` brings up Jaeger, Prometheus and a provisioned Grafana alongside the
+services:
+
+```
+Jaeger      http://localhost:16686   traces spanning all three services
+Prometheus  http://localhost:9090
+Grafana     http://localhost:3000    the "Fluxgate pipeline" dashboard, no login
+```
 
 ## The query API
 
@@ -518,6 +598,8 @@ The ones that most often need changing:
 | `AGGREGATOR_ALLOWED_LATENESS` | `30s` | Freshness traded for out-of-order tolerance |
 | `QUERY_MAX_RANGE` | `744h` | Longest span one query may cover |
 | `QUERY_MAX_SERIES` | `500` | Distinct series in one response |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | -- | Setting it also enables tracing |
+| `TRACE_SAMPLE_RATIO` | `1` local/dev, `0.05` prod | Completeness traded for cost |
 | `HTTP_TRUST_PROXY_HEADER` | `false` | Enable only behind a proxy that rewrites `X-Forwarded-For` |
 
 Two settings are boot failures rather than documented warnings, because both
@@ -560,7 +642,7 @@ internal/config/        environment configuration and validation
 internal/httpx/         handler contract, error envelope, middleware, server
 internal/idempotency/   replaying outcomes for retried requests
 internal/ingest/        the sink seam between HTTP and the delivery pipeline
-internal/observability/ logging and health probes
+internal/observability/ logging, probes, tracing and metrics
 internal/pubsubx/       envelope, publisher, subscriber runtime, topology
 internal/query/         query parsing, limits and result shaping
 internal/ratelimit/     sharded token-bucket throttling
@@ -569,7 +651,8 @@ internal/store/         Postgres schema, migrations and the delivery ledger
 internal/telemetry/     the metric domain model and its validation rules
 internal/version/       build provenance
 build/docker/           multi-stage Dockerfile shared by every service
-deploy/                 docker-compose stack for local development
+deploy/                 docker-compose stack, Prometheus scrape config,
+                        provisioned Grafana dashboards
 ```
 
 ## License

@@ -86,6 +86,22 @@ func run() error {
 		context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	metrics := observability.NewMetrics(cfg.Service)
+
+	tracing, err := observability.InitTracing(ctx, cfg, observability.TracingConfig{
+		Enabled:       cfg.Telemetry.TracingEnabled,
+		Endpoint:      cfg.Telemetry.OTLPEndpoint,
+		Insecure:      cfg.Telemetry.OTLPInsecure,
+		SampleRatio:   cfg.Telemetry.TraceSampleRatio,
+		ExportTimeout: cfg.Telemetry.TraceExportTimeout,
+	}, logger)
+	if err != nil {
+		return err
+	}
+	// Flushed last, so the spans describing the shutdown itself are exported
+	// rather than discarded with the process.
+	defer tracing.Shutdown(ctx)
+
 	health := observability.NewHealth(cfg.HTTP.HandlerTimeout)
 
 	authOpts, err := buildAuth(cfg, logger)
@@ -93,7 +109,7 @@ func run() error {
 		return err
 	}
 
-	sink, closeSink, err := buildSink(ctx, cfg, logger, health)
+	sink, closeSink, err := buildSink(ctx, cfg, logger, health, metrics)
 	if err != nil {
 		return err
 	}
@@ -103,10 +119,11 @@ func run() error {
 	defer closeSink()
 
 	handler := api.NewRouter(api.Deps{
-		Config: cfg,
-		Logger: logger,
-		Health: health,
-		Auth:   authOpts,
+		Config:  cfg,
+		Logger:  logger,
+		Health:  health,
+		Auth:    authOpts,
+		Metrics: metrics,
 		Ingest: api.IngestDeps{
 			Sink: sink,
 			Validator: telemetry.Validator{
@@ -191,7 +208,8 @@ func buildAuth(cfg config.Config, logger *slog.Logger) (auth.Options, error) {
 // else. Configuration validation already refuses it on staging and prod; the
 // warning here is for the tiers where it is merely surprising.
 func buildSink(
-	ctx context.Context, cfg config.Config, logger *slog.Logger, health *observability.Health,
+	ctx context.Context, cfg config.Config, logger *slog.Logger,
+	health *observability.Health, metrics *observability.Metrics,
 ) (ingest.Sink, func(), error) {
 	if !cfg.PubSub.Enabled {
 		logger.Warn("using the in-memory sink; accepted batches are NOT durable",
@@ -231,7 +249,8 @@ func buildSink(
 			FailureThreshold: cfg.PubSub.BreakerFailureThreshold,
 			Cooldown:         cfg.PubSub.BreakerCooldown,
 		},
-		Logger: logger,
+		Metrics: metrics,
+		Logger:  logger,
 	})
 	if err != nil {
 		_ = client.Close()

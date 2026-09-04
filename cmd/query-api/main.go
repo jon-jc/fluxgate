@@ -73,6 +73,22 @@ func run() error {
 		context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	metrics := observability.NewMetrics(cfg.Service)
+
+	tracing, err := observability.InitTracing(ctx, cfg, observability.TracingConfig{
+		Enabled:       cfg.Telemetry.TracingEnabled,
+		Endpoint:      cfg.Telemetry.OTLPEndpoint,
+		Insecure:      cfg.Telemetry.OTLPInsecure,
+		SampleRatio:   cfg.Telemetry.TraceSampleRatio,
+		ExportTimeout: cfg.Telemetry.TraceExportTimeout,
+	}, logger)
+	if err != nil {
+		return err
+	}
+	// Flushed last, so the spans describing the shutdown itself are exported
+	// rather than discarded with the process.
+	defer tracing.Shutdown(ctx)
+
 	health := observability.NewHealth(cfg.HTTP.HandlerTimeout)
 
 	db, err := store.Open(ctx, store.Config{
@@ -98,10 +114,11 @@ func run() error {
 	}
 
 	handler := api.NewQueryRouter(api.QueryRouterDeps{
-		Config: cfg,
-		Logger: logger,
-		Health: health,
-		Auth:   authOpts,
+		Config:  cfg,
+		Logger:  logger,
+		Health:  health,
+		Auth:    authOpts,
+		Metrics: metrics,
 		Query: api.QueryDeps{
 			Reader: db,
 			Limits: query.Limits{

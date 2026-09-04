@@ -9,6 +9,10 @@ import (
 
 	pubsub "cloud.google.com/go/pubsub/v2"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+
 	"github.com/jon-jc/fluxgate/internal/httpx"
 	"github.com/jon-jc/fluxgate/internal/observability"
 	"github.com/jon-jc/fluxgate/internal/resilience"
@@ -34,6 +38,9 @@ type PublisherOptions struct {
 	MaxOutstandingBytes int
 	// Breaker configures failing fast when Pub/Sub looks unhealthy.
 	Breaker resilience.Options
+	// Metrics records publish outcomes. Optional; a nil value disables
+	// instrumentation rather than panicking.
+	Metrics *observability.Metrics
 	// Logger receives lifecycle events.
 	Logger *slog.Logger
 }
@@ -78,6 +85,7 @@ type Publisher struct {
 	topic   string
 	timeout time.Duration
 	breaker *resilience.Breaker
+	metrics *observability.Metrics
 	log     *slog.Logger
 }
 
@@ -124,17 +132,36 @@ func NewPublisher(client *pubsub.Client, opts PublisherOptions) (*Publisher, err
 		topic:   opts.Topic,
 		timeout: opts.PublishTimeout,
 		breaker: resilience.New(opts.Breaker),
+		metrics: opts.Metrics,
 		log:     opts.Logger,
 	}, nil
 }
 
+// tracerName identifies this instrumentation in the collected spans.
+const tracerName = "github.com/jon-jc/fluxgate/internal/pubsubx"
+
 // Publish implements ingest.Sink.
 func (p *Publisher) Publish(ctx context.Context, batch telemetry.Batch) error {
+	ctx, span := observability.Tracer(tracerName).Start(ctx, "publish "+p.topic,
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "gcp_pubsub"),
+			attribute.String("messaging.destination.name", p.topic),
+			attribute.String("fluxgate.batch_id", batch.ID),
+			attribute.String("fluxgate.tenant_id", batch.TenantID),
+			attribute.Int("fluxgate.points", len(batch.Points)),
+		))
+	defer span.End()
+
+	started := time.Now()
+
 	token, err := p.breaker.Allow()
 	if err != nil {
 		// Failing fast here is the whole point: without it, every request
 		// waits out the full publish timeout while holding a connection, and
 		// a broker outage becomes an exhausted server.
+		span.SetStatus(codes.Error, "circuit breaker open")
+		p.metrics.ObservePublish("breaker_open", time.Since(started))
 		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 
@@ -152,6 +179,12 @@ func (p *Publisher) Publish(ctx context.Context, batch telemetry.Batch) error {
 		Attributes: envelope.Attributes(httpx.RequestIDFromContext(ctx), time.Now()),
 	}
 
+	// Write the trace context into the message attributes. This is what lets
+	// one trace span the broker: the consumer reads it back out minutes later,
+	// on another machine, and its work appears as a child of the request that
+	// produced the data rather than as an unattributable orphan.
+	observability.InjectTrace(ctx, observability.MapCarrier(msg.Attributes))
+
 	// Bound the wait independently of the caller's deadline so a client with a
 	// generous timeout cannot pin a publish slot indefinitely.
 	publishCtx, cancel := context.WithTimeout(ctx, p.timeout)
@@ -162,14 +195,22 @@ func (p *Publisher) Publish(ctx context.Context, batch telemetry.Batch) error {
 	serverID, err := result.Get(publishCtx)
 	if err != nil {
 		token.Failure()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "publish failed")
 
 		if errors.Is(err, pubsub.ErrFlowControllerMaxOutstandingMessages) ||
 			errors.Is(err, pubsub.ErrFlowControllerMaxOutstandingBytes) {
+			p.metrics.ObservePublish("overloaded", time.Since(started))
 			return fmt.Errorf("%w: %w", ErrOverloaded, err)
 		}
+		p.metrics.ObservePublish("error", time.Since(started))
 		return wrapPublishError(p.topic, err)
 	}
 	token.Success()
+
+	span.SetAttributes(attribute.String("messaging.message.id", serverID))
+	p.metrics.ObservePublish("ok", time.Since(started))
+	p.metrics.SetBreakerState("pubsub-publisher", int(p.breaker.State()))
 
 	observability.LoggerFromContext(ctx).Debug("batch published",
 		slog.String("batch_id", batch.ID),

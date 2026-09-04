@@ -363,11 +363,131 @@ jobs:
 
           echo "confirmed: the image published to a real broker, request ID intact"
 
+      # Everything above proves the edge works. This proves the pipeline does:
+      # a point sent over HTTP has to come back out over HTTP, aggregated,
+      # through the broker, the aggregator and Postgres, with no step mocked.
+      - name: End-to-end through the whole pipeline
+        run: |
+          SECRET=ci-smoke-secret
+          DIGEST=$(printf %s "$SECRET" | sha256sum | cut -d' ' -f1)
+          PROJECT=fluxgate-ci
+          KEYS="[{\"key_id\":\"ci\",\"tenant_id\":\"ci-tenant\",\"secret_sha256\":\"$DIGEST\"}]"
+
+          docker run -d --name postgres --network fluxgate-ci \
+            -e POSTGRES_USER=fluxgate -e POSTGRES_PASSWORD=fluxgate \
+            -e POSTGRES_DB=fluxgate \
+            postgres:17-alpine
+
+          for i in $(seq 1 60); do
+            docker exec postgres pg_isready -U fluxgate -d fluxgate >/dev/null 2>&1 && break
+            if [ "$i" = "60" ]; then
+              echo "::error::postgres never became ready"
+              docker logs postgres
+              exit 1
+            fi
+            sleep 1
+          done
+
+          # Short windows so the assertion does not wait out a minute boundary,
+          # and a short idle timeout so the final window closes once the
+          # producer stops sending.
+          docker run -d --name aggregator --network fluxgate-ci \
+            -e ENVIRONMENT=dev \
+            -e GCP_PROJECT_ID="$PROJECT" \
+            -e PUBSUB_EMULATOR_HOST=pubsub:8085 \
+            -e DATABASE_URL="postgres://fluxgate:fluxgate@postgres:5432/fluxgate?sslmode=disable" \
+            -e AGGREGATOR_WINDOW_SIZE=5s \
+            -e AGGREGATOR_ALLOWED_LATENESS=1s \
+            -e AGGREGATOR_FLUSH_INTERVAL=2s \
+            -e AGGREGATOR_IDLE_TIMEOUT=3s \
+            -e LEDGER_RETENTION=1h \
+            fluxgate/aggregator:ci
+
+          docker run -d --name query-api --network fluxgate-ci -p 8082:8080 \
+            -e ENVIRONMENT=dev \
+            -e DATABASE_URL="postgres://fluxgate:fluxgate@postgres:5432/fluxgate?sslmode=disable" \
+            -e API_KEYS="$KEYS" \
+            fluxgate/query-api:ci
+
+          for name in aggregator query-api; do
+            for i in $(seq 1 60); do
+              docker exec "$name" /usr/local/bin/service -healthcheck >/dev/null 2>&1 && break
+              if [ "$i" = "60" ]; then
+                echo "::error::$name never became ready"
+                docker logs "$name"
+                exit 1
+              fi
+              sleep 1
+            done
+          done
+
+          # Three batches of one series, so the assertion checks the
+          # aggregation itself rather than merely that a row appeared.
+          for v in 10 20 30; do
+            curl -fsS -X POST http://localhost:8080/v1/ingest \
+              -H "Authorization: Bearer fxg_ci_$SECRET" \
+              -H 'Content-Type: application/json' \
+              -d "{\"points\":[{\"metric\":\"ci.pipeline\",\"kind\":\"gauge\",\"value\":$v}]}" \
+              >/dev/null
+          done
+
+          # Unauthenticated reads are refused, just like writes.
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            "http://localhost:8082/v1/query?metric=ci.pipeline")
+          if [ "$status" != "401" ]; then
+            echo "::error::unauthenticated query returned $status, want 401"
+            exit 1
+          fi
+
+          # The decisive assertion: the numbers must come back out over HTTP.
+          for i in $(seq 1 90); do
+            result=$(curl -fsS \
+              -H "Authorization: Bearer fxg_ci_$SECRET" \
+              "http://localhost:8082/v1/query?metric=ci.pipeline&from=-1h&agg=sum" || true)
+
+            if echo "$result" | grep -q '"v":60'; then
+              echo "$result"
+              echo "confirmed: HTTP in, Pub/Sub, aggregation, Postgres, HTTP out"
+              break
+            fi
+            if [ "$i" = "90" ]; then
+              echo "last response: ${result:-<none>}"
+              echo "::error::the aggregated sum of 60 never came back from the query API"
+              docker logs aggregator
+              docker logs query-api
+              exit 1
+            fi
+            sleep 1
+          done
+
+          metrics=$(curl -fsS \
+            -H "Authorization: Bearer fxg_ci_$SECRET" \
+            "http://localhost:8082/v1/metrics")
+          echo "$metrics" | grep -q 'ci.pipeline' \
+            || { echo "::error::the metric is missing from /v1/metrics"; exit 1; }
+
+          # Every service must be scrapeable, and the route label must be the
+          # registered pattern rather than "unmatched" -- an instrumentation
+          # bug that is silent and makes every dashboard useless.
+          for port in 8080 8082; do
+            curl -fsS "http://localhost:$port/metrics" | grep -q '^fluxgate_' \
+              || { echo "::error::port $port exposes no fluxgate metrics"; exit 1; }
+          done
+
+          curl -fsS http://localhost:8080/metrics | grep -q 'route="POST /v1/ingest"' \
+            || { echo "::error::the route label is not the registered pattern"; \
+                 curl -fsS http://localhost:8080/metrics | grep fluxgate_http_requests_total; \
+                 exit 1; }
+
+          echo "confirmed: metrics exposed with bounded route labels"
+
       - name: Container logs on failure
         if: failure()
         run: |
           docker logs fluxgate 2>&1 || true
           docker logs aggregator 2>&1 || true
+          docker logs query-api 2>&1 || true
+          docker logs postgres 2>&1 || true
           docker logs query-api 2>&1 || true
           docker logs pubsub 2>&1 || true
           docker logs postgres 2>&1 || true

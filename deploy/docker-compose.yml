@@ -1,6 +1,12 @@
 # Local development stack.
 #
-#   make up          # emulator, Postgres, ingest API, aggregator, query API
+#   make up          # the whole stack, including tracing and metrics
+#
+# Once up:
+#   Jaeger      http://localhost:16686   one trace spanning HTTP, the broker
+#                                        and the aggregator
+#   Prometheus  http://localhost:9090
+#   Grafana     http://localhost:3000    (anonymous, no login)
 #   make down        # and a clean slate
 #
 # The emulator holds everything in memory, so `down -v` really is a clean
@@ -66,6 +72,8 @@ services:
     depends_on:
       pubsub:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     ports:
       - "8080:8080"
     environment:
@@ -74,6 +82,10 @@ services:
       LOG_LEVEL: debug
       GCP_PROJECT_ID: fluxgate-local
       PUBSUB_EMULATOR_HOST: pubsub:8085
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
+      # Sample everything locally: a trace you cannot find is worse than no
+      # tracing at all when you are trying to understand a single request.
+      TRACE_SAMPLE_RATIO: "1"
       # Credentials for the compose stack only. The secret is
       # "local-dev-secret"; the service never sees anything but this digest.
       API_KEYS: >-
@@ -100,6 +112,8 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     ports:
       # Probes only; the aggregator exposes no API of its own.
       - "8081:8080"
@@ -112,6 +126,10 @@ services:
       DATABASE_URL: postgres://fluxgate:fluxgate@postgres:5432/fluxgate?sslmode=disable
       # Short windows keep the local loop tight: a rollup appears within
       # seconds of sending a point rather than at the next minute boundary.
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
+      # Sample everything locally: a trace you cannot find is worse than no
+      # tracing at all when you are trying to understand a single request.
+      TRACE_SAMPLE_RATIO: "1"
       AGGREGATOR_WINDOW_SIZE: 10s
       AGGREGATOR_ALLOWED_LATENESS: 2s
       AGGREGATOR_FLUSH_INTERVAL: 2s
@@ -135,6 +153,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      jaeger:
+        condition: service_started
     ports:
       - "8082:8080"
     environment:
@@ -142,6 +162,10 @@ services:
       LOG_FORMAT: text
       LOG_LEVEL: debug
       DATABASE_URL: postgres://fluxgate:fluxgate@postgres:5432/fluxgate?sslmode=disable
+      OTEL_EXPORTER_OTLP_ENDPOINT: jaeger:4317
+      # Sample everything locally: a trace you cannot find is worse than no
+      # tracing at all when you are trying to understand a single request.
+      TRACE_SAMPLE_RATIO: "1"
       # The read path shares the ingest API's credentials: a tenant's key
       # identifies the tenant, and separate read keys would double the
       # rotation burden without changing who can see what.
@@ -156,6 +180,56 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
+
+  # --- observability ---------------------------------------------------------
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.65.0
+    container_name: fluxgate-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"   # UI
+      - "4317:4317"     # OTLP gRPC, which is what the services export to
+    # No healthcheck, and nothing gates on one. The services must not depend on
+    # the collector being up: an exporter that cannot reach it retries in the
+    # background, and instrumentation errors are handled rather than returned.
+    # Telemetry being down should cost visibility, never availability -- and a
+    # compose file that refuses to start the pipeline because Jaeger is
+    # unhealthy would encode exactly the opposite.
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: fluxgate-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      # Needed for the reload endpoint and for editing the config without a
+      # container restart.
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: fluxgate-grafana
+    depends_on:
+      - prometheus
+      - jaeger
+    environment:
+      # Anonymous admin: this stack is a laptop convenience, and a login
+      # prompt between an engineer and their own dashboard is friction with no
+      # security value here. Nothing about this arrangement is deployable.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_FEATURE_TOGGLES_ENABLE: traceToMetrics
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
 
 volumes:
   postgres-data:

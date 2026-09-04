@@ -1,0 +1,159 @@
+{
+  "uid": "fluxgate-pipeline",
+  "title": "Fluxgate pipeline",
+  "tags": ["fluxgate"],
+  "timezone": "utc",
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Points accepted per second",
+      "description": "Throughput at the edge, by tenant. The first number anyone asks for.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (tenant) (rate(fluxgate_ingest_points_accepted_total[1m]))",
+          "legendFormat": "{{tenant}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Ingest latency",
+      "description": "p50 and p99 of the ingest endpoint. A 202 means the batch is durable, so this includes the broker acknowledgement.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(fluxgate_http_request_duration_seconds_bucket{route=\"POST /v1/ingest\"}[1m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fluxgate_http_request_duration_seconds_bucket{route=\"POST /v1/ingest\"}[1m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Watermark lag",
+      "description": "How far the aggregator's event-time watermark trails wall-clock time. A steadily rising line means the pipeline is falling behind, long before any queue-depth alarm would notice.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        {
+          "expr": "fluxgate_aggregate_watermark_lag_seconds",
+          "legendFormat": "lag"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Tracked series",
+      "description": "Distinct series held across open windows. This is the number the cardinality bound applies to; it rising without traffic rising is the shape of a cardinality problem.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        { "expr": "fluxgate_aggregate_tracked_series", "legendFormat": "series" },
+        { "expr": "fluxgate_aggregate_open_windows", "legendFormat": "open windows" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Publish outcomes",
+      "description": "Batches published by outcome. Anything other than ok means the edge is shedding or the broker is unhealthy.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(fluxgate_publish_batches_total[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Message outcomes",
+      "description": "Consumed messages by outcome. `retried` means transient failures; `rejected` means something is heading for the dead-letter queue.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (outcome) (rate(fluxgate_consume_messages_total[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Circuit breaker",
+      "description": "0 closed, 1 half-open, 2 open. Anything above zero means the edge is failing fast rather than waiting out timeouts.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        { "expr": "max(fluxgate_resilience_breaker_state)", "legendFormat": "state" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "closed", "color": "green", "index": 0 },
+                "1": { "text": "half-open", "color": "orange", "index": 1 },
+                "2": { "text": "open", "color": "red", "index": 2 }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "HTTP errors by class",
+      "description": "4xx is clients getting it wrong; 5xx is us. Only the second should ever page anyone.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (service, status) (rate(fluxgate_http_requests_total{status=~\"4xx|5xx\"}[1m]))",
+          "legendFormat": "{{service}} {{status}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Flush duration",
+      "description": "Time to commit a flush transaction. Rollups and the delivery ledger commit together, so this is the whole exactly-once write.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "fluxgate-prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fluxgate_aggregate_flush_duration_seconds_bucket[1m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

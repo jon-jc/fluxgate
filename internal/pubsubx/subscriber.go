@@ -8,6 +8,9 @@ import (
 	"time"
 
 	pubsub "cloud.google.com/go/pubsub/v2"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/jon-jc/fluxgate/internal/httpx"
 	"github.com/jon-jc/fluxgate/internal/observability"
@@ -90,6 +93,9 @@ type SubscriberOptions struct {
 	// durable closes that gap, at the cost of holding the message's lease for
 	// longer -- which is what MaxExtension is for.
 	ManualAck bool
+	// Metrics records consumption outcomes. Optional; a nil value disables
+	// instrumentation rather than panicking.
+	Metrics *observability.Metrics
 	// Logger receives lifecycle events.
 	Logger *slog.Logger
 }
@@ -122,6 +128,7 @@ type Subscriber struct {
 	handler   Handler
 	timeout   time.Duration
 	manualAck bool
+	metrics   *observability.Metrics
 	log       *slog.Logger
 }
 
@@ -151,6 +158,7 @@ func NewSubscriber(client *pubsub.Client, handler Handler, opts SubscriberOption
 		handler:   handler,
 		timeout:   opts.HandlerTimeout,
 		manualAck: opts.ManualAck,
+		metrics:   opts.Metrics,
 		log:       opts.Logger,
 	}, nil
 }
@@ -189,15 +197,43 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 				slog.String(observability.KeyRequestID, requestID)))
 	}
 
+	// Continue the trace the publisher started. The span links back to the
+	// HTTP request that produced this data, so a single trace spans the edge,
+	// the broker and this consumer -- which is the only way to answer "where
+	// did this point actually go" without correlating by hand.
+	ctx = observability.ExtractTrace(ctx, observability.MapCarrier(msg.Attributes))
+
+	ctx, span := observability.Tracer(tracerName).Start(ctx, "consume "+s.name,
+		trace.WithSpanKind(trace.SpanKindConsumer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "gcp_pubsub"),
+			attribute.String("messaging.source.name", s.name),
+			attribute.String("messaging.message.id", msg.ID),
+			attribute.Int("messaging.message.body.size", len(msg.Data)),
+			attribute.Int("messaging.delivery_attempt", deliveryAttempt(msg)),
+		))
+	defer span.End()
+
+	ctx = observability.ContextWithLogger(ctx, observability.LoggerWithTrace(ctx))
+
 	log := observability.LoggerFromContext(ctx).With(
 		slog.String("message_id", msg.ID),
 		slog.String("subscription", s.name))
 
 	envelope, err := DecodeEnvelope(msg.Data)
 	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "undecodable envelope")
+		s.metrics.ObserveMessage("rejected")
 		s.reject(log, msg, err, "envelope could not be decoded")
 		return
 	}
+
+	span.SetAttributes(
+		attribute.String("fluxgate.batch_id", envelope.BatchID),
+		attribute.String("fluxgate.tenant_id", envelope.TenantID),
+		attribute.Int("fluxgate.points", len(envelope.Points)),
+	)
 
 	log = log.With(
 		slog.String("batch_id", envelope.BatchID),
@@ -224,7 +260,11 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 	}
 
 	if err := s.invoke(handlerCtx, delivery); err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "handler failed")
+
 		if IsPermanent(err) {
+			s.metrics.ObserveMessage("rejected")
 			s.reject(log, msg, err, "handler reported a permanent failure")
 			return
 		}
@@ -236,9 +276,12 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 		log.Warn("handler failed; message will be redelivered",
 			slog.Any("error", err),
 			slog.Int("delivery_attempt", delivery.DeliveryAttempt))
+		s.metrics.ObserveMessage("retried")
 		msg.Nack()
 		return
 	}
+
+	s.metrics.ObserveMessage("ok")
 
 	// In manual mode the handler has taken ownership and will settle the
 	// message once the work it triggered is durable.
