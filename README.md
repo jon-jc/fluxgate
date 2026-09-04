@@ -33,9 +33,13 @@ flowchart LR
 | 4 | Aggregator: windowing, watermarks, duplicate suppression, Postgres rollups | Merged |
 | 5 | Query API: time-series queries, label filtering, percentiles, SSE live tail | Merged |
 | 6 | Observability: distributed tracing across the broker, Prometheus metrics, dashboards | Merged |
-| 7 | Deployment: Terraform for GCP, least-privilege IAM, alert policies, decision records | In review |
+| 7 | Deployment: Terraform for GCP, least-privilege IAM, alert policies, decision records | Merged |
 
-Each milestone lands as its own reviewed pull request.
+All seven milestones are merged. Each landed as its own reviewed pull request,
+so the history reads as a sequence of decisions rather than one large drop.
+
+Alerting was deliberately dropped from the plan rather than quietly left
+promised; [ADR 7](docs/adr/0007-deferred-alerting.md) records why.
 
 ## Deploying
 
