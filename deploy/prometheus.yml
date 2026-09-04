@@ -1,0 +1,32 @@
+# Scrape configuration for the local stack.
+#
+# The interval is deliberately short. In production it would be 15-30s; here
+# the point is to see a change within a few seconds of causing it, which is
+# what makes the metrics useful while developing rather than a thing you set up
+# once and never look at.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    env: local
+
+scrape_configs:
+  # Every Fluxgate service exposes the same path on its own port. They are
+  # listed individually rather than discovered because the local stack is
+  # fixed; a deployed one would use service discovery.
+  - job_name: fluxgate
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ingest-api:8080"]
+        labels:
+          component: ingest
+      - targets: ["aggregator:8080"]
+        labels:
+          component: aggregator
+      - targets: ["query-api:8080"]
+        labels:
+          component: query
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

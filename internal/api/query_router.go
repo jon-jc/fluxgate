@@ -18,6 +18,8 @@ type QueryRouterDeps struct {
 	Health *observability.Health
 	Auth   auth.Options
 	Query  QueryDeps
+	// Metrics instruments the HTTP surface. Optional.
+	Metrics *observability.Metrics
 }
 
 // NewQueryRouter builds the HTTP handler for the read API.
@@ -33,6 +35,8 @@ func NewQueryRouter(deps QueryRouterDeps) http.Handler {
 	mux.Handle("GET "+PathLiveness, deps.Health.LivenessHandler())
 	mux.Handle("GET "+PathReadiness, deps.Health.ReadinessHandler())
 	mux.Handle("GET /v1/version", httpx.Handler(handleVersion))
+
+	mountMetrics(mux, deps.Config, deps.Metrics)
 
 	authenticated := auth.Middleware(deps.Auth)
 
@@ -50,6 +54,8 @@ func NewQueryRouter(deps QueryRouterDeps) http.Handler {
 	stack := httpx.Chain(
 		httpx.RequestID,
 		httpx.RealIP(deps.Config.HTTP.TrustedProxyHeader),
+		httpx.Trace(mux),
+		httpx.Metrics(deps.Metrics, mux),
 		httpx.Recoverer,
 		httpx.AccessLog(httpx.AccessLogOptions{
 			SkipPaths: []string{PathLiveness, PathReadiness},

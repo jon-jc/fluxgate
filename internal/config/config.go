@@ -66,6 +66,29 @@ type Config struct {
 	Aggregator AggregatorConfig
 	// Query holds the read API's limits.
 	Query QueryConfig
+	// Telemetry holds the tracing and metrics settings.
+	Telemetry TelemetryConfig
+}
+
+// TelemetryConfig configures the service's own observability.
+type TelemetryConfig struct {
+	// TracingEnabled turns distributed tracing on.
+	TracingEnabled bool
+	// OTLPEndpoint is the collector's gRPC address.
+	OTLPEndpoint string
+	// OTLPInsecure disables transport security, appropriate for a collector on
+	// a loopback or a private mesh and nowhere else.
+	OTLPInsecure bool
+	// TraceSampleRatio is the fraction of traces recorded. Tracing every
+	// request is affordable in development and ruinous at ingest volumes, so
+	// production samples.
+	TraceSampleRatio float64
+	// TraceExportTimeout bounds one batch export.
+	TraceExportTimeout time.Duration
+	// MetricsEnabled exposes the Prometheus scrape endpoint.
+	MetricsEnabled bool
+	// MetricsPath is where the scrape endpoint is mounted.
+	MetricsPath string
 }
 
 // QueryConfig bounds what the read API will do for one caller.
@@ -312,6 +335,11 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 	// could disagree with it.
 	emulator := l.str("PUBSUB_EMULATOR_HOST", "")
 
+	// OTEL_EXPORTER_OTLP_ENDPOINT is the name the OpenTelemetry SDKs already
+	// use, so it is honoured rather than duplicated under a Fluxgate-specific
+	// name that could disagree with it.
+	otlpEndpoint := l.str("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+
 	cfg := Config{
 		Service:     l.str("SERVICE_NAME", service),
 		Environment: env,
@@ -406,6 +434,17 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			StreamHeartbeat:    l.duration("QUERY_STREAM_HEARTBEAT", 20*time.Second),
 			StreamMaxDuration:  l.duration("QUERY_STREAM_MAX_DURATION", 30*time.Minute),
 		},
+		Telemetry: TelemetryConfig{
+			TracingEnabled: l.boolean("TRACING_ENABLED", otlpEndpoint != ""),
+			OTLPEndpoint:   otlpEndpoint,
+			OTLPInsecure:   l.boolean("OTEL_EXPORTER_OTLP_INSECURE", true),
+			// Sampling everything is affordable while developing and ruinous
+			// at ingest volumes, so the default follows the tier.
+			TraceSampleRatio:   l.float("TRACE_SAMPLE_RATIO", defaultSampleRatio(env)),
+			TraceExportTimeout: l.duration("TRACE_EXPORT_TIMEOUT", 10*time.Second),
+			MetricsEnabled:     l.boolean("METRICS_ENABLED", true),
+			MetricsPath:        l.str("METRICS_PATH", "/metrics"),
+		},
 	}
 
 	// Cloud Run and several other managed platforms inject the listener port
@@ -460,6 +499,31 @@ func (c Config) validate(l *loader) {
 	c.validateDatabase(l)
 	c.validateAggregator(l)
 	c.validateQuery(l)
+	c.validateTelemetry(l)
+}
+
+// defaultSampleRatio trades completeness for cost by tier.
+func defaultSampleRatio(env Environment) float64 {
+	if env.IsProduction() {
+		return 0.05
+	}
+	return 1
+}
+
+func (c Config) validateTelemetry(l *loader) {
+	if c.Telemetry.TraceSampleRatio < 0 || c.Telemetry.TraceSampleRatio > 1 {
+		l.reject("TRACE_SAMPLE_RATIO", "must be between 0 and 1")
+	}
+	if c.Telemetry.TracingEnabled && c.Telemetry.OTLPEndpoint == "" {
+		l.reject("OTEL_EXPORTER_OTLP_ENDPOINT",
+			"is required when TRACING_ENABLED is true")
+	}
+	// Transport security is not optional against a collector reached over a
+	// public network; requiring it explicitly means the insecure case is a
+	// deliberate choice rather than an inherited default.
+	if c.Telemetry.MetricsEnabled && c.Telemetry.MetricsPath == "" {
+		l.reject("METRICS_PATH", "must not be empty when METRICS_ENABLED is true")
+	}
 }
 
 func (c Config) validateQuery(l *loader) {

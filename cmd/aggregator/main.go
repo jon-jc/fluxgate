@@ -71,6 +71,22 @@ func run() error {
 		context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	metrics := observability.NewMetrics(cfg.Service)
+
+	tracing, err := observability.InitTracing(ctx, cfg, observability.TracingConfig{
+		Enabled:       cfg.Telemetry.TracingEnabled,
+		Endpoint:      cfg.Telemetry.OTLPEndpoint,
+		Insecure:      cfg.Telemetry.OTLPInsecure,
+		SampleRatio:   cfg.Telemetry.TraceSampleRatio,
+		ExportTimeout: cfg.Telemetry.TraceExportTimeout,
+	}, logger)
+	if err != nil {
+		return err
+	}
+	// Flushed last, so the spans describing the shutdown itself are exported
+	// rather than discarded with the process.
+	defer tracing.Shutdown(ctx)
+
 	health := observability.NewHealth(5 * time.Second)
 
 	db, err := store.Open(ctx, store.Config{
@@ -128,6 +144,7 @@ func run() error {
 		Engine:        engine,
 		Store:         db,
 		FlushInterval: cfg.Aggregator.FlushInterval,
+		Metrics:       metrics,
 		Logger:        logger,
 	})
 	if err != nil {
@@ -145,6 +162,7 @@ func run() error {
 		MaxExtension: maxExtensionFor(cfg),
 		// The runner settles messages itself, once their windows are durable.
 		ManualAck: true,
+		Metrics:   metrics,
 		Logger:    logger,
 	})
 	if err != nil {
@@ -156,7 +174,7 @@ func run() error {
 	probes := httpx.NewServer(httpx.ServerOptions{
 		HTTP:     cfg.HTTP,
 		Shutdown: cfg.Shutdown,
-		Handler:  probeRouter(logger, health),
+		Handler:  probeRouter(cfg, logger, health, metrics),
 		Logger:   logger,
 		OnDrain:  func() { health.SetReady(false) },
 	})
@@ -168,7 +186,9 @@ func run() error {
 		named{"flusher", runner.Run},
 		named{"probes", probes.Run},
 		named{"retention", func(ctx context.Context) error { return prune(ctx, db, cfg, logger) }},
-		named{"reporter", func(ctx context.Context) error { return report(ctx, engine, runner, logger) }},
+		named{"reporter", func(ctx context.Context) error {
+			return report(ctx, engine, runner, metrics, logger)
+		}},
 	)
 }
 
@@ -240,10 +260,20 @@ func maxExtensionFor(cfg config.Config) time.Duration {
 }
 
 // probeRouter serves liveness and readiness for an orchestrator.
-func probeRouter(logger *slog.Logger, health *observability.Health) http.Handler {
+func probeRouter(
+	cfg config.Config, logger *slog.Logger,
+	health *observability.Health, metrics *observability.Metrics,
+) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /healthz", health.LivenessHandler())
 	mux.Handle("GET /readyz", health.ReadinessHandler())
+
+	// The aggregator serves no API, but it still has to be scrapeable: its
+	// watermark lag and series count are the numbers that say whether the
+	// pipeline is keeping up.
+	if metrics != nil && cfg.Telemetry.MetricsEnabled && cfg.Telemetry.MetricsPath != "" {
+		mux.Handle("GET "+cfg.Telemetry.MetricsPath, metrics.Handler())
+	}
 
 	stack := httpx.Chain(
 		httpx.RequestID,
@@ -296,7 +326,8 @@ func prune(ctx context.Context, db *store.DB, cfg config.Config, logger *slog.Lo
 // report logs a periodic summary, so an operator can see watermark progress
 // and memory pressure without attaching a debugger.
 func report(
-	ctx context.Context, engine *aggregate.Engine, runner *aggregator.Runner, logger *slog.Logger,
+	ctx context.Context, engine *aggregate.Engine, runner *aggregator.Runner,
+	metrics *observability.Metrics, logger *slog.Logger,
 ) error {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
@@ -308,6 +339,13 @@ func report(
 		case <-ticker.C:
 			engineStats := engine.Stats()
 			runnerStats := runner.Stats()
+
+			// Watermark lag is the single most useful pipeline gauge: a
+			// steadily rising value means the aggregator is falling behind,
+			// long before any queue depth alarm would notice.
+			watermarkLag := time.Since(time.Unix(engineStats.WatermarkUnixSec, 0))
+			metrics.SetAggregationState(
+				engineStats.OpenWindows, engineStats.TrackedSeries, watermarkLag)
 
 			logger.Info("aggregator status",
 				slog.Int("open_windows", engineStats.OpenWindows),

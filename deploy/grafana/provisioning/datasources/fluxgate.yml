@@ -1,0 +1,24 @@
+# Datasources are provisioned rather than clicked in, so the stack is the same
+# for everyone who runs it and survives `make down`.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: fluxgate-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 5s
+      # Links a metric straight to the traces behind it, which is the join
+      # that turns "latency rose" into "here is the request that was slow".
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: fluxgate-jaeger
+
+  - name: Jaeger
+    type: jaeger
+    uid: fluxgate-jaeger
+    access: proxy
+    url: http://jaeger:16686

@@ -45,6 +45,9 @@ type Options struct {
 	// data has arrived. Without it, a producer that goes quiet would leave its
 	// last window unwritten and its messages unacknowledged indefinitely.
 	FlushInterval time.Duration
+	// Metrics records flush outcomes. Optional; a nil value disables
+	// instrumentation rather than panicking.
+	Metrics *observability.Metrics
 	// Logger receives lifecycle events.
 	Logger *slog.Logger
 }
@@ -68,6 +71,7 @@ type Runner struct {
 	engine        *aggregate.Engine
 	store         Store
 	flushInterval time.Duration
+	metrics       *observability.Metrics
 	log           *slog.Logger
 
 	mu sync.Mutex
@@ -125,6 +129,7 @@ func New(opts Options) (*Runner, error) {
 		engine:        opts.Engine,
 		store:         opts.Store,
 		flushInterval: opts.FlushInterval,
+		metrics:       opts.Metrics,
 		log:           opts.Logger,
 		inflight:      make(map[int64][]*pendingMessage),
 		contributions: make(map[int64]map[string]store.Contribution),
@@ -359,6 +364,8 @@ func (r *Runner) flush(ctx context.Context, all bool) error {
 	// Whatever happens next, these contributions stop being in-flight.
 	defer r.releaseFlushing(contributions)
 
+	started := time.Now()
+
 	if err := r.store.Flush(ctx, rollups, contributions); err != nil {
 		// The engine has already handed over these rollups, so this data now
 		// exists nowhere else. Handing the messages back is what recovers it:
@@ -376,6 +383,7 @@ func (r *Runner) flush(ctx context.Context, all bool) error {
 	// The engine is only told now: before the write is confirmed, a point for
 	// one of these windows is not late, it is the raw material for the retry.
 	r.engine.MarkFlushed(windows)
+	r.metrics.ObserveFlush(len(windows), len(rollups), time.Since(started))
 	r.ackAll(messages)
 
 	r.mu.Lock()
