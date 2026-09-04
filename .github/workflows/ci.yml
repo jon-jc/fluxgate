@@ -162,6 +162,48 @@ jobs:
         if: failure()
         run: docker logs pubsub
 
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9"
+          # The wrapper rewrites stdout, which makes a failure harder to read
+          # than the raw output.
+          terraform_wrapper: false
+
+      - name: Format
+        working-directory: deploy/terraform
+        run: terraform fmt -check -recursive -diff
+
+      # No backend: validation needs the provider schemas, not remote state,
+      # and CI has no business touching a real state file.
+      - name: Validate
+        working-directory: deploy/terraform
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
+      # A variable with no description is a variable somebody will guess at.
+      - name: Every variable is documented
+        working-directory: deploy/terraform
+        run: |
+          undocumented=$(awk '
+            /^variable "/ { name = $2; documented = 0 }
+            /^  description/ { documented = 1 }
+            /^}/ { if (name != "" && !documented) print name; name = "" }
+          ' variables.tf)
+
+          if [ -n "$undocumented" ]; then
+            echo "::error::these variables have no description:"
+            echo "$undocumented"
+            exit 1
+          fi
+          echo "every variable is documented"
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

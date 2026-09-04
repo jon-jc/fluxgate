@@ -92,6 +92,19 @@ test-integration: deps ## Run the tests that need a real broker and database
 psql: ## Open a shell on the local database
 	docker exec -it fluxgate-postgres psql -U fluxgate -d fluxgate
 
+.PHONY: load
+load: ## Drive synthetic telemetry at a running stack
+	$(GO) run ./cmd/loadgen -duration 30s -workers 8 -batch 200 -rate 45
+
+.PHONY: tf-check
+tf-check: ## Format and validate the Terraform
+	docker run --rm -v "$(PWD)/deploy/terraform:/tf" -w /tf \
+		hashicorp/terraform:1.9 fmt -check -diff
+	docker run --rm -v "$(PWD)/deploy/terraform:/tf" -w /tf \
+		hashicorp/terraform:1.9 init -backend=false -input=false
+	docker run --rm -v "$(PWD)/deploy/terraform:/tf" -w /tf \
+		hashicorp/terraform:1.9 validate
+
 .PHONY: bench
 bench: ## Run benchmarks
 	$(GO) test -run '^$$' -bench . -benchmem ./...

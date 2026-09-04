@@ -32,10 +32,57 @@ flowchart LR
 | 3 | Pub/Sub layer: batched publisher, subscriber runtime, retries, DLQ, emulator harness | Merged |
 | 4 | Aggregator: windowing, watermarks, duplicate suppression, Postgres rollups | Merged |
 | 5 | Query API: time-series queries, label filtering, percentiles, SSE live tail | Merged |
-| 6 | Observability: distributed tracing across the broker, Prometheus metrics, dashboards | In review |
-| 7 | Deployment: Terraform for Pub/Sub and Cloud Run, runbooks, architecture decision records | Planned |
+| 6 | Observability: distributed tracing across the broker, Prometheus metrics, dashboards | Merged |
+| 7 | Deployment: Terraform for GCP, least-privilege IAM, alert policies, decision records | In review |
 
 Each milestone lands as its own reviewed pull request.
+
+## Deploying
+
+[`deploy/terraform`](deploy/terraform) provisions the whole platform on GCP:
+Pub/Sub topology with dead-lettering, Cloud SQL on a private IP, three Cloud Run
+services, one service account per service, secrets in Secret Manager, and four
+alert policies. See [its README](deploy/terraform/README.md) for the apply, and
+for the parts that bite.
+
+Three decisions in there are worth calling out, because each is a mistake that
+produces no error message:
+
+**Dead lettering silently does nothing without two IAM bindings.** Pub/Sub's own
+service agent performs the dead-letter publish — not the consumer — so it needs
+publish rights on the dead-letter topic and subscribe rights on the source
+subscription. Without them there is no failure at apply time and none at run
+time: messages simply keep being redelivered forever.
+
+**The aggregator is not autoscaled.** Each instance holds open windows in memory
+and writes them only when they close, so scaling in mid-window hands the
+survivors a redelivery of everything the departing instance had not yet flushed.
+Correct, thanks to the delivery ledger, and pure rework.
+
+**CPU stays allocated on the aggregator and the query API.** Both work between
+requests — flushing on a timer, polling for a live tail. With Cloud Run's idle
+CPU throttling the flush timer would be throttled to a stop, and windows would
+only be written when a message happened to arrive.
+
+Permissions are split by what each service actually does. The ingest API holds
+no database credentials at all; the query API holds no Pub/Sub permissions. A
+compromise of one does not reach what the other can touch, and that is enforced
+by IAM rather than by discipline.
+
+## Decision records
+
+The choices that were genuinely contested, each with what it cost and what would
+make us revisit it — [`docs/adr`](docs/adr):
+
+| # | Decision |
+| --- | --- |
+| [1](docs/adr/0001-event-driven-pipeline.md) | Asynchronous pipeline rather than synchronous writes |
+| [2](docs/adr/0002-exactly-once-accumulation.md) | Exactly-once accumulation via a per-window delivery ledger |
+| [3](docs/adr/0003-json-envelope.md) | Versioned JSON on the wire rather than protobuf |
+| [4](docs/adr/0004-fixed-histogram-layout.md) | Fixed-layout histograms rather than adaptive sketches |
+| [5](docs/adr/0005-postgres-not-a-tsdb.md) | Postgres rather than a purpose-built time-series database |
+| [6](docs/adr/0006-separate-read-and-write-services.md) | Separate read and write services |
+| [7](docs/adr/0007-deferred-alerting.md) | Alerting deferred, and why |
 
 ## Observability
 
@@ -466,6 +513,37 @@ shedding requests:
 
 Skipping step 2 is the usual cause of a handful of 502s on every deploy.
 
+### Under load
+
+`make load` drives synthetic telemetry at a running stack. On a laptop, against
+the full compose stack — every service, the emulator and Postgres sharing one
+machine with the load generator:
+
+```
+  batches         897 (45/s)
+  points          179400 (8970/s)
+  status
+    202           897
+  latency (client-side, includes the broker acknowledgement)
+    p50           55.5ms
+    p90           57.9ms
+    p99           60.7ms
+```
+
+Those 179,400 points became **240 rollup rows** — four metrics across ten hosts
+over the run's windows — and the percentiles were queryable per series
+immediately afterwards. Watermark lag held at 4.2s against a 10s window.
+
+The latency is dominated by the broker acknowledgement, which is the honest
+cost of a 202 that means *durable* rather than *buffered*. See
+[ADR 1](docs/adr/0001-event-driven-pipeline.md) for why that trade is made
+deliberately.
+
+Removing the `-rate` cap is also worth doing once: the run saturates, and 2163
+of 3261 batches come back 429 with `Retry-After`. That is the rate limiter
+working — quota is metered in points per second, so a bigger batch consumes
+proportionally more of it.
+
 ## Quick start
 
 The full stack -- Pub/Sub emulator and the ingest API -- comes up with one
@@ -561,6 +639,8 @@ make psql              # a shell on the local database
 make cover             # coverage profile and per-package summary
 make lint              # golangci-lint
 make vulncheck         # known vulnerabilities in dependencies
+make load              # drive synthetic telemetry at a running stack
+make tf-check          # format and validate the Terraform
 make ci                # what the pipeline enforces
 ```
 
@@ -634,6 +714,7 @@ api/openapi.yaml        the public API contract
 cmd/ingest-api/         the edge: validates and publishes
 cmd/aggregator/         the consumer: windows, aggregates and persists
 cmd/query-api/          the read path: queries and the live tail
+cmd/loadgen/            synthetic load, for seeing what the pipeline does
 internal/aggregate/     windowing, watermarks, accumulators, histograms
 internal/aggregator/    delivery, flushing and acknowledgement lifecycle
 internal/api/           route table and request handlers
@@ -653,6 +734,8 @@ internal/version/       build provenance
 build/docker/           multi-stage Dockerfile shared by every service
 deploy/                 docker-compose stack, Prometheus scrape config,
                         provisioned Grafana dashboards
+deploy/terraform/       GCP infrastructure
+docs/adr/               architecture decision records
 ```
 
 ## License

@@ -1,0 +1,29 @@
+# Copy to prod.tfvars and fill in.
+
+project_id  = "your-gcp-project"
+region      = "us-central1"
+environment = "prod"
+
+image_tag = "a1b2c3d4"
+
+# Warm instances on the write path: a cold start means a client's batch waits
+# on an image pull, and late telemetry is worth much less than prompt telemetry.
+ingest_min_instances = 2
+ingest_max_instances = 50
+
+# Fixed. Scaling in mid-window hands the survivors a redelivery of everything
+# the departing instance had not yet flushed.
+aggregator_instances = 3
+
+query_min_instances = 1
+query_max_instances = 20
+
+database_tier              = "db-custom-4-15360"
+database_disk_gb           = 200
+database_availability_type = "REGIONAL"
+
+# Create the channels first, then reference them here:
+#   gcloud alpha monitoring channels list --format='value(name)'
+alert_notification_channels = [
+  # "projects/your-gcp-project/notificationChannels/1234567890",
+]

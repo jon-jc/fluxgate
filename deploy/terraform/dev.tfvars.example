@@ -1,0 +1,23 @@
+# Copy to dev.tfvars and fill in. Never commit the real file: tfvars land in
+# shell history and editor backups, and this one names your project.
+
+project_id  = "your-gcp-project"
+region      = "us-central1"
+environment = "dev"
+
+# An immutable tag, normally the commit SHA that CI built.
+image_tag = "a1b2c3d4"
+
+# Small and cheap. Production overrides all of these.
+ingest_min_instances = 0
+ingest_max_instances = 3
+aggregator_instances = 1
+query_max_instances  = 2
+
+database_tier              = "db-f1-micro"
+database_disk_gb           = 10
+database_availability_type = "ZONAL"
+
+# Empty means the alert policies exist but notify nobody, which is right until
+# there is somebody to notify.
+alert_notification_channels = []
