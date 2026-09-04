@@ -43,3 +43,8 @@ Thumbs.db
 # Local tooling caches
 /.cache/
 /tmp/
+
+# Terraform provider cache and lock file. The lock is intentionally excluded
+# here because CI runs `init -backend=false` fresh; a committed lock would be
+# the better choice for a team applying to shared infrastructure.
+deploy/terraform/.terraform/
