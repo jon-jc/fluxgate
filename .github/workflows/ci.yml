@@ -79,8 +79,26 @@ jobs:
           retention-days: 7
 
   integration:
-    name: Integration (Pub/Sub emulator)
+    name: Integration (Pub/Sub + Postgres)
     runs-on: ubuntu-latest
+
+    # Postgres runs as a service container: unlike the emulator it needs no
+    # command override, so the built-in health gating applies.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: fluxgate
+          POSTGRES_PASSWORD: fluxgate
+          POSTGRES_DB: fluxgate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fluxgate -d fluxgate"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v5
 
@@ -115,11 +133,15 @@ jobs:
           done
 
       # The race detector matters most here: the subscriber dispatches messages
-      # concurrently, which is where a data race would actually live.
+      # concurrently and the aggregator settles messages from a different
+      # goroutine than the one that accepted them, which is where a data race
+      # would actually live.
       - name: Integration tests
         env:
           PUBSUB_EMULATOR_HOST: localhost:8681
-        run: go test -race -count=1 -timeout 10m ./internal/pubsubx/...
+          TEST_DATABASE_URL: postgres://fluxgate:fluxgate@localhost:5432/fluxgate?sslmode=disable
+        run: |
+          go test -race -count=1 -timeout 15m             ./internal/pubsubx/... ./internal/store/... ./internal/aggregator/...
 
       # A skip here would mean the integration tests silently stopped running,
       # which is worse than them failing: the suite would go green while
@@ -127,15 +149,16 @@ jobs:
       - name: Assert the tests actually ran
         env:
           PUBSUB_EMULATOR_HOST: localhost:8681
+          TEST_DATABASE_URL: postgres://fluxgate:fluxgate@localhost:5432/fluxgate?sslmode=disable
         run: |
-          output=$(go test -count=1 -v -run TestPublishAndReceive ./internal/pubsubx/...)
+          output=$(go test -count=1 -v             -run 'TestPublishAndReceive|TestFlushAndQuery'             ./internal/pubsubx/... ./internal/store/...)
           echo "$output"
           if echo "$output" | grep -q "SKIP"; then
-            echo "::error::integration tests were skipped; the emulator was not detected"
+            echo "::error::integration tests were skipped; a dependency was not detected"
             exit 1
           fi
 
-      - name: Emulator logs on failure
+      - name: Dependency logs on failure
         if: failure()
         run: docker logs pubsub
 
@@ -189,6 +212,19 @@ jobs:
           push: false
           load: true
           tags: fluxgate/ingest-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build aggregator image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/docker/Dockerfile
+          build-args: |
+            SERVICE=aggregator
+          push: false
+          load: true
+          tags: fluxgate/aggregator:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -318,4 +354,6 @@ jobs:
         if: failure()
         run: |
           docker logs fluxgate 2>&1 || true
+          docker logs aggregator 2>&1 || true
           docker logs pubsub 2>&1 || true
+          docker logs postgres 2>&1 || true

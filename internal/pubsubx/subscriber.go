@@ -28,11 +28,31 @@ type Delivery struct {
 	// MessageID is the broker's identifier, for correlating with Pub/Sub's own
 	// metrics and logs.
 	MessageID string
+
+	// msg is retained so a handler running in manual-acknowledgement mode can
+	// settle the message later, once the work it triggered is durable.
+	msg *pubsub.Message
 }
 
 // RequestID returns the correlation ID propagated from the HTTP edge, so a
 // trace can continue across the queue.
 func (d Delivery) RequestID() string { return d.Attributes[AttrRequestID] }
+
+// Ack marks the message as processed. It is only meaningful in
+// manual-acknowledgement mode; the second and subsequent calls are ignored by
+// the client.
+func (d Delivery) Ack() {
+	if d.msg != nil {
+		d.msg.Ack()
+	}
+}
+
+// Nack returns the message for redelivery.
+func (d Delivery) Nack() {
+	if d.msg != nil {
+		d.msg.Nack()
+	}
+}
 
 // Handler processes one delivery.
 //
@@ -56,8 +76,20 @@ type SubscriberOptions struct {
 	// deadline before giving up and letting it be redelivered.
 	MaxExtension time.Duration
 	// HandlerTimeout bounds a single handler invocation. A handler that hangs
-	// would otherwise occupy an outstanding-message slot indefinitely.
+	// would otherwise occupy an outstanding-message slot indefinitely. It is
+	// ignored in manual-acknowledgement mode, where the handler deliberately
+	// outlives its own invocation.
 	HandlerTimeout time.Duration
+	// ManualAck hands settlement to the handler.
+	//
+	// The default -- acknowledge when the handler returns -- means a message is
+	// considered processed as soon as it has been accepted into memory. For a
+	// windowed aggregator that is a data-loss bug: a crash between accepting a
+	// point and flushing its window discards the point, and the broker will
+	// never redeliver it. Deferring the acknowledgement until the work is
+	// durable closes that gap, at the cost of holding the message's lease for
+	// longer -- which is what MaxExtension is for.
+	ManualAck bool
 	// Logger receives lifecycle events.
 	Logger *slog.Logger
 }
@@ -85,11 +117,12 @@ func (o *SubscriberOptions) applyDefaults() {
 
 // Subscriber pulls messages from a subscription and runs a Handler for each.
 type Subscriber struct {
-	sub     *pubsub.Subscriber
-	name    string
-	handler Handler
-	timeout time.Duration
-	log     *slog.Logger
+	sub       *pubsub.Subscriber
+	name      string
+	handler   Handler
+	timeout   time.Duration
+	manualAck bool
+	log       *slog.Logger
 }
 
 // NewSubscriber builds a Subscriber over an existing client.
@@ -113,11 +146,12 @@ func NewSubscriber(client *pubsub.Client, handler Handler, opts SubscriberOption
 	}
 
 	return &Subscriber{
-		sub:     sub,
-		name:    opts.Subscription,
-		handler: handler,
-		timeout: opts.HandlerTimeout,
-		log:     opts.Logger,
+		sub:       sub,
+		name:      opts.Subscription,
+		handler:   handler,
+		timeout:   opts.HandlerTimeout,
+		manualAck: opts.ManualAck,
+		log:       opts.Logger,
 	}, nil
 }
 
@@ -176,10 +210,18 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 		PublishTime:     msg.PublishTime,
 		DeliveryAttempt: deliveryAttempt(msg),
 		MessageID:       msg.ID,
+		msg:             msg,
 	}
 
-	handlerCtx, cancel := context.WithTimeout(ctx, s.timeout)
-	defer cancel()
+	handlerCtx := ctx
+	if !s.manualAck {
+		// A handler that settles its own message deliberately outlives this
+		// call, so bounding the invocation would cancel work that is still
+		// legitimately in flight.
+		var cancel context.CancelFunc
+		handlerCtx, cancel = context.WithTimeout(ctx, s.timeout)
+		defer cancel()
+	}
 
 	if err := s.invoke(handlerCtx, delivery); err != nil {
 		if IsPermanent(err) {
@@ -188,7 +230,9 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 		}
 
 		// Transient: nack so the message comes back promptly rather than
-		// waiting out its ack deadline.
+		// waiting out its ack deadline. This happens even in manual mode: a
+		// handler that returns an error has declined responsibility for the
+		// message.
 		log.Warn("handler failed; message will be redelivered",
 			slog.Any("error", err),
 			slog.Int("delivery_attempt", delivery.DeliveryAttempt))
@@ -196,7 +240,11 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 		return
 	}
 
-	msg.Ack()
+	// In manual mode the handler has taken ownership and will settle the
+	// message once the work it triggered is durable.
+	if !s.manualAck {
+		msg.Ack()
+	}
 }
 
 // invoke runs the handler, converting a panic into a permanent failure.

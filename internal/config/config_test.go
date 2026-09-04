@@ -16,7 +16,7 @@ func env(kv map[string]string) lookupFunc {
 }
 
 func TestLoadDefaults(t *testing.T) {
-	cfg, err := load(env(nil))
+	cfg, err := load(env(nil), "fluxgate-ingest-api", Requirements{})
 	if err != nil {
 		t.Fatalf("load with empty environment: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestLoadOverrides(t *testing.T) {
 		"LOG_LEVEL":                "DEBUG",
 		"LOG_FORMAT":               "TEXT",
 		"SHUTDOWN_DRAIN_TIMEOUT":   "45s",
-	}))
+	}), "fluxgate-ingest-api", Requirements{Auth: true})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestLoadPortOverridesAddr(t *testing.T) {
 	cfg, err := load(env(map[string]string{
 		"HTTP_ADDR": ":8080",
 		"PORT":      "8081",
-	}))
+	}), "fluxgate-ingest-api", Requirements{})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestLoadPortOverridesAddr(t *testing.T) {
 func TestLoadBlankValueFallsBackToDefault(t *testing.T) {
 	// An unset variable and one exported as the empty string are the same
 	// thing in practice; both must yield the default.
-	cfg, err := load(env(map[string]string{"HTTP_ADDR": "   "}))
+	cfg, err := load(env(map[string]string{"HTTP_ADDR": "   "}), "fluxgate-ingest-api", Requirements{})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestLoadReportsEveryProblemAtOnce(t *testing.T) {
 		"LOG_LEVEL":              "loud",
 		"HTTP_READ_TIMEOUT":      "soon",
 		"HTTP_MAX_REQUEST_BYTES": "-1",
-	}))
+	}), "fluxgate-ingest-api", Requirements{})
 	if err == nil {
 		t.Fatal("load: expected an error, got nil")
 	}
@@ -148,7 +148,7 @@ func TestLoadRejectsHandlerTimeoutAtOrAboveWriteTimeout(t *testing.T) {
 			_, err := load(env(map[string]string{
 				"HTTP_HANDLER_TIMEOUT": tc.handler,
 				"HTTP_WRITE_TIMEOUT":   tc.write,
-			}))
+			}), "fluxgate-ingest-api", Requirements{})
 			if err == nil {
 				t.Fatal("expected an error, got nil")
 			}
@@ -214,7 +214,7 @@ func TestEnvironmentIsProduction(t *testing.T) {
 // TestAuthDefaultsOffOnlyLocally keeps a fresh clone runnable with no setup,
 // without letting that convenience follow the code to a deployed tier.
 func TestAuthDefaultsOffOnlyLocally(t *testing.T) {
-	local, err := load(env(map[string]string{"ENVIRONMENT": "local"}))
+	local, err := load(env(map[string]string{"ENVIRONMENT": "local"}), "fluxgate-ingest-api", Requirements{Auth: true})
 	if err != nil {
 		t.Fatalf("local: %v", err)
 	}
@@ -224,7 +224,7 @@ func TestAuthDefaultsOffOnlyLocally(t *testing.T) {
 
 	// Every other tier defaults to requiring credentials, so omitting them is
 	// a boot failure rather than a silently open endpoint.
-	if _, err := load(env(map[string]string{"ENVIRONMENT": "dev"})); err == nil {
+	if _, err := load(env(map[string]string{"ENVIRONMENT": "dev"}), "fluxgate-ingest-api", Requirements{Auth: true}); err == nil {
 		t.Error("dev tier booted with no API keys and no explicit AUTH_DISABLED")
 	}
 }
@@ -238,7 +238,7 @@ func TestAuthCannotBeDisabledInProduction(t *testing.T) {
 			_, err := load(env(map[string]string{
 				"ENVIRONMENT":   tier,
 				"AUTH_DISABLED": "true",
-			}))
+			}), "fluxgate-ingest-api", Requirements{Auth: true})
 			if err == nil {
 				t.Fatalf("AUTH_DISABLED=true was accepted on the %s tier", tier)
 			}
@@ -250,7 +250,7 @@ func TestAuthCannotBeDisabledInProduction(t *testing.T) {
 }
 
 func TestAuthRequiresAKeySourceWhenEnabled(t *testing.T) {
-	_, err := load(env(map[string]string{"ENVIRONMENT": "prod"}))
+	_, err := load(env(map[string]string{"ENVIRONMENT": "prod"}), "fluxgate-ingest-api", Requirements{Auth: true})
 	if err == nil {
 		t.Fatal("expected an error when authentication is on but no keys are configured")
 	}
@@ -265,7 +265,7 @@ func TestAuthRequiresAKeySourceWhenEnabled(t *testing.T) {
 				"ENVIRONMENT":    "prod",
 				"GCP_PROJECT_ID": "fluxgate-test",
 				source:           "value",
-			})); err != nil {
+			}), "fluxgate-ingest-api", Requirements{Auth: true}); err != nil {
 				t.Errorf("load with %s set: %v", source, err)
 			}
 		})
@@ -278,7 +278,7 @@ func TestBurstMustAdmitAFullBatch(t *testing.T) {
 	_, err := load(env(map[string]string{
 		"INGEST_MAX_POINTS_PER_BATCH": "1000",
 		"RATE_LIMIT_BURST":            "500",
-	}))
+	}), "fluxgate-ingest-api", Requirements{})
 	if err == nil {
 		t.Fatal("a burst smaller than one batch was accepted")
 	}
@@ -288,7 +288,7 @@ func TestBurstMustAdmitAFullBatch(t *testing.T) {
 }
 
 func TestIngestDefaults(t *testing.T) {
-	cfg, err := load(env(nil))
+	cfg, err := load(env(nil), "fluxgate-ingest-api", Requirements{})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -311,7 +311,7 @@ func TestLoaderNumericParsing(t *testing.T) {
 	_, err := load(env(map[string]string{
 		"INGEST_MAX_POINTS_PER_BATCH":  "lots",
 		"RATE_LIMIT_POINTS_PER_SECOND": "fast",
-	}))
+	}), "fluxgate-ingest-api", Requirements{})
 	if err == nil {
 		t.Fatal("expected an error for unparseable numbers")
 	}
@@ -319,5 +319,95 @@ func TestLoaderNumericParsing(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error does not mention %s:\n%v", want, err)
 		}
+	}
+}
+
+// TestAuthIsNotRequiredOfBackgroundServices keeps a consumer from failing to
+// boot over a setting it never reads: the aggregator has no callers to
+// authenticate.
+func TestAuthIsNotRequiredOfBackgroundServices(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		"ENVIRONMENT":    "prod",
+		"GCP_PROJECT_ID": "fluxgate",
+		"DATABASE_URL":   "postgres://localhost/fluxgate",
+	}), "fluxgate-aggregator", Requirements{Database: true})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Service != "fluxgate-aggregator" {
+		t.Errorf("Service = %q, want the name the binary supplied", cfg.Service)
+	}
+}
+
+func TestDatabaseIsRequiredWhenDeclared(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"ENVIRONMENT":    "prod",
+		"GCP_PROJECT_ID": "fluxgate",
+	}), "fluxgate-aggregator", Requirements{Database: true})
+	if err == nil {
+		t.Fatal("load succeeded with no DATABASE_URL for a service that needs one")
+	}
+	if !strings.Contains(err.Error(), "DATABASE_URL") {
+		t.Errorf("error does not mention DATABASE_URL:\n%v", err)
+	}
+
+	// A service that does not declare it must not be held to it.
+	if _, err := load(env(map[string]string{
+		"ENVIRONMENT":    "prod",
+		"GCP_PROJECT_ID": "fluxgate",
+		"API_KEYS":       "[]",
+	}), "fluxgate-ingest-api", Requirements{Auth: true}); err != nil {
+		t.Errorf("a service without a database requirement was rejected: %v", err)
+	}
+}
+
+// TestFlushIntervalMustNotExceedTheWindow: a longer interval means every rollup
+// is stale by the difference before anyone can read it.
+func TestFlushIntervalMustNotExceedTheWindow(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"DATABASE_URL":              "postgres://localhost/fluxgate",
+		"AGGREGATOR_WINDOW_SIZE":    "1m",
+		"AGGREGATOR_FLUSH_INTERVAL": "5m",
+	}), "fluxgate-aggregator", Requirements{Database: true})
+	if err == nil {
+		t.Fatal("a flush interval longer than the window was accepted")
+	}
+	if !strings.Contains(err.Error(), "AGGREGATOR_FLUSH_INTERVAL") {
+		t.Errorf("error does not mention AGGREGATOR_FLUSH_INTERVAL:\n%v", err)
+	}
+}
+
+// TestLedgerRetentionMustOutliveTheWindow: pruning the delivery ledger sooner
+// would let a redelivered batch be counted a second time.
+func TestLedgerRetentionMustOutliveTheWindow(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"DATABASE_URL":           "postgres://localhost/fluxgate",
+		"AGGREGATOR_WINDOW_SIZE": "10m",
+		"LEDGER_RETENTION":       "1m",
+	}), "fluxgate-aggregator", Requirements{Database: true})
+	if err == nil {
+		t.Fatal("a ledger retention shorter than the window was accepted")
+	}
+	if !strings.Contains(err.Error(), "LEDGER_RETENTION") {
+		t.Errorf("error does not mention LEDGER_RETENTION:\n%v", err)
+	}
+}
+
+func TestAggregatorDefaults(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		"DATABASE_URL": "postgres://localhost/fluxgate",
+	}), "fluxgate-aggregator", Requirements{Database: true})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if cfg.Aggregator.WindowSize != time.Minute {
+		t.Errorf("WindowSize = %v, want 1m", cfg.Aggregator.WindowSize)
+	}
+	if cfg.Aggregator.AllowedLateness != 30*time.Second {
+		t.Errorf("AllowedLateness = %v, want 30s", cfg.Aggregator.AllowedLateness)
+	}
+	if !cfg.Database.Migrate {
+		t.Error("Migrate defaults to false; a fresh database would never get a schema")
 	}
 }

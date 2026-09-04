@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	cloud.google.com/go/pubsub/v2 v2.7.0
+	github.com/jackc/pgx/v5 v5.10.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
@@ -23,6 +24,9 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.17 // indirect
 	github.com/googleapis/gax-go/v2 v2.23.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.67.0 // indirect
@@ -35,7 +39,7 @@ require (
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
+	golang.org/x/text v0.39.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto v0.0.0-20260319201613-d00831a3d3e7 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260630182238-925bb5da69e7 // indirect

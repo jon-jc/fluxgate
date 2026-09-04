@@ -64,20 +64,29 @@ up: ## Start the local stack (Pub/Sub emulator + ingest API)
 	docker compose -f deploy/docker-compose.yml up -d --build
 	@echo ""
 	@echo "  ingest API:  http://localhost:8080"
+	@echo "  aggregator:  http://localhost:8081  (probes only)"
 	@echo "  emulator:    localhost:8681"
+	@echo "  postgres:    localhost:5442  (fluxgate/fluxgate)"
 	@echo "  API key:     fxg_local_local-dev-secret"
 
 .PHONY: down
 down: ## Stop the local stack and discard its state
 	docker compose -f deploy/docker-compose.yml down -v
 
-.PHONY: emulator
-emulator: ## Start only the Pub/Sub emulator, for running tests against
-	docker compose -f deploy/docker-compose.yml up -d pubsub
+.PHONY: deps
+deps: ## Start only the Pub/Sub emulator and Postgres, for running tests against
+	docker compose -f deploy/docker-compose.yml up -d pubsub postgres
 
 .PHONY: test-integration
-test-integration: emulator ## Run the tests that need a real broker
-	PUBSUB_EMULATOR_HOST=localhost:8681 $(GO) test -count=1 -timeout 10m ./internal/pubsubx/...
+test-integration: deps ## Run the tests that need a real broker and database
+	PUBSUB_EMULATOR_HOST=localhost:8681 \
+	TEST_DATABASE_URL="postgres://fluxgate:fluxgate@localhost:5442/fluxgate?sslmode=disable" \
+	$(GO) test -count=1 -timeout 15m \
+		./internal/pubsubx/... ./internal/store/... ./internal/aggregator/...
+
+.PHONY: psql
+psql: ## Open a shell on the local database
+	docker exec -it fluxgate-postgres psql -U fluxgate -d fluxgate
 
 .PHONY: bench
 bench: ## Run benchmarks

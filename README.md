@@ -37,6 +37,83 @@ flowchart LR
 
 Each milestone lands as its own reviewed pull request.
 
+## The aggregator
+
+The aggregator consumes batches, folds their points into tumbling windows keyed
+by event time, and commits each closed window to Postgres. It is a separate
+binary from the ingest API, because the two scale on different axes: the edge
+scales with request rate, the aggregator with series cardinality.
+
+### Exactly-once, and how it is actually achieved
+
+Pub/Sub delivers at least once. Counting a redelivered batch twice would
+silently corrupt every aggregate it touches, and nothing downstream could
+detect it. Three things together make accumulation exactly-once:
+
+1. **The message is acknowledged only when its data is durable.** Acknowledging
+   on receipt would mean a crash between accepting a point and writing its
+   window loses the point while the broker believes it was delivered. The
+   subscriber runs in manual-acknowledgement mode and the runner settles each
+   message once every window it fed has committed.
+2. **Rollups and a delivery ledger commit in one transaction.** There is no
+   interval where the data is stored but the batch is not recorded, or the
+   reverse.
+3. **The ledger is keyed on (batch, window), not on the batch.** A batch that
+   straddles a boundary feeds two windows that flush at different times. Keyed
+   on the batch alone, one whose first window committed and whose second failed
+   would be recorded as fully processed -- and the retry that should have
+   rebuilt the second window would be skipped, losing it silently.
+
+The two crash windows both come out correct:
+
+| Crash point | Ledger | Acknowledged | On redelivery |
+| --- | --- | --- | --- |
+| Before commit | absent | no | Re-accumulated; correct |
+| After commit, before ack | present | no | Skipped; correct |
+
+Duplicate suppression has an in-memory half and a durable half, and both are
+needed: a redelivery arriving *before* the flush is not in the database yet, and
+one arriving *after a restart* is not in memory. A third state exists for a
+redelivery that lands *during* a write -- the outcome is not knowable yet, so
+the message is handed back rather than guessed at.
+
+### Watermarks and late data
+
+Windows close on event time, not wall-clock time. A watermark trails the highest
+observed timestamp by the lateness allowance, and a window is emitted once the
+watermark passes its end. That is what makes replay meaningful: feeding a day of
+history through the aggregator produces exactly the rollups it produced live,
+because nothing depends on when the process happened to run.
+
+Collecting a window does not close it. The engine hands the rollups over, but
+only marks the window flushed when the caller confirms the write -- because a
+window whose write failed has to be rebuildable from a redelivery, and it cannot
+be if the engine has already decided that anything arriving for it is late.
+
+Event-time watermarks have one structural weakness: they only advance when data
+arrives, so a producer that stops sending strands its final window one
+observation short of closing, permanently. After a configurable silence the
+watermark is allowed to advance on processing time instead, far enough to close
+the oldest open window and no further -- jumping it to the wall clock would slam
+every window shut at once, including ones a resuming producer could still fill.
+
+### What is stored
+
+One row per series per window: count, sum, min, max, last, and for histogram
+series a fixed-layout bucket vector. The upsert merges additively, so a window
+written in two pieces -- by two replicas, or by one across a restart -- totals
+the same as if it had been written once. That is sound only because every
+statistic is associative, which is also why `last` is resolved by event time
+rather than by whichever write arrived second.
+
+Histogram buckets are exponential with a fixed layout, so absolute error grows
+with the value: a 1ms measurement is resolved far more finely than a 10s one,
+which is the right trade when the question is "is p99 2ms or 20ms". The layout
+is fixed rather than adaptive precisely so two accumulators can always be merged
+by adding their bucket counts -- including inside SQL, via a small immutable
+function, which keeps the upsert a single statement instead of a
+read-modify-write race between replicas.
+
 ## The event transport
 
 Accepted batches are published to Pub/Sub and consumed asynchronously. The
@@ -242,11 +319,23 @@ curl -X POST localhost:8080/v1/ingest \
 {"batch_id":"7f0c8e8327d609ba5917480caeea6a7b","accepted":1,"rejected":0}
 ```
 
-Readiness reports the transport too:
+Readiness reports each service's own dependencies:
 
 ```bash
-curl -s localhost:8080/readyz
-# {"status":"ok","checks":{"pubsub-publisher":"ok"}}
+curl -s localhost:8080/readyz   # {"status":"ok","checks":{"pubsub-publisher":"ok"}}
+curl -s localhost:8081/readyz   # {"status":"ok","checks":{"postgres":"ok"}}
+```
+
+Within a few seconds the aggregator closes the window and writes the rollup:
+
+```bash
+make psql
+```
+
+```sql
+SELECT metric, window_start, count, sum, min, max FROM rollups;
+--        metric    |      window_start      | count | sum | min | max
+--   queue.depth    | 2026-09-04 01:05:40+00 |     3 |  42 |   7 |  21
 ```
 
 `make down` discards the stack and its state.
@@ -293,17 +382,23 @@ pivot with.
 ```bash
 make help              # list every target
 make test              # unit tests with the race detector
-make test-integration  # tests that need a real broker (starts the emulator)
+make test-integration  # tests needing a real broker and database
+make psql              # a shell on the local database
 make cover             # coverage profile and per-package summary
 make lint              # golangci-lint
 make vulncheck         # known vulnerabilities in dependencies
 make ci                # what the pipeline enforces
 ```
 
-The Pub/Sub tests skip themselves when `PUBSUB_EMULATOR_HOST` is unset, so
-`go test ./...` stays green without Docker. CI runs them against a real
-emulator under the race detector, and fails the build if they report a skip --
-a suite that silently stops covering anything is worse than one that fails.
+The integration tests skip themselves when `PUBSUB_EMULATOR_HOST` and
+`TEST_DATABASE_URL` are unset, so `go test ./...` stays green without Docker.
+CI runs them against a real emulator and a real Postgres under the race
+detector, and fails the build if they report a skip -- a suite that silently
+stops covering anything is worse than one that fails.
+
+Using a real database rather than a mock is deliberate: the additive upsert, the
+histogram merge function and the ledger's composite key are exactly the parts a
+mock would get wrong in agreement with its author.
 
 `make test` needs cgo for the race detector. On a machine without a C toolchain,
 use `make test-short` locally — CI runs the race detector on Linux regardless.
@@ -324,6 +419,9 @@ The ones that most often need changing:
 | `PUBSUB_ENABLED` | `false` on `local`, else `true` | Validation **refuses** `false` on staging and prod |
 | `GCP_PROJECT_ID` | -- | Required when the transport is enabled |
 | `PUBSUB_EMULATOR_HOST` | -- | Setting it also enables the transport and topology bootstrap |
+| `DATABASE_URL` | -- | Required by the aggregator; unused by the ingest API |
+| `AGGREGATOR_WINDOW_SIZE` | `1m` | Event time covered by each rollup |
+| `AGGREGATOR_ALLOWED_LATENESS` | `30s` | Freshness traded for out-of-order tolerance |
 | `HTTP_TRUST_PROXY_HEADER` | `false` | Enable only behind a proxy that rewrites `X-Forwarded-For` |
 
 Two settings are boot failures rather than documented warnings, because both
@@ -355,7 +453,10 @@ Put the digest in the key document:
 
 ```
 api/openapi.yaml        the public API contract
-cmd/ingest-api/         service entrypoint
+cmd/ingest-api/         the edge: validates and publishes
+cmd/aggregator/         the consumer: windows, aggregates and persists
+internal/aggregate/     windowing, watermarks, accumulators, histograms
+internal/aggregator/    delivery, flushing and acknowledgement lifecycle
 internal/api/           route table and request handlers
 internal/auth/          API key verification and tenant resolution
 internal/config/        environment configuration and validation
@@ -366,6 +467,7 @@ internal/observability/ logging and health probes
 internal/pubsubx/       envelope, publisher, subscriber runtime, topology
 internal/ratelimit/     sharded token-bucket throttling
 internal/resilience/    circuit breaker
+internal/store/         Postgres schema, migrations and the delivery ledger
 internal/telemetry/     the metric domain model and its validation rules
 internal/version/       build provenance
 build/docker/           multi-stage Dockerfile shared by every service
