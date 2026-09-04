@@ -1,12 +1,18 @@
 openapi: 3.1.0
 
 info:
-  title: Fluxgate Ingest API
+  title: Fluxgate API
   version: "1.0.0"
-  summary: High-volume telemetry ingestion.
+  summary: High-volume telemetry ingestion and query.
   description: |
-    Fluxgate accepts batches of metric points and hands them to an asynchronous
-    aggregation pipeline.
+    Fluxgate accepts batches of metric points, aggregates them into time windows
+    asynchronously, and serves the rollups back.
+
+    Writes and reads are served by **separate processes** on separate ports.
+    They share this contract, the error format and the credentials, but they
+    scale on different axes and fail in different ways: an expensive dashboard
+    query should not slow telemetry ingestion, and an ingest spike should not
+    make dashboards unreadable.
 
     ## Error format
 
@@ -35,14 +41,18 @@ info:
 
 servers:
   - url: http://localhost:8080
-    description: Local development
+    description: Ingest API (local development)
+  - url: http://localhost:8082
+    description: Query API (local development)
 
 security:
   - bearerAuth: []
 
 tags:
   - name: Ingestion
-    description: Submitting telemetry.
+    description: Submitting telemetry. Served by the ingest API.
+  - name: Query
+    description: Reading aggregated telemetry back. Served by the query API.
   - name: Operations
     description: Probes and build metadata. Not part of the versioned contract.
 
@@ -174,6 +184,197 @@ paths:
           description: The request exceeded its processing deadline.
           $ref: '#/components/responses/Problem'
 
+  /v1/query:
+    get:
+      tags: [Query]
+      operationId: queryRollups
+      summary: Read a metric as time series.
+      description: |
+        Returns one series per distinct label combination, each with one point
+        per window. Points within a series are ordered oldest first, and series
+        are ordered stably, so a client diffing two responses does not see them
+        shuffle.
+
+        Results are always scoped to the tenant owning the credential. There is
+        no parameter for selecting a tenant, by design.
+      parameters:
+        - name: metric
+          in: query
+          required: true
+          schema:
+            type: string
+          example: http.request.duration_ms
+        - name: from
+          in: query
+          description: |
+            RFC 3339, or a negative duration relative to `to` such as `-15m`.
+            Defaults to one hour before `to`.
+          schema:
+            type: string
+          example: "-15m"
+        - name: to
+          in: query
+          description: RFC 3339, or a negative duration relative to now. Defaults to now.
+          schema:
+            type: string
+        - name: agg
+          in: query
+          description: |
+            Which statistic to read from each window. The percentiles are
+            estimated from stored histogram buckets and are only available for
+            histogram metrics; asking for one of a gauge or counter returns an
+            empty series and a warning rather than a fabricated zero.
+          schema:
+            type: string
+            default: avg
+            enum: [sum, count, avg, min, max, last, p50, p90, p95, p99]
+        - name: label.*
+          in: query
+          description: |
+            Restricts results to series carrying all the given labels, e.g.
+            `label.service=checkout&label.status=500`. The prefix exists so a
+            label can never collide with this API's own parameters -- a metric
+            labelled `agg` would otherwise be unqueryable.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The matching series.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: A parameter was invalid. Every problem is reported at once.
+          $ref: '#/components/responses/Problem'
+        '504':
+          description: The query exceeded its processing deadline.
+          $ref: '#/components/responses/Problem'
+
+  /v1/metrics:
+    get:
+      tags: [Query]
+      operationId: listMetrics
+      summary: List the metrics this tenant has data for.
+      description: |
+        Each entry carries its time range, which saves a caller from probing
+        for it: a UI that has to guess renders an empty chart on its first
+        attempt, which reads as "the system is broken" rather than "you asked
+        about the wrong hour".
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 500
+      responses:
+        '200':
+          description: The tenant's metrics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metrics:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/MetricSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/labels:
+    get:
+      tags: [Query]
+      operationId: listLabels
+      summary: List a metric's label keys, or one key's values.
+      description: |
+        Without `label`, returns the label keys present on the metric. With
+        `label`, returns the distinct values that key takes — enough for a UI to
+        offer a filter without the caller guessing.
+      parameters:
+        - name: metric
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: label
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Label keys, or one label's values.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metric:
+                    type: string
+                  labels:
+                    type: array
+                    items:
+                      type: string
+                  label:
+                    type: string
+                  values:
+                    type: array
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Problem'
+
+  /v1/stream:
+    get:
+      tags: [Query]
+      operationId: streamRollups
+      summary: Tail rollups as they are written (server-sent events).
+      description: |
+        Streams `rollup` events as the aggregator commits windows. The stream
+        starts from now: it is for watching what happens next, and replaying
+        history on connect would flood a client that only wanted the live edge.
+
+        Server-sent events rather than WebSocket: the traffic is
+        one-directional, every HTTP client already speaks it, it survives
+        proxies that mangle upgrades, and reconnection is part of the protocol
+        rather than of every client.
+
+        The stream advertises a `retry` interval and sends `: keep-alive`
+        comments while idle, so intermediaries do not reap a connection they
+        believe is dead. Connections are bounded server-side; a client should
+        reconnect, which the protocol does automatically.
+
+        The cursor advances on **write** time, not event time, so a late
+        arrival updating a window that closed minutes ago still appears.
+      parameters:
+        - name: metric
+          in: query
+          description: Restricts the tail to one metric. Omit to tail everything.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: An event stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                retry: 2000
+
+                event: rollup
+                data: {"metric":"live.demo","labels":{},"window_start":"2026-09-04T01:36:30Z","window_end":"2026-09-04T01:36:40Z","count":3,"sum":600,"min":100,"max":300,"last":300}
+
+                : keep-alive
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/Problem'
+
   /healthz:
     get:
       tags: [Operations]
@@ -296,6 +497,79 @@ components:
             $ref: '#/components/schemas/Problem'
 
   schemas:
+    QueryResult:
+      type: object
+      required: [metric, aggregation, from, to, series]
+      properties:
+        metric:
+          type: string
+        kind:
+          type: string
+          enum: [gauge, counter, histogram]
+        aggregation:
+          type: string
+        from:
+          type: string
+          format: date-time
+          description: The resolved start of the range, so a caller can see what a relative range meant.
+        to:
+          type: string
+          format: date-time
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuerySeries'
+        truncated:
+          type: boolean
+          description: |
+            True when a limit cut the response short, so a caller can tell an
+            incomplete answer from an empty one.
+        warnings:
+          type: array
+          description: |
+            Facts a caller needs that are not errors, such as a percentile
+            requested of a metric that has no histogram.
+          items:
+            type: string
+
+    QuerySeries:
+      type: object
+      required: [labels, points]
+      properties:
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        points:
+          type: array
+          items:
+            type: object
+            required: [t, v]
+            properties:
+              t:
+                type: string
+                format: date-time
+                description: The window start.
+              v:
+                type: number
+
+    MetricSummary:
+      type: object
+      properties:
+        metric:
+          type: string
+        kind:
+          type: string
+        series_count:
+          type: integer
+          description: Distinct label combinations seen for this metric.
+        oldest_window:
+          type: string
+          format: date-time
+        newest_window:
+          type: string
+          format: date-time
+
     IngestRequest:
       type: object
       required: [points]

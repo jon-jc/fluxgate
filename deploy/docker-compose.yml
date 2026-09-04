@@ -1,6 +1,6 @@
 # Local development stack.
 #
-#   make up          # emulator, Postgres, ingest API and aggregator
+#   make up          # emulator, Postgres, ingest API, aggregator, query API
 #   make down        # and a clean slate
 #
 # The emulator holds everything in memory, so `down -v` really is a clean
@@ -118,6 +118,38 @@ services:
       # A producer that stops sending would otherwise strand its last window.
       AGGREGATOR_IDLE_TIMEOUT: 5s
       LEDGER_RETENTION: 1h
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/service", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  query-api:
+    build:
+      context: ..
+      dockerfile: build/docker/Dockerfile
+      args:
+        SERVICE: query-api
+    container_name: fluxgate-query-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8082:8080"
+    environment:
+      ENVIRONMENT: dev
+      LOG_FORMAT: text
+      LOG_LEVEL: debug
+      DATABASE_URL: postgres://fluxgate:fluxgate@postgres:5432/fluxgate?sslmode=disable
+      # The read path shares the ingest API's credentials: a tenant's key
+      # identifies the tenant, and separate read keys would double the
+      # rotation burden without changing who can see what.
+      API_KEYS: >-
+        [{"key_id":"local","tenant_id":"acme",
+          "secret_sha256":"eb26d4a9a0ef04727f52fb5acc8936196ae90e23003fc5117ce8e3e28c49363f"}]
+      # A tight poll keeps the local live tail feeling immediate.
+      QUERY_STREAM_POLL_INTERVAL: 1s
     healthcheck:
       test: ["CMD", "/usr/local/bin/service", "-healthcheck"]
       interval: 10s

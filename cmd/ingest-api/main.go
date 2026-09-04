@@ -66,7 +66,7 @@ func main() {
 const serviceName = "fluxgate-ingest-api"
 
 func run() error {
-	cfg, err := config.Load(serviceName, config.Requirements{Auth: true})
+	cfg, err := config.Load(serviceName, config.Requirements{Auth: true, PubSub: true})
 	if err != nil {
 		return err
 	}
@@ -263,7 +263,7 @@ func buildSink(
 // different port stays probeable without the healthcheck being updated
 // separately and silently drifting out of sync.
 func probe() error {
-	cfg, err := config.Load(serviceName, config.Requirements{Auth: true})
+	cfg, err := config.Load(serviceName, config.Requirements{})
 	if err != nil {
 		return err
 	}

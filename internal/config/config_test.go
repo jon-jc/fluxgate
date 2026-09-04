@@ -411,3 +411,68 @@ func TestAggregatorDefaults(t *testing.T) {
 		t.Error("Migrate defaults to false; a fresh database would never get a schema")
 	}
 }
+
+// TestPubSubIsNotRequiredOfReadOnlyServices keeps the query API from failing to
+// boot over a transport it never touches.
+func TestPubSubIsNotRequiredOfReadOnlyServices(t *testing.T) {
+	cfg, err := load(env(map[string]string{
+		"ENVIRONMENT":  "prod",
+		"API_KEYS":     "[]",
+		"DATABASE_URL": "postgres://localhost/fluxgate",
+	}), "fluxgate-query-api", Requirements{Auth: true, Database: true})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Service != "fluxgate-query-api" {
+		t.Errorf("Service = %q", cfg.Service)
+	}
+}
+
+// TestPubSubGuardsApplyWhenDeclared confirms the production safeguard still
+// fires for the services that do publish or subscribe.
+func TestPubSubGuardsApplyWhenDeclared(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"ENVIRONMENT":    "prod",
+		"API_KEYS":       "[]",
+		"PUBSUB_ENABLED": "false",
+	}), "fluxgate-ingest-api", Requirements{Auth: true, PubSub: true})
+	if err == nil {
+		t.Fatal("a publishing service accepted PUBSUB_ENABLED=false in production")
+	}
+	if !strings.Contains(err.Error(), "PUBSUB_ENABLED") {
+		t.Errorf("error does not mention PUBSUB_ENABLED:\n%v", err)
+	}
+}
+
+func TestQueryLimitDefaults(t *testing.T) {
+	cfg, err := load(env(nil), "fluxgate-query-api", Requirements{})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if cfg.Query.DefaultRange != time.Hour {
+		t.Errorf("DefaultRange = %v, want 1h", cfg.Query.DefaultRange)
+	}
+	if cfg.Query.MaxSeries != 500 {
+		t.Errorf("MaxSeries = %d, want 500", cfg.Query.MaxSeries)
+	}
+	if cfg.Query.StreamHeartbeat >= cfg.Query.StreamMaxDuration {
+		t.Error("the default heartbeat would never fire before the stream closes")
+	}
+}
+
+// TestQueryDefaultRangeMustFitTheMaximum: otherwise every request with no range
+// would fail its own validation, which is a confusing way to learn about a
+// misconfiguration.
+func TestQueryDefaultRangeMustFitTheMaximum(t *testing.T) {
+	_, err := load(env(map[string]string{
+		"QUERY_MAX_RANGE":     "1h",
+		"QUERY_DEFAULT_RANGE": "24h",
+	}), "fluxgate-query-api", Requirements{})
+	if err == nil {
+		t.Fatal("a default range wider than the maximum was accepted")
+	}
+	if !strings.Contains(err.Error(), "QUERY_DEFAULT_RANGE") {
+		t.Errorf("error does not mention QUERY_DEFAULT_RANGE:\n%v", err)
+	}
+}

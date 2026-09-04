@@ -28,14 +28,105 @@ flowchart LR
 | Milestone | Scope | State |
 | --------- | ----- | ----- |
 | 1 | Service foundation: config, logging, HTTP middleware, probes, graceful shutdown, CI | Merged |
-| 2 | Ingest API: metric model, validation, API-key auth, per-tenant rate limiting, OpenAPI | In review |
-| 3 | Pub/Sub layer: batched publisher, subscriber runtime, retries, DLQ, emulator harness | Planned |
-| 4 | Aggregator: windowing, watermarks, duplicate suppression, Postgres rollups | Planned |
-| 5 | Query API and alerting: time-series queries, SSE live tail, rule evaluation | Planned |
-| 6 | Observability and resilience: OpenTelemetry, Prometheus, circuit breaking, load shedding | Planned |
+| 2 | Ingest API: metric model, validation, API-key auth, per-tenant rate limiting, OpenAPI | Merged |
+| 3 | Pub/Sub layer: batched publisher, subscriber runtime, retries, DLQ, emulator harness | Merged |
+| 4 | Aggregator: windowing, watermarks, duplicate suppression, Postgres rollups | Merged |
+| 5 | Query API: time-series queries, label filtering, percentiles, SSE live tail | In review |
+| 6 | Alerting and observability: rule evaluation, OpenTelemetry, Prometheus metrics | Planned |
 | 7 | Deployment: Terraform for Pub/Sub and Cloud Run, runbooks, architecture decision records | Planned |
 
 Each milestone lands as its own reviewed pull request.
+
+## The query API
+
+Rollups are read back through a separate process on a separate port. Reads and
+writes scale on different axes and fail in different ways: an expensive
+dashboard query should not be able to slow telemetry ingestion, and an ingest
+spike should not make dashboards unreadable. The read path also holds only a
+read-shaped database pool and no publisher at all.
+
+```bash
+curl -H 'Authorization: Bearer fxg_local_local-dev-secret' \
+  'localhost:8082/v1/query?metric=http.request.duration_ms&from=-15m&agg=p95&label.status=500'
+```
+
+```json
+{
+  "metric": "http.request.duration_ms",
+  "kind": "histogram",
+  "aggregation": "p95",
+  "from": "2026-09-04T01:21:24Z",
+  "to": "2026-09-04T01:36:24Z",
+  "series": [
+    {
+      "labels": {"service": "checkout", "status": "500"},
+      "points": [{"t": "2026-09-04T01:36:00Z", "v": 219.48}]
+    }
+  ]
+}
+```
+
+**Percentiles come from the stored histogram buckets**, not from a recomputation
+over raw points that no longer exist. Asking for `p99` of a gauge returns an
+empty series *and a warning*, rather than a zero: a fabricated percentile
+rendered on a dashboard is worse than a gap, because nobody can tell it is
+wrong.
+
+**Relative ranges are first class.** `from=-15m` is what a human actually
+wants, and forcing them to compute two timestamps is how a dashboard ends up
+with a hard-coded range that silently goes stale. `from` is measured from `to`,
+not from now, so the two compose. The response echoes the resolved range, so a
+caller can see what a relative range actually meant.
+
+**Label filters are namespaced** as `label.<key>`. Without the prefix, a metric
+labelled `agg` or `from` would be unqueryable. Filtering uses JSONB containment
+against a GIN index rather than a join through a normalised label table: the
+rollup already carries its labels, so containment answers the question in one
+index lookup.
+
+**Every limit is a bound on a real failure.** A single unbounded query over a
+year of one-minute windows across a thousand series is half a billion rows, and
+the client that asked for it is usually a dashboard that will ask again in
+thirty seconds. Responses that hit a limit are marked `truncated`, so a caller
+can tell an incomplete answer from an empty one.
+
+**The tenant always comes from the credential.** There is no parameter for
+selecting one — a caller able to name someone else's tenant could read their
+data.
+
+### Live tail
+
+`GET /v1/stream` pushes rollups over server-sent events as the aggregator
+commits them:
+
+```
+retry: 2000
+
+event: rollup
+data: {"metric":"live.demo","labels":{},"window_start":"2026-09-04T01:36:30Z","count":3,"sum":600,"min":100,"max":300,"last":300}
+
+: keep-alive
+```
+
+SSE rather than WebSocket: the traffic is one-directional, every HTTP client
+already speaks it, it survives proxies that mangle upgrades, and reconnection is
+part of the protocol rather than of every client.
+
+The tail polls an indexed column rather than subscribing to a topic. A
+per-instance Pub/Sub subscription would deliver changes sooner, but every
+replica would need one created and torn down with the instance — runtime
+topology management, for a feature whose usable latency floor is a human
+looking at a screen.
+
+The cursor advances on **write** time, not event time. A late arrival updates a
+window that closed minutes ago, and a tail ordered by event time would never
+show it.
+
+One routing detail worth noting: the request timeout is applied to every
+endpoint *except* the stream. A blanket timeout would sever each stream at the
+deadline, which a client cannot distinguish from a server fault — it would
+reconnect, be cut off again, and settle into a reconnect loop that looks exactly
+like an outage. The stream bounds itself with its own, much longer, budget.
 
 ## The aggregator
 
@@ -319,26 +410,29 @@ curl -X POST localhost:8080/v1/ingest \
 {"batch_id":"7f0c8e8327d609ba5917480caeea6a7b","accepted":1,"rejected":0}
 ```
 
+Within a few seconds the aggregator closes the window, and the rollup is
+readable:
+
+```bash
+curl -H 'Authorization: Bearer fxg_local_local-dev-secret' \
+  'localhost:8082/v1/query?metric=queue.depth&from=-15m&agg=sum'
+```
+
+```json
+{"metric":"queue.depth","aggregation":"sum",
+ "series":[{"labels":{},"points":[{"t":"2026-09-04T01:05:40Z","v":42}]}]}
+```
+
 Readiness reports each service's own dependencies:
 
 ```bash
 curl -s localhost:8080/readyz   # {"status":"ok","checks":{"pubsub-publisher":"ok"}}
 curl -s localhost:8081/readyz   # {"status":"ok","checks":{"postgres":"ok"}}
+curl -s localhost:8082/readyz   # {"status":"ok","checks":{"postgres":"ok"}}
 ```
 
-Within a few seconds the aggregator closes the window and writes the rollup:
-
-```bash
-make psql
-```
-
-```sql
-SELECT metric, window_start, count, sum, min, max FROM rollups;
---        metric    |      window_start      | count | sum | min | max
---   queue.depth    | 2026-09-04 01:05:40+00 |     3 |  42 |   7 |  21
-```
-
-`make down` discards the stack and its state.
+`make psql` opens a shell on the database; `make down` discards the stack and
+its state.
 
 ### Without Docker
 
@@ -422,6 +516,8 @@ The ones that most often need changing:
 | `DATABASE_URL` | -- | Required by the aggregator; unused by the ingest API |
 | `AGGREGATOR_WINDOW_SIZE` | `1m` | Event time covered by each rollup |
 | `AGGREGATOR_ALLOWED_LATENESS` | `30s` | Freshness traded for out-of-order tolerance |
+| `QUERY_MAX_RANGE` | `744h` | Longest span one query may cover |
+| `QUERY_MAX_SERIES` | `500` | Distinct series in one response |
 | `HTTP_TRUST_PROXY_HEADER` | `false` | Enable only behind a proxy that rewrites `X-Forwarded-For` |
 
 Two settings are boot failures rather than documented warnings, because both
@@ -455,6 +551,7 @@ Put the digest in the key document:
 api/openapi.yaml        the public API contract
 cmd/ingest-api/         the edge: validates and publishes
 cmd/aggregator/         the consumer: windows, aggregates and persists
+cmd/query-api/          the read path: queries and the live tail
 internal/aggregate/     windowing, watermarks, accumulators, histograms
 internal/aggregator/    delivery, flushing and acknowledgement lifecycle
 internal/api/           route table and request handlers
@@ -465,6 +562,7 @@ internal/idempotency/   replaying outcomes for retried requests
 internal/ingest/        the sink seam between HTTP and the delivery pipeline
 internal/observability/ logging and health probes
 internal/pubsubx/       envelope, publisher, subscriber runtime, topology
+internal/query/         query parsing, limits and result shaping
 internal/ratelimit/     sharded token-bucket throttling
 internal/resilience/    circuit breaker
 internal/store/         Postgres schema, migrations and the delivery ledger

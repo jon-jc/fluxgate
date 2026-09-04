@@ -65,6 +65,7 @@ up: ## Start the local stack (Pub/Sub emulator + ingest API)
 	@echo ""
 	@echo "  ingest API:  http://localhost:8080"
 	@echo "  aggregator:  http://localhost:8081  (probes only)"
+	@echo "  query API:   http://localhost:8082"
 	@echo "  emulator:    localhost:8681"
 	@echo "  postgres:    localhost:5442  (fluxgate/fluxgate)"
 	@echo "  API key:     fxg_local_local-dev-secret"
