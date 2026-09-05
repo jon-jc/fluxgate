@@ -150,6 +150,14 @@ func TestParseKeysRejectsMalformedDocuments(t *testing.T) {
 		{name: "missing tenant", doc: `[{"key_id":"k1","secret_sha256":"` + valid + `"}]`},
 		{name: "underscore in key id", doc: `[{"key_id":"k_1","tenant_id":"t","secret_sha256":"` + valid + `"}]`},
 		{name: "space in key id", doc: `[{"key_id":"k 1","tenant_id":"t","secret_sha256":"` + valid + `"}]`},
+		// A tenant ID is the partition key for every stored row. A value that
+		// only looks blank must fail the deployment rather than issue a
+		// working credential scoped to a tenant nobody meant to create.
+		{name: "whitespace-only tenant", doc: `[{"key_id":"k1","tenant_id":" ","secret_sha256":"` + valid + `"}]`},
+		{name: "tab-only tenant", doc: `[{"key_id":"k1","tenant_id":"	","secret_sha256":"` + valid + `"}]`},
+		{name: "tenant with trailing space", doc: `[{"key_id":"k1","tenant_id":"acme ","secret_sha256":"` + valid + `"}]`},
+		{name: "tenant with leading space", doc: `[{"key_id":"k1","tenant_id":" acme","secret_sha256":"` + valid + `"}]`},
+		{name: "whitespace-only key id", doc: `[{"key_id":" ","tenant_id":"t","secret_sha256":"` + valid + `"}]`},
 		{name: "digest not hex", doc: `[{"key_id":"k1","tenant_id":"t","secret_sha256":"zzz"}]`},
 		{name: "digest wrong length", doc: `[{"key_id":"k1","tenant_id":"t","secret_sha256":"abcd"}]`},
 		{name: "negative rate", doc: `[{"key_id":"k1","tenant_id":"t","secret_sha256":"` + valid + `","rate_limit_per_second":-1}]`},

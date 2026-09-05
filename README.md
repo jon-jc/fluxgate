@@ -663,10 +663,25 @@ Run one locally:
 go test -run '^$' -fuzz FuzzValidatePoint -fuzztime 60s ./internal/telemetry
 ```
 
-CI gives each target a bounded budget and caches the corpus between runs, so
-coverage accumulates across pull requests rather than restarting from the seeds.
+Fuzzing runs nightly rather than on pull requests. It is a randomised search, so
+a target that passes on one run can fail on the next with no change to the code
+— blocking every pull request on that teaches people a red check means "run it
+again", which is worse than not having the check at all. What blocks is fully
+deterministic instead: the seed corpus and every crasher ever found are committed
+under `testdata/`, and `go test ./...` replays all of them on every pull request.
+A bug found at night becomes a permanent regression test by morning.
 
-This was worth doing. `FuzzEnvelopeRoundTrip` found that a label value
+This was worth doing twice over.
+
+`FuzzParseKeys` found that a key document with a whitespace-only `tenant_id` was
+accepted. The tenant ID is the partition key for every stored row and every
+query, so `" "` is a real, addressable tenant that no operator meant to create —
+and one that reads as blank in any config file, log line or dashboard. A
+deployment typo would have issued a working credential whose data landed
+somewhere nobody would ever look, which is exactly what validating the document
+at startup is supposed to prevent.
+
+`FuzzEnvelopeRoundTrip` found that a label value
 containing invalid UTF-8 was silently rewritten: Go's JSON decoder replaces the
 bad bytes with U+FFFD and returns no error, so the client received a `202` for a
 point this service had quietly altered, with nothing anywhere recording the

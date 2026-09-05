@@ -220,63 +220,6 @@ jobs:
           version: latest
           args: --timeout=5m
 
-  fuzz:
-    name: Fuzz
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-
-      # Seed corpora are committed and run as ordinary unit tests by the build
-      # job, so this step is about exploring past them. Each target gets a short
-      # bounded budget: long enough to reach new coverage, short enough that a
-      # pull request is not held up. The corpus a run discovers lives in the
-      # cache below, so successive runs continue from where the last one
-      # stopped rather than restarting from the seeds every time.
-      - name: Restore the discovered corpus
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/go-build/fuzz
-          key: fuzz-${{ github.sha }}
-          restore-keys: fuzz-
-
-      - name: Fuzz every parser boundary
-        run: |
-          set -euo pipefail
-          # target:package -- one entry per boundary that parses untrusted input.
-          targets=(
-            "FuzzDecodeEnvelope:./internal/pubsubx"
-            "FuzzEnvelopeRoundTrip:./internal/pubsubx"
-            "FuzzParse:./internal/query"
-            "FuzzHashLabels:./internal/aggregate"
-            "FuzzWindowFor:./internal/aggregate"
-            "FuzzVerify:./internal/auth"
-            "FuzzParseKeys:./internal/auth"
-            "FuzzValidatePoint:./internal/telemetry"
-          )
-          for entry in "${targets[@]}"; do
-            target="${entry%%:*}"
-            pkg="${entry#*:}"
-            echo "::group::$target"
-            go test -run '^$' -fuzz "^${target}$" -fuzztime 40s "$pkg"
-            echo "::endgroup::"
-          done
-
-      # A crasher is written to testdata/, where it becomes a permanent
-      # regression test. Uploading it means the reproducer survives even if the
-      # cache is evicted before anyone looks at the failure.
-      - name: Upload any crasher
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fuzz-crashers
-          path: internal/**/testdata/fuzz/**
-          if-no-files-found: ignore
-
   vulncheck:
     name: Vulnerability scan
     runs-on: ubuntu-latest

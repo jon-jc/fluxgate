@@ -111,10 +111,24 @@ func ParseKeys(doc []byte) (*StaticStore, error) {
 	keys := make(map[string]Key, len(records))
 	for i, k := range records {
 		switch {
-		case k.ID == "":
+		case strings.TrimSpace(k.ID) == "":
 			return nil, fmt.Errorf("key %d: key_id is required", i)
-		case k.TenantID == "":
+		case strings.TrimSpace(k.TenantID) == "":
+			// Checked after trimming, not against "". The tenant ID is the
+			// partition key for every stored row and every query, so a value
+			// of " " is a real, addressable tenant that no operator meant to
+			// create -- and one that reads as blank in any config file, log
+			// line or dashboard. A deployment typo must fail here rather than
+			// quietly issue a working credential whose data lands under a
+			// tenant nobody will ever look at.
 			return nil, fmt.Errorf("key %q: tenant_id is required", k.ID)
+		case strings.TrimSpace(k.TenantID) != k.TenantID:
+			// The same reasoning one step further out: "acme " and "acme"
+			// would be two separate partitions that are indistinguishable to
+			// anyone reading either of them.
+			return nil, fmt.Errorf(
+				"key %q: tenant_id must not have leading or trailing whitespace",
+				k.ID)
 		case strings.ContainsAny(k.ID, "_ \t\n"):
 			// The credential format joins its parts with underscores, so an
 			// underscore in the ID would make the split ambiguous.
