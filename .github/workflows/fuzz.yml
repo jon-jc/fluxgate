@@ -1,0 +1,148 @@
+# Continuous fuzzing.
+#
+# This is deliberately not part of the pull request pipeline. Fuzzing is a
+# randomised search, so a target that passes on one run can fail on the next
+# with no change to the code -- as happened here: a run picked up the corpus a
+# previous run had discovered, explored past it, and failed a commit that had
+# nothing to do with the bug it found. Blocking every pull request on that
+# teaches people that a red check means "run it again", which is worse than not
+# having the check.
+#
+# What is blocking lives in ci.yml instead, and is fully deterministic: the
+# seed corpus and every crasher ever found are committed under testdata/, and
+# `go test ./...` replays all of them on every pull request. So a bug found
+# here becomes a permanent regression test there, which is the property that
+# actually matters.
+name: Fuzz
+
+on:
+  schedule:
+    # 04:00 UTC daily, well clear of the working day in any timezone.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: "Budget per target, as a Go duration"
+        required: false
+        default: "5m"
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+
+      # Successive nights continue from where the last one stopped rather than
+      # restarting from the seeds, so coverage compounds instead of re-treading
+      # the shallow paths every run.
+      - name: Restore the discovered corpus
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build/fuzz
+          key: fuzz-${{ github.run_id }}
+          restore-keys: fuzz-
+
+      - name: Fuzz every parser boundary
+        id: fuzz
+        run: |
+          set -uo pipefail
+          # target:package -- one entry per boundary that parses untrusted input.
+          targets=(
+            "FuzzDecodeEnvelope:./internal/pubsubx"
+            "FuzzEnvelopeRoundTrip:./internal/pubsubx"
+            "FuzzParse:./internal/query"
+            "FuzzHashLabels:./internal/aggregate"
+            "FuzzWindowFor:./internal/aggregate"
+            "FuzzVerify:./internal/auth"
+            "FuzzParseKeys:./internal/auth"
+            "FuzzValidatePoint:./internal/telemetry"
+          )
+          budget="${{ github.event.inputs.fuzztime || '5m' }}"
+          failed=()
+          for entry in "${targets[@]}"; do
+            target="${entry%%:*}"
+            pkg="${entry#*:}"
+            echo "::group::$target ($budget)"
+            # Every target runs even after one fails, so a single night
+            # reports every boundary that is broken rather than just the
+            # first one in the list.
+            if ! go test -run '^$' -fuzz "^${target}$" -fuzztime "$budget" "$pkg"; then
+              failed+=("$target")
+              echo "::error title=$target::fuzzing found a failing input"
+            fi
+            echo "::endgroup::"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "targets=${failed[*]}" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      # Go writes a crasher into testdata/, where committing it turns it into a
+      # permanent regression test. Uploading it means the reproducer survives
+      # even if the corpus cache is evicted before anyone looks.
+      - name: Upload the reproducers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashers
+          path: internal/**/testdata/fuzz/**
+          if-no-files-found: ignore
+
+      # A nightly job that only turns a square red is a job nobody reads.
+      - name: Open an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGETS: ${{ steps.fuzz.outputs.targets }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          # The label may not exist yet in a fresh repository, and both the
+          # list and the create below fail outright without it.
+          gh label create fuzz --color B60205 --description "Found by fuzzing" >/dev/null 2>&1 || true
+          # One open issue at a time: a search that fails every night should
+          # not file an identical report every night.
+          existing=$(gh issue list --label fuzz --state open \
+            --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body \
+              "Still failing on \`${TARGETS:-unknown}\`. Run: ${RUN_URL}"
+            exit 0
+          fi
+          gh issue create \
+            --title "Fuzzing found a failing input in ${TARGETS:-a target}" \
+            --label fuzz \
+            --body "$(cat <<BODY
+          Nightly fuzzing failed on: \`${TARGETS:-unknown}\`
+
+          The reproducer is attached to the run as the \`fuzz-crashers\`
+          artifact, under \`internal/<pkg>/testdata/fuzz/<Target>/\`.
+
+          To reproduce and fix:
+
+          1. Download the artifact and copy the file into the matching
+             \`testdata/fuzz/<Target>/\` directory in a branch.
+          2. \`go test -run '<Target>/<file>' ./internal/<pkg>\` — it should fail.
+          3. Fix the bug, then commit the reproducer alongside the fix. It then
+             runs on every pull request as an ordinary deterministic test.
+
+          Run: ${RUN_URL}
+          BODY
+          )"
