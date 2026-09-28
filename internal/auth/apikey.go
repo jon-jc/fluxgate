@@ -274,8 +274,13 @@ func splitToken(token string) (keyID, secret string, err error) {
 		return "", "", ErrMalformedCredential
 	}
 	keyID, secret, ok = strings.Cut(rest, "_")
-	if !ok || keyID == "" || secret == "" {
+	if !ok || !validKeyID(keyID) || secret == "" || len(secret) > 1024 {
 		return "", "", ErrMalformedCredential
+	}
+	for _, c := range secret {
+		if c < 0x21 || c > 0x7e {
+			return "", "", ErrMalformedCredential
+		}
 	}
 	return keyID, secret, nil
 }

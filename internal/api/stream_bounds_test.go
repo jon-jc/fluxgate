@@ -43,7 +43,7 @@ func TestStreamSurvivesServerWriteTimeoutAndCapsConnections(t *testing.T) {
 	}
 	second := request()
 	_ = second.Body.Close()
-	if second.StatusCode != 503 || second.Header.Get("Retry-After") == "" {
+	if second.StatusCode != 429 || second.Header.Get("Retry-After") == "" {
 		t.Fatalf("excess stream status: %d", second.StatusCode)
 	}
 	body, err := io.ReadAll(first.Body)

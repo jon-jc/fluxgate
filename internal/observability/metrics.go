@@ -246,8 +246,20 @@ func (m *Metrics) ObserveRequest(route, method string, status int, d time.Durati
 	if m == nil {
 		return
 	}
+	method = HTTPMethod(method)
 	m.httpRequests.WithLabelValues(route, method, statusClass(status)).Inc()
 	m.httpDuration.WithLabelValues(route, method).Observe(d.Seconds())
+}
+
+// HTTPMethod bounds unauthenticated, caller-controlled metric cardinality.
+// Fluxgate implements standard HTTP methods; extensions share one bucket.
+func HTTPMethod(method string) string {
+	switch method {
+	case "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH":
+		return method
+	default:
+		return "_OTHER"
+	}
 }
 
 // TrackInFlight increments the in-flight gauge and returns its decrement.

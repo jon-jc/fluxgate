@@ -181,5 +181,5 @@ func telemetryOptions(cfg config.Config) httpx.TelemetryOptions {
 	if cfg.Telemetry.MetricsPath != "" {
 		routes = append(routes, "GET "+cfg.Telemetry.MetricsPath)
 	}
-	return httpx.TelemetryOptions{SkipRoutes: routes}
+	return httpx.TelemetryOptions{SkipRoutes: routes, TrustTraceParent: cfg.HTTP.TrustTraceParent}
 }

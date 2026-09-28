@@ -360,7 +360,11 @@ paths:
         believe is dead. Connections are bounded server-side; a client should
         reconnect, which the protocol does automatically.
 
-        The cursor advances on **write** time, not event time, so a late
+        Per-instance tenant quotas default to eight concurrent streams. Tenant
+        quota exhaustion returns 429; instance capacity exhaustion returns 503.
+        Both include Retry-After.
+
+        The cursor advances on committed revision, not event time, so a late
         arrival updating a window that closed minutes ago still appears.
       parameters:
         - name: metric
@@ -384,6 +388,9 @@ paths:
                 : keep-alive
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: This tenant has reached its concurrent-stream quota; respect Retry-After.
+          $ref: '#/components/responses/RateLimited'
         '503':
           description: Capacity exhausted; respect Retry-After before retrying.
           $ref: '#/components/responses/Problem'

@@ -7,6 +7,7 @@ import (
 
 func TestRejectUnsafeRuntimeBounds(t *testing.T) {
 	for key, value := range map[string]string{
+		"QUERY_STREAM_MAX_PER_TENANT":   "0",
 		"AGGREGATOR_MAX_BUFFERED_BYTES": "1MB", "AGGREGATOR_MAX_OUTSTANDING_BYTES": "1MB",
 		"HTTP_HANDLER_TIMEOUT": "0s", "HTTP_READ_HEADER_TIMEOUT": "0s",
 		"HTTP_READ_TIMEOUT": "0s", "HTTP_IDLE_TIMEOUT": "0s",

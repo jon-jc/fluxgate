@@ -134,6 +134,7 @@ func run() error {
 			},
 			Stream: api.StreamOptions{
 				MaxConcurrent:     cfg.Query.StreamMaxConcurrent,
+				MaxPerTenant:      cfg.Query.StreamMaxPerTenant,
 				QueryTimeout:      cfg.HTTP.HandlerTimeout,
 				WriteTimeout:      cfg.HTTP.WriteTimeout,
 				PollInterval:      cfg.Query.StreamPollInterval,

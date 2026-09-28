@@ -847,6 +847,20 @@ Rate limits and stream limits apply per instance. Scaling replicas multiplies
 the available allowance; use a shared gateway quota if a tenant-wide hard cap is
 required.
 
+Public HTTP trace headers are linked to a fresh locally sampled trace; arbitrary
+baggage is discarded at the HTTP boundary. Set `HTTP_TRUST_TRACE_PARENT=true`
+only behind a gateway that authenticates/replaces trace context. Internal broker
+propagation still preserves the edge's sampling decision. Span attributes and
+export queues are bounded. Unknown HTTP methods share `_OTHER`, following the
+[OpenTelemetry HTTP convention](https://opentelemetry.io/docs/specs/semconv/registry/attributes/http/).
+Credential identifiers are limited to 128 ASCII characters and secrets to 1024
+printable ASCII characters before lookup or logging.
+
+Each tenant may hold at most `QUERY_STREAM_MAX_PER_TENANT` streams per instance
+(default 8, bounded by total capacity). Tenant exhaustion returns 429; total
+capacity exhaustion returns 503. Both include `Retry-After`. Closing streams
+releases their slots; different API keys for the same tenant share the quota.
+
 Aggregator admission also accounts for label width and histogram storage through
 `AGGREGATOR_MAX_BUFFERED_BYTES` (128 MiB by default). It rejects an entire batch
 for redelivery when the budget is full. The subscriber separately limits retained
