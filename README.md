@@ -429,11 +429,20 @@ the traffic shape that overwhelms a downstream service. Denials carry
 `Retry-After` — unless waiting cannot help, because the batch is larger than the
 burst will ever hold, in which case the response says to split it instead.
 
-**Retries are safe.** A client that times out cannot tell whether its batch
+**Retries with a shared store are safe within `IDEMPOTENCY_TTL`.** A client that times out cannot tell whether its batch
 landed. Send `Idempotency-Key` and repeat the identical body: the original
 response is replayed rather than the data being counted twice. Reusing a key
-with a *different* body is a 409 — replaying the first response there would
-silently discard the second batch.
+with a *different* body is a 409. The batch identity, server timestamps, and
+response are reserved in Postgres **before** publishing. If a publish times out
+ambiguously, retries publish the identical batch and the delivery ledger prevents
+double counting. A confirmed response is shared across replicas and restarts.
+Without a key, each HTTP attempt is a new batch. Expired keys may be reused for
+new work; do not retry an old operation beyond its TTL.
+
+`DATABASE_URL` is required for ingestion on staging and prod. Local and dev may
+use a bounded in-memory store; retries there do not survive a process restart.
+Apply migration 0004 before starting ingest replicas. The aggregator reclaims
+expired retry payloads during retention maintenance.
 
 **Authentication is bearer API keys** in the form `fxg_<key id>_<secret>`. Only
 a SHA-256 digest is stored, so a leaked configuration file does not hand anyone
@@ -712,7 +721,7 @@ The ones that most often need changing:
 | `PUBSUB_ENABLED` | `false` on `local`, else `true` | Validation **refuses** `false` on staging and prod |
 | `GCP_PROJECT_ID` | -- | Required when the transport is enabled |
 | `PUBSUB_EMULATOR_HOST` | -- | Setting it also enables the transport and topology bootstrap |
-| `DATABASE_URL` | -- | Required by the aggregator; unused by the ingest API |
+| `DATABASE_URL` | -- | Required by aggregator/query; required for shared ingest retries on staging/prod |
 | `AGGREGATOR_WINDOW_SIZE` | `1m` | Event time covered by each rollup |
 | `AGGREGATOR_ALLOWED_LATENESS` | `30s` | Freshness traded for out-of-order tolerance |
 | `QUERY_MAX_RANGE` | `744h` | Longest span one query may cover |

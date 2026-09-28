@@ -95,7 +95,7 @@ func newHarness(t *testing.T, opts ...harnessOption) *harness {
 
 	now := func() time.Time { return cfg.now }
 
-	var idem *idempotency.Store
+	var idem idempotency.Repository
 	if cfg.idempotency {
 		idem = idempotency.New(time.Hour, idempotency.WithClock(now))
 	}

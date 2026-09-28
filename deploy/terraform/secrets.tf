@@ -94,3 +94,12 @@ resource "google_secret_manager_secret_iam_member" "query_database_url" {
   member    = "serviceAccount:${google_service_account.query.email}"
   project   = var.project_id
 }
+
+# The edge reserves retry identities before publishing. Access will be limited
+# to the retry table by the database role provisioning in the deployment guide.
+resource "google_secret_manager_secret_iam_member" "ingest_database_url" {
+  secret_id = google_secret_manager_secret.database_url.id
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.ingest.email}"
+  project   = var.project_id
+}

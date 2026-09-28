@@ -10,9 +10,12 @@ package idempotency
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/jon-jc/fluxgate/internal/telemetry"
 )
 
 // ErrPayloadMismatch means the key was reused with a different request body.
@@ -24,6 +27,9 @@ var ErrPayloadMismatch = errors.New("idempotency key reused with a different pay
 
 // Record is a completed outcome, replayed verbatim on a repeat.
 type Record struct {
+	// Batch is fixed before publishing, including server-assigned timestamps.
+	Batch     telemetry.Batch
+	Published bool
 	// Status is the HTTP status code originally returned.
 	Status int
 	// Body is the response body originally returned.
@@ -46,9 +52,7 @@ func Fingerprint(body []byte) string {
 // This implementation is per-process and in-memory, which is honest about its
 // limits: with more than one replica, a retry that lands on a different
 // instance is not recognised. That is an acceptable trade for the current
-// stage -- duplicate suppression also happens downstream, where it is
-// authoritative -- and the interface is shaped so a shared backing store can
-// replace it without touching a caller.
+// stage for local development only. Deployed ingestion uses Postgres.
 type Store struct {
 	ttl      time.Duration
 	maxSize  int
@@ -57,6 +61,8 @@ type Store struct {
 
 	mu        sync.Mutex
 	records   map[string]Record
+	sizes     map[string]int
+	bytes     int
 	lastSweep time.Time
 }
 
@@ -83,6 +89,7 @@ func New(ttl time.Duration, opts ...Option) *Store {
 		now:      time.Now,
 		sweepGap: time.Minute,
 		records:  make(map[string]Record),
+		sizes:    make(map[string]int),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -124,6 +131,10 @@ func (s *Store) Save(tenantID, key string, rec Record) {
 	if key == "" {
 		return
 	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -142,7 +153,13 @@ func (s *Store) Save(tenantID, key string, rec Record) {
 		}
 	}
 
-	s.records[s.compositeKey(tenantID, key)] = rec
+	k := s.compositeKey(tenantID, key)
+	if s.bytes-s.sizes[k]+len(data) > 64<<20 {
+		return
+	}
+	s.bytes += len(data) - s.sizes[k]
+	s.sizes[k] = len(data)
+	s.records[k] = rec
 }
 
 // compositeKey namespaces keys by tenant so that two tenants choosing the same
@@ -158,9 +175,11 @@ func (s *Store) sweepLocked(now time.Time) {
 	}
 	s.lastSweep = now
 
-	for k, rec := range s.records {
-		if now.Sub(rec.StoredAt) > s.ttl {
+	for k := range s.records {
+		if now.Sub(s.records[k].StoredAt) > s.ttl {
 			delete(s.records, k)
+			s.bytes -= s.sizes[k]
+			delete(s.sizes, k)
 		}
 	}
 }

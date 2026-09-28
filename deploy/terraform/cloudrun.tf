@@ -36,6 +36,8 @@ resource "google_cloud_run_v2_service" "ingest" {
   # The edge is public by design; the API key is the boundary.
   ingress = "INGRESS_TRAFFIC_ALL"
 
+  depends_on = [google_cloud_run_v2_service.aggregator, google_secret_manager_secret_iam_member.ingest_database_url]
+
   template {
     service_account = google_service_account.ingest.email
 
@@ -48,6 +50,11 @@ resource "google_cloud_run_v2_service" "ingest" {
     # The number is bounded by the publisher's own outstanding-message limit,
     # not by CPU.
     max_instance_request_concurrency = 80
+
+    vpc_access {
+      connector = google_vpc_access_connector.main.id
+      egress    = "PRIVATE_RANGES_ONLY"
+    }
 
     containers {
       image = "${local.image_base}/ingest-api:${var.image_tag}"
@@ -83,6 +90,21 @@ resource "google_cloud_run_v2_service" "ingest" {
             version = "latest"
           }
         }
+      }
+
+      env {
+        name = "DATABASE_URL"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.database_url.secret_id
+            version = "latest"
+          }
+        }
+      }
+
+      env {
+        name  = "DATABASE_MIGRATE"
+        value = "false"
       }
 
       # Behind Cloud Run's load balancer, X-Forwarded-For is rewritten and can

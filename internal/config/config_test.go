@@ -41,6 +41,19 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestDeployedIngestRequiresSharedRetryStorage(t *testing.T) {
+	for _, tier := range []string{"staging", "prod"} {
+		_, err := load(env(map[string]string{"ENVIRONMENT": tier}), "ingest", Requirements{Ingest: true})
+		if err == nil || !strings.Contains(err.Error(), "DATABASE_URL") {
+			t.Fatalf("tier=%s err=%v", tier, err)
+		}
+		_, err = load(env(map[string]string{"ENVIRONMENT": tier, "DATABASE_URL": "postgres://db/fluxgate"}), "ingest", Requirements{Ingest: true})
+		if err != nil {
+			t.Fatalf("valid shared retry config: %v", err)
+		}
+	}
+}
+
 func TestLoadOverrides(t *testing.T) {
 	cfg, err := load(env(map[string]string{
 		"SERVICE_NAME":             "fluxgate-test",
