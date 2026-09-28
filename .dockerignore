@@ -1,12 +1,8 @@
-.git
-.github
-.gitignore
-.dockerignore
-bin/
-dist/
-docs/
-deploy/
-*.md
-!README.md
-coverage.out
-coverage.html
+# Only compilation inputs may enter the build context or remote build cache.
+**
+!go.mod
+!go.sum
+!cmd/**/*.go
+!internal/**/*.go
+!internal/store/migrations/*.sql
+!build/docker/Dockerfile

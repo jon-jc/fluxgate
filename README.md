@@ -840,7 +840,7 @@ Confirmed retry reservations reclaim their telemetry payload immediately, keepin
 only identity, fingerprint and response for the remaining TTL. Pending or
 ambiguous publishes retain the original points so retries remain safe.
 
-Migration 0006 adds the retention index; rerun the migration job with
+Migrations 0006/0007 install the retention index; rerun the migration job with
 `-grant-runtime-roles` to install the cleanup privileges. Index creation can block
 writes on an existing large table, so use the planned migration maintenance window.
 Rate limits and stream limits apply per instance. Scaling replicas multiplies
@@ -878,3 +878,18 @@ to narrow the range or labels. Live-tail pages use a 256 KiB budget and resume
 from the last returned row. These budgets account for decoded data, not process
 RSS; measure container memory before increasing concurrency. HTTP headers are
 limited with a 32 KiB server setting.
+
+Release images use digest-pinned compiler/runtime bases and an allowlisted build
+context containing only Go sources, module manifests and embedded migrations.
+Local credentials and scratch files cannot enter build layers or remote caches.
+CI actions are pinned to reviewed commits. Update those pins explicitly, rebuild,
+and run the complete validation before releasing a dependency refresh.
+
+After building, run `python scripts/audit_images.py --output-dir <reports>
+--cache-dir <scanner-cache>` (on one line) to scan all four local validation
+images. Use `--image-prefix fluxgate --tag ci` for CI tags. The pinned Trivy
+scanner downloads its current vulnerability database, exports JSON reports and
+CycloneDX SBOMs, and fails on any known HIGH or CRITICAL finding, including those
+without an available fix. CI preserves these reports for 30 days. Reachability
+analysis (`govulncheck`) also runs separately: an unused vulnerable component
+still blocks the packaged-image check. Scanner/database failures fail the job.
