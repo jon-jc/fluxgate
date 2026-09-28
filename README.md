@@ -585,7 +585,7 @@ its state.
 
 ### Without Docker
 
-Requires Go 1.25 or newer. Runs against the in-memory sink with authentication
+Requires Go 1.27 or newer. Runs against the in-memory sink with authentication
 off:
 
 ```bash
