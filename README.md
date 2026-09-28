@@ -229,9 +229,13 @@ replica would need one created and torn down with the instance — runtime
 topology management, for a feature whose usable latency floor is a human
 looking at a screen.
 
-The cursor advances on **write** time, not event time. A late arrival updates a
-window that closed minutes ago, and a tail ordered by event time would never
-show it.
+The cursor advances on **committed tenant revisions**, not event timestamps.
+Concurrent flushes for a tenant lock its revision counter until commit, so a
+slow transaction cannot arrive behind a cursor already sent to a reader. Pages
+also carry the row identity to handle multiple rows in one revision. Updates to
+the same rollup between polls may coalesce: this is a live view of current totals,
+not an event archive. Reconnecting starts at the current revision; refresh
+`/v1/query` to reconcile anything missed while disconnected.
 
 One routing detail worth noting: the request timeout is applied to every
 endpoint *except* the stream. A blanket timeout would sever each stream at the
@@ -799,3 +803,11 @@ capacity budgets, recovery procedures and staging release checks. Cloud SQL uses
 the private-IP Go connector. Public service metrics are disabled in the deployed
 configuration; native platform metrics back the alerts. Traces require a configured
 collector. Local/CI validation is not evidence of live cloud readiness.
+
+
+Live streams cap concurrent connections (`QUERY_STREAM_MAX_CONCURRENT`, default
+100 per instance), bound every database poll, and renew a bounded socket write
+deadline per frame. Query responses set `truncated` when the database row limit
+cuts off results; use a smaller time range or label filter to retrieve the rest.
+Migration 0005 adds commit revisions: stop old aggregators, run the migration and
+runtime-role provisioning, then deploy both new aggregators and query services.

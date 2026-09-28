@@ -27,8 +27,8 @@ const upsertRollup = `
 INSERT INTO rollups (
 	tenant_id, metric, kind, label_hash,
 	window_start, window_end, labels,
-	count, sum, min, max, last, last_event_at, buckets
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	count, sum, min, max, last, last_event_at, buckets, revision
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 ON CONFLICT (tenant_id, metric, kind, label_hash, window_start) DO UPDATE SET
 	count         = rollups.count + EXCLUDED.count,
 	sum           = rollups.sum + EXCLUDED.sum,
@@ -41,7 +41,8 @@ ON CONFLICT (tenant_id, metric, kind, label_hash, window_start) DO UPDATE SET
 	                END,
 	last_event_at = GREATEST(rollups.last_event_at, EXCLUDED.last_event_at),
 	buckets       = fluxgate_array_add(rollups.buckets, EXCLUDED.buckets),
-	updated_at    = now()
+	updated_at    = clock_timestamp(),
+	revision      = EXCLUDED.revision
 `
 
 // Contribution records that one batch supplied data to one window.
@@ -87,7 +88,33 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 	}
 	// Rollback after a successful commit is a no-op, so this is safe to defer
 	// unconditionally and removes every early-return leak.
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = tx.Rollback(cleanup)
+	}()
+
+	// Lock tenants in a consistent order before writing any ledger/rollup rows.
+	// A revision becomes visible only at commit, so a reader cannot advance past
+	// another transaction that still has unseen changes for the same tenant.
+	revisions := make(map[string]int64)
+	for i := range rollups {
+		revisions[rollups[i].Key.TenantID] = 0
+	}
+	tenants := make([]string, 0, len(revisions))
+	for tenant := range revisions {
+		tenants = append(tenants, tenant)
+	}
+	sort.Strings(tenants)
+	for _, tenant := range tenants {
+		var revision int64
+		if revisionErr := tx.QueryRow(ctx, `INSERT INTO tenant_revisions (tenant_id, revision) VALUES ($1, 1)
+			ON CONFLICT (tenant_id) DO UPDATE SET revision = tenant_revisions.revision + 1
+			RETURNING revision`, tenant).Scan(&revision); revisionErr != nil {
+			return fmt.Errorf("assign rollup revision: %w", revisionErr)
+		}
+		revisions[tenant] = revision
+	}
 
 	// Claim the ledger entries before applying any totals. A competing replica
 	// may have passed its read check already. Any overlap rolls back the whole
@@ -153,6 +180,7 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 			r.Acc.Last,
 			time.Unix(0, r.Acc.LastTimestampUnixNano).UTC(),
 			buckets,
+			revisions[r.Key.TenantID],
 		)
 	}
 

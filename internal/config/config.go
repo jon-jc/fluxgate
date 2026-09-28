@@ -98,6 +98,8 @@ type TelemetryConfig struct {
 // across a thousand series is half a billion rows, and the client that asked
 // for it is usually a dashboard that will ask again in thirty seconds.
 type QueryConfig struct {
+	// StreamMaxConcurrent bounds pollers held by one process.
+	StreamMaxConcurrent int
 	// MaxRange is the longest time span one query may cover.
 	MaxRange time.Duration
 	// MaxSeries caps the distinct series in one response.
@@ -437,10 +439,11 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			PruneInterval:          l.duration("PRUNE_INTERVAL", time.Hour),
 		},
 		Query: QueryConfig{
-			MaxRange:     l.duration("QUERY_MAX_RANGE", 31*24*time.Hour),
-			MaxSeries:    l.integer("QUERY_MAX_SERIES", 500),
-			MaxPoints:    l.integer("QUERY_MAX_POINTS", 50_000),
-			DefaultRange: l.duration("QUERY_DEFAULT_RANGE", time.Hour),
+			StreamMaxConcurrent: l.integer("QUERY_STREAM_MAX_CONCURRENT", 100),
+			MaxRange:            l.duration("QUERY_MAX_RANGE", 31*24*time.Hour),
+			MaxSeries:           l.integer("QUERY_MAX_SERIES", 500),
+			MaxPoints:           l.integer("QUERY_MAX_POINTS", 50_000),
+			DefaultRange:        l.duration("QUERY_DEFAULT_RANGE", time.Hour),
 
 			StreamPollInterval: l.duration("QUERY_STREAM_POLL_INTERVAL", 2*time.Second),
 			StreamHeartbeat:    l.duration("QUERY_STREAM_HEARTBEAT", 20*time.Second),
@@ -541,6 +544,12 @@ func (c Config) validateTelemetry(l *loader) {
 func (c Config) validateQuery(l *loader) {
 	if c.Query.MaxSeries <= 0 {
 		l.reject("QUERY_MAX_SERIES", "must be greater than zero")
+	}
+	if c.Query.StreamMaxConcurrent <= 0 {
+		l.reject("QUERY_STREAM_MAX_CONCURRENT", "must be greater than zero")
+	}
+	if c.Query.MaxPoints > 50_000 {
+		l.reject("QUERY_MAX_POINTS", "must not exceed 50000")
 	}
 	if c.Query.MaxPoints <= 0 {
 		l.reject("QUERY_MAX_POINTS", "must be greater than zero")

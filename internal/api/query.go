@@ -23,7 +23,7 @@ import (
 type Reader interface {
 	Query(ctx context.Context, f store.QueryFilter) ([]store.StoredRollup, error)
 	Changed(ctx context.Context, tenantID, metric string, cursor store.Cursor, limit int) ([]store.StoredRollup, store.Cursor, error)
-	NewestWriteTime(ctx context.Context, tenantID string) (time.Time, error)
+	NewestRevision(ctx context.Context, tenantID string) (int64, error)
 	Metrics(ctx context.Context, tenantID string, limit int) ([]store.MetricSummary, error)
 	LabelKeys(ctx context.Context, tenantID, metric string, limit int) ([]string, error)
 	LabelValues(ctx context.Context, tenantID, metric, label string, limit int) ([]string, error)
@@ -50,6 +50,10 @@ func (d QueryDeps) now() time.Time {
 
 // StreamOptions configures the server-sent events endpoint.
 type StreamOptions struct {
+	// Bound connection count, individual polls, and writes to slow clients.
+	MaxConcurrent int
+	QueryTimeout  time.Duration
+	WriteTimeout  time.Duration
 	// PollInterval is how often the tail checks for newly written rollups.
 	PollInterval time.Duration
 	// HeartbeatInterval is how often a comment is sent on an idle stream, to
@@ -61,6 +65,15 @@ type StreamOptions struct {
 }
 
 func (o *StreamOptions) applyDefaults() {
+	if o.MaxConcurrent <= 0 {
+		o.MaxConcurrent = 100
+	}
+	if o.QueryTimeout <= 0 {
+		o.QueryTimeout = 5 * time.Second
+	}
+	if o.WriteTimeout <= 0 {
+		o.WriteTimeout = 10 * time.Second
+	}
 	if o.PollInterval <= 0 {
 		o.PollInterval = 2 * time.Second
 	}
@@ -108,13 +121,18 @@ func handleQuery(deps QueryDeps) httpx.Handler {
 			From:     req.From,
 			To:       req.To,
 			Labels:   req.Labels,
-			Limit:    deps.Limits.MaxPoints,
+			Limit:    deps.Limits.MaxPoints + 1,
 		})
 		if err != nil {
 			return httpx.Internal(fmt.Errorf("read rollups: %w", err))
 		}
 
+		truncated := len(rollups) > deps.Limits.MaxPoints
+		if truncated {
+			rollups = rollups[:deps.Limits.MaxPoints]
+		}
 		result := query.Build(req, rollups, deps.Limits)
+		result.Truncated = result.Truncated || truncated
 		return httpx.WriteJSON(w, r, http.StatusOK, result)
 	}
 }
@@ -184,6 +202,7 @@ func handleLabels(deps QueryDeps) httpx.Handler {
 
 // streamEvent is one server-sent event payload.
 type streamEvent struct {
+	Kind        string            `json:"kind"`
 	Metric      string            `json:"metric"`
 	Labels      map[string]string `json:"labels"`
 	WindowStart time.Time         `json:"window_start"`
@@ -203,6 +222,7 @@ type streamEvent struct {
 func handleStream(deps QueryDeps) httpx.Handler {
 	opts := deps.Stream
 	opts.applyDefaults()
+	slots := make(chan struct{}, opts.MaxConcurrent)
 
 	return func(w http.ResponseWriter, r *http.Request) error {
 		principal, ok := auth.PrincipalFromContext(r.Context())
@@ -224,6 +244,23 @@ func handleStream(deps QueryDeps) httpx.Handler {
 				return httpx.Invalid("The stream request is not valid.",
 					fieldErrors(violations)...)
 			}
+		}
+
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+		default:
+			w.Header().Set("Retry-After", "5")
+			return httpx.Unavailable("The live stream is at capacity. Retry shortly.")
+		}
+		seedCtx, seedCancel := context.WithTimeout(r.Context(), opts.QueryTimeout)
+		seed, seedErr := deps.Reader.NewestRevision(seedCtx, principal.TenantID)
+		seedCancel()
+		if seedErr != nil {
+			return httpx.Internal(fmt.Errorf("seed live stream: %w", seedErr))
+		}
+		if err := streamWriteDeadline(w, opts.WriteTimeout); err != nil {
+			return httpx.Internal(err)
 		}
 
 		h := w.Header()
@@ -250,31 +287,17 @@ func handleStream(deps QueryDeps) httpx.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), opts.MaxDuration)
 		defer cancel()
 
-		return streamRollups(ctx, w, flusher, deps, opts, principal.TenantID, metric)
+		return streamRollups(ctx, w, flusher, deps, opts, principal.TenantID, metric, seed)
 	}
 }
 
 func streamRollups(
 	ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
-	deps QueryDeps, opts StreamOptions, tenantID, metric string,
+	deps QueryDeps, opts StreamOptions, tenantID, metric string, seed int64,
 ) error {
 	log := observability.LoggerFromContext(ctx)
 
-	// Start from now: a tail is for watching what happens next, and replaying
-	// history on connect would flood a client that only wanted the live edge.
-	//
-	// "Now" is asked of the database, not of this process. Rows are stamped by
-	// the database clock, so any skew between the two would either hide events
-	// or replay history -- both silently.
-	seed, err := deps.Reader.NewestWriteTime(ctx, tenantID)
-	if err != nil {
-		// Falling back to the local clock keeps the stream working through a
-		// blip; the cost is at most a little skew on the first poll.
-		log.Warn("could not seed the stream cursor from the database",
-			slog.Any("error", err))
-		seed = deps.now().UTC()
-	}
-	cursor := store.Cursor{Since: seed}
+	cursor := store.Cursor{Revision: seed}
 
 	poll := time.NewTicker(opts.PollInterval)
 	defer poll.Stop()
@@ -292,13 +315,18 @@ func streamRollups(
 		case <-heartbeat.C:
 			// A comment, which the protocol ignores but which keeps an idle
 			// connection from being reaped by an intermediary.
+			if err := streamWriteDeadline(w, opts.WriteTimeout); err != nil {
+				return nil
+			}
 			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
 				return nil
 			}
 			flusher.Flush()
 
 		case <-poll.C:
-			changed, next, err := deps.Reader.Changed(ctx, tenantID, metric, cursor, 500)
+			pollCtx, pollCancel := context.WithTimeout(ctx, opts.QueryTimeout)
+			changed, next, err := deps.Reader.Changed(pollCtx, tenantID, metric, cursor, 500)
+			pollCancel()
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil
@@ -309,6 +337,11 @@ func streamRollups(
 			}
 			cursor = next
 
+			if len(changed) > 0 {
+				if err := streamWriteDeadline(w, opts.WriteTimeout); err != nil {
+					return nil
+				}
+			}
 			for i := range changed {
 				if err := writeEvent(w, &changed[i]); err != nil {
 					// A write failure on a stream means the client
@@ -325,8 +358,19 @@ func streamRollups(
 	}
 }
 
+// Refresh a bounded write deadline for each SSE frame instead of inheriting
+// the server's absolute HTTP response deadline. The context bounds total life.
+func streamWriteDeadline(w http.ResponseWriter, timeout time.Duration) error {
+	err := http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
+	if errors.Is(err, http.ErrNotSupported) {
+		return nil
+	} // e.g. in-memory test recorder
+	return err
+}
+
 func writeEvent(w http.ResponseWriter, r *store.StoredRollup) error {
 	payload, err := json.Marshal(streamEvent{
+		Kind:        r.Kind,
 		Metric:      r.Metric,
 		Labels:      orEmptyLabels(r.Labels),
 		WindowStart: r.WindowStart.UTC(),
@@ -341,7 +385,7 @@ func writeEvent(w http.ResponseWriter, r *store.StoredRollup) error {
 		// The payload is fixed-shape data, so this cannot fail in practice.
 		// Dropping one event is strictly better than tearing down a live
 		// stream over an encoding problem the client cannot act on.
-		return nil //nolint:nilerr // deliberate: skip the event, keep the stream
+		return fmt.Errorf("encode stream event: %w", err)
 	}
 
 	_, err = fmt.Fprintf(w, "event: rollup\ndata: %s\n\n", payload)
