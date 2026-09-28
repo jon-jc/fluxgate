@@ -235,6 +235,14 @@ jobs:
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
+      - name: Reject unmaintained OpenPGP packages in release binaries
+        run: |
+          packages=$(go list -deps ./cmd/ingest-api ./cmd/aggregator ./cmd/query-api ./cmd/migrate)
+          if echo "$packages" | grep -Eq '^golang.org/x/crypto/openpgp(/|$)'; then
+            echo "::error::release binaries must not include the unmaintained OpenPGP packages"
+            exit 1
+          fi
+
   docker:
     name: Container image
     runs-on: ubuntu-latest
