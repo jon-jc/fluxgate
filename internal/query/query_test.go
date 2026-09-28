@@ -503,3 +503,21 @@ func TestSeriesFingerprintIsOrderIndependent(t *testing.T) {
 		t.Error("nil and empty label maps fingerprinted differently")
 	}
 }
+
+func TestBuildSeparatesKindsAndAmbiguousLabels(t *testing.T) {
+	req, _ := parse(Params{Metric: "mixed", Aggregation: "sum"})
+	rows := []store.StoredRollup{
+		{Kind: "gauge", Labels: map[string]string{"a": "x,b=y"}, WindowStart: now, Sum: 1},
+		{Kind: "gauge", Labels: map[string]string{"a": "x", "b": "y"}, WindowStart: now, Sum: 2},
+		{Kind: "histogram", Labels: map[string]string{"a": "x", "b": "y"}, WindowStart: now, Sum: 3},
+	}
+	result := Build(req, rows, DefaultLimits())
+	if result.Kind != "mixed" || len(result.Series) != 3 {
+		t.Fatalf("result=%+v", result)
+	}
+	for _, series := range result.Series {
+		if len(series.Points) != 1 {
+			t.Fatal("distinct series were merged")
+		}
+	}
+}

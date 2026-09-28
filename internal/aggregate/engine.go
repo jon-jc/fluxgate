@@ -192,6 +192,37 @@ func (e *Engine) WindowSize() time.Duration { return e.cfg.WindowSize }
 func (e *Engine) Ingest(batch telemetry.Batch) IngestResult {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	return e.ingestLocked(batch, false)
+}
+
+// ErrCapacity asks the caller to retry after flushing, without losing a subset
+// of an already accepted batch.
+var ErrCapacity = errors.New("aggregation capacity exhausted")
+
+// IngestDurable admits the entire batch or none of it. Previously flushed
+// windows may receive corrections: the durable delivery ledger, not a local
+// watermark, decides whether a contribution was already stored.
+func (e *Engine) IngestDurable(batch telemetry.Batch) (IngestResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	type entry struct {
+		start int64
+		key   SeriesKey
+	}
+	added := make(map[entry]struct{})
+	for _, p := range batch.Points {
+		k := entry{WindowFor(p.Timestamp, e.cfg.WindowSize).Start.UnixNano(), SeriesKeyFor(batch.TenantID, p)}
+		if _, exists := e.windows[k.start][k.key]; !exists {
+			added[k] = struct{}{}
+		}
+	}
+	if e.seriesCount+len(added) > e.cfg.MaxSeries {
+		return IngestResult{}, ErrCapacity
+	}
+	return e.ingestLocked(batch, true), nil
+}
+
+func (e *Engine) ingestLocked(batch telemetry.Batch, corrections bool) IngestResult {
 
 	var (
 		result IngestResult
@@ -210,7 +241,7 @@ func (e *Engine) Ingest(batch telemetry.Batch) IngestResult {
 
 		// A window that has already been emitted cannot take more data without
 		// silently changing a rollup somebody may already have read.
-		if !e.flushedThrough.IsZero() && !window.End.After(e.flushedThrough) {
+		if !corrections && !e.flushedThrough.IsZero() && !window.End.After(e.flushedThrough) {
 			result.Late++
 			e.stats.PointsLate++
 			continue
@@ -218,7 +249,7 @@ func (e *Engine) Ingest(batch telemetry.Batch) IngestResult {
 
 		key := SeriesKeyFor(batch.TenantID, p)
 		series, ok := e.windows[window.Start.UnixNano()]
-		if !ok {
+		if !ok && e.seriesCount < e.cfg.MaxSeries {
 			series = make(map[SeriesKey]*seriesState)
 			e.windows[window.Start.UnixNano()] = series
 		}

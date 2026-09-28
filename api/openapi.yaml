@@ -505,7 +505,7 @@ components:
           type: string
         kind:
           type: string
-          enum: [gauge, counter, histogram]
+          enum: [gauge, counter, histogram, mixed]
         aggregation:
           type: string
         from:
@@ -534,8 +534,11 @@ components:
 
     QuerySeries:
       type: object
-      required: [labels, points]
+      required: [kind, labels, points]
       properties:
+        kind:
+          type: string
+          enum: [gauge, counter, histogram]
         labels:
           type: object
           additionalProperties:

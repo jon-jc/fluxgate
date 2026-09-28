@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	pubsub "cloud.google.com/go/pubsub/v2"
@@ -34,7 +35,20 @@ type Delivery struct {
 
 	// msg is retained so a handler running in manual-acknowledgement mode can
 	// settle the message later, once the work it triggered is durable.
-	msg *pubsub.Message
+	settlement *settlement
+}
+
+// Settlement is signalled to the Receive callback. The Pub/Sub client requires
+// Ack/Nack on that callback's goroutine to keep flow control and leases valid.
+type settlement struct {
+	once sync.Once
+	done chan bool
+}
+
+func (s *settlement) resolve(ack bool) {
+	if s != nil {
+		s.once.Do(func() { s.done <- ack })
+	}
 }
 
 // RequestID returns the correlation ID propagated from the HTTP edge, so a
@@ -45,16 +59,12 @@ func (d Delivery) RequestID() string { return d.Attributes[AttrRequestID] }
 // manual-acknowledgement mode; the second and subsequent calls are ignored by
 // the client.
 func (d Delivery) Ack() {
-	if d.msg != nil {
-		d.msg.Ack()
-	}
+	d.settlement.resolve(true)
 }
 
 // Nack returns the message for redelivery.
 func (d Delivery) Nack() {
-	if d.msg != nil {
-		d.msg.Nack()
-	}
+	d.settlement.resolve(false)
 }
 
 // Handler processes one delivery.
@@ -246,7 +256,7 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 		PublishTime:     msg.PublishTime,
 		DeliveryAttempt: deliveryAttempt(msg),
 		MessageID:       msg.ID,
-		msg:             msg,
+		settlement:      &settlement{done: make(chan bool, 1)},
 	}
 
 	handlerCtx := ctx
@@ -287,6 +297,19 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 	// message once the work it triggered is durable.
 	if !s.manualAck {
 		msg.Ack()
+		return
+	}
+	// Keep the callback active until storage settles the message. Returning
+	// early releases client flow control even while the runner holds the data.
+	select {
+	case ack := <-delivery.settlement.done:
+		if ack {
+			msg.Ack()
+		} else {
+			msg.Nack()
+		}
+	case <-ctx.Done():
+		msg.Nack()
 	}
 }
 

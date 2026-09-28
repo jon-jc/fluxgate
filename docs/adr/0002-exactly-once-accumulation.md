@@ -28,7 +28,7 @@ Three mechanisms together, none of which is sufficient alone:
 2. **Commit rollups and a delivery ledger in one transaction.** No interval
    exists where the data is stored but the batch is not recorded, or the
    reverse.
-3. **Key the ledger on `(batch_id, window_start)`.**
+3. **Key the ledger on `(tenant_id, batch_id, window_start)`.**
 
 The third is the one that is easy to get wrong. A batch straddling a window
 boundary feeds two windows that flush at different times. Keyed on `batch_id`
@@ -53,13 +53,22 @@ means the acknowledgement lease has to be sized generously. And a third state,
 "flushing", for a redelivery that arrives mid-write: the outcome is not knowable
 yet, so the message is handed back rather than guessed at.
 
-**What it does not cover.** Two aggregator instances processing the same batch
-concurrently would both pass the ledger check before either commits. Pub/Sub
-does not deliver one message to two subscribers on the same subscription, so
-this does not arise — but it is a property of the broker, not of this design,
-and it is the assumption to re-examine if the transport ever changes.
+**Concurrent deliveries.** The broker can redeliver while the original consumer
+is still processing. Each flush inserts all delivery claims in its transaction
+before updating totals. An existing claim aborts the whole flush. The consumer
+nacks its deliveries, whose retries rebuild only the uncommitted contributions.
+A duplicate waiting in memory waits for durability; it cannot acknowledge the
+original broker message early. Admission and collection share a lock so a flush
+cannot detach a point from its delivery bookkeeping.
 
-**When to revisit.** If duplicate suppression ever needs to survive a change of
-broker, the check and the write would have to become one atomic operation —
-which in practice means moving the accumulator itself into the database, at a
-large cost in throughput.
+**Late data.** A local watermark cannot establish completeness across replicas.
+Accepted late points and failed writes therefore remain eligible for additive
+corrections. Cardinality pressure rejects the entire batch for redelivery.
+
+**Upgrade.** Migration 0003 adds the tenant to the ledger key and the metric kind
+to the rollup key. Drain old aggregators before applying it, then start only the
+new version. Older binaries use conflict targets that no longer exist. Restore
+from a tested backup for a schema rollback; do not roll back only the image.
+
+**When to revisit.** Frequent overlapping flushes waste work. Measure conflict
+rates and database throughput before considering per-batch durable staging.

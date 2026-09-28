@@ -3,13 +3,18 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/jon-jc/fluxgate/internal/aggregate"
 )
+
+// ErrContributionConflict requires redelivery after an overlapping flush.
+var ErrContributionConflict = errors.New("contribution already committed; rebuild uncommitted windows")
 
 // upsertRollup merges one window's aggregate into the stored row.
 //
@@ -24,14 +29,15 @@ INSERT INTO rollups (
 	window_start, window_end, labels,
 	count, sum, min, max, last, last_event_at, buckets
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-ON CONFLICT (tenant_id, metric, label_hash, window_start) DO UPDATE SET
+ON CONFLICT (tenant_id, metric, kind, label_hash, window_start) DO UPDATE SET
 	count         = rollups.count + EXCLUDED.count,
 	sum           = rollups.sum + EXCLUDED.sum,
 	min           = LEAST(rollups.min, EXCLUDED.min),
 	max           = GREATEST(rollups.max, EXCLUDED.max),
 	last          = CASE
-	                    WHEN EXCLUDED.last_event_at >= rollups.last_event_at
-	                    THEN EXCLUDED.last ELSE rollups.last
+	                    WHEN EXCLUDED.last_event_at > rollups.last_event_at THEN EXCLUDED.last
+                        WHEN EXCLUDED.last_event_at = rollups.last_event_at THEN GREATEST(EXCLUDED.last, rollups.last)
+                        ELSE rollups.last
 	                END,
 	last_event_at = GREATEST(rollups.last_event_at, EXCLUDED.last_event_at),
 	buckets       = fluxgate_array_add(rollups.buckets, EXCLUDED.buckets),
@@ -51,7 +57,7 @@ type Contribution struct {
 
 // Key renders a contribution for use as a map key.
 func (c Contribution) Key() string {
-	return c.BatchID + "@" + c.WindowStart.UTC().Format(time.RFC3339)
+	return c.TenantID + "\x00" + c.BatchID + "@" + c.WindowStart.UTC().Format(time.RFC3339Nano)
 }
 
 // Flush writes a set of rollups and records the contributions that produced
@@ -82,6 +88,41 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 	// Rollback after a successful commit is a no-op, so this is safe to defer
 	// unconditionally and removes every early-return leak.
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	// Claim the ledger entries before applying any totals. A competing replica
+	// may have passed its read check already. Any overlap rolls back the whole
+	// flush, including non-overlapping entries; redelivery rebuilds those safely.
+	claims := append([]Contribution(nil), contributions...)
+	sort.Slice(claims, func(i, j int) bool { return claims[i].Key() < claims[j].Key() })
+	for _, c := range claims {
+		tag, err := tx.Exec(ctx, `INSERT INTO processed_batches (tenant_id, batch_id, window_start)
+   VALUES ($1, $2, $3) ON CONFLICT (tenant_id, batch_id, window_start) DO NOTHING`,
+			c.TenantID, c.BatchID, c.WindowStart)
+		if err != nil {
+			return fmt.Errorf("claim contribution: %w", err)
+		}
+		if tag.RowsAffected() != 1 && len(rollups) > 0 {
+			return ErrContributionConflict
+		}
+	}
+	// Consistent row ordering prevents concurrent multi-series flush deadlocks.
+	rollups = append([]aggregate.Rollup(nil), rollups...)
+	sort.Slice(rollups, func(i, j int) bool {
+		a, b := rollups[i], rollups[j]
+		if a.Key.TenantID != b.Key.TenantID {
+			return a.Key.TenantID < b.Key.TenantID
+		}
+		if a.Key.Metric != b.Key.Metric {
+			return a.Key.Metric < b.Key.Metric
+		}
+		if a.Key.Kind != b.Key.Kind {
+			return a.Key.Kind < b.Key.Kind
+		}
+		if a.Key.LabelHash != b.Key.LabelHash {
+			return a.Key.LabelHash < b.Key.LabelHash
+		}
+		return a.Window.Start.Before(b.Window.Start)
+	})
 
 	batch := &pgx.Batch{}
 
@@ -115,18 +156,6 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 		)
 	}
 
-	for _, c := range contributions {
-		// ON CONFLICT DO NOTHING rather than an error: a duplicate here means
-		// the same contribution was accumulated twice within one flush, which
-		// the in-memory guard should prevent but which must not fail the write
-		// of everything else in the transaction.
-		batch.Queue(`
-			INSERT INTO processed_batches (batch_id, window_start, tenant_id)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (batch_id, window_start) DO NOTHING`,
-			c.BatchID, c.WindowStart, c.TenantID)
-	}
-
 	results := tx.SendBatch(ctx, batch)
 	// Every queued statement must be consumed before the batch can be closed,
 	// or pgx reports the connection as busy on its next use.
@@ -153,14 +182,14 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 // redelivery within one process lifetime, and this covers one that arrives
 // after a restart. Both are needed -- a redelivery before the flush is not in
 // the database yet, and one after a restart is not in memory.
-func (db *DB) SeenContributions(ctx context.Context, batchID string, windows []time.Time) (map[string]bool, error) {
+func (db *DB) SeenContributions(ctx context.Context, tenantID, batchID string, windows []time.Time) (map[string]bool, error) {
 	if batchID == "" || len(windows) == 0 {
 		return map[string]bool{}, nil
 	}
 
 	rows, err := db.pool.Query(ctx, `
 		SELECT window_start FROM processed_batches
-		 WHERE batch_id = $1 AND window_start = ANY($2)`, batchID, windows)
+		 WHERE tenant_id = $1 AND batch_id = $2 AND window_start = ANY($3)`, tenantID, batchID, windows)
 	if err != nil {
 		return nil, fmt.Errorf("seen contributions: %w", err)
 	}
@@ -172,7 +201,7 @@ func (db *DB) SeenContributions(ctx context.Context, batchID string, windows []t
 		if err := rows.Scan(&start); err != nil {
 			return nil, fmt.Errorf("seen contributions: scan: %w", err)
 		}
-		seen[Contribution{BatchID: batchID, WindowStart: start}.Key()] = true
+		seen[Contribution{TenantID: tenantID, BatchID: batchID, WindowStart: start}.Key()] = true
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("seen contributions: %w", err)
@@ -188,8 +217,8 @@ func (db *DB) SeenContributions(ctx context.Context, batchID string, windows []t
 // that can no longer arrive.
 func (db *DB) PruneProcessedBatches(ctx context.Context, olderThan time.Duration) (int64, error) {
 	tag, err := db.pool.Exec(ctx,
-		"DELETE FROM processed_batches WHERE processed_at < now() - $1::interval",
-		olderThan.String())
+		"DELETE FROM processed_batches WHERE processed_at < now() - $1 * interval '1 second'",
+		olderThan.Seconds())
 	if err != nil {
 		return 0, fmt.Errorf("prune processed batches: %w", err)
 	}
@@ -200,8 +229,8 @@ func (db *DB) PruneProcessedBatches(ctx context.Context, olderThan time.Duration
 // horizon.
 func (db *DB) PruneRollups(ctx context.Context, olderThan time.Duration) (int64, error) {
 	tag, err := db.pool.Exec(ctx,
-		"DELETE FROM rollups WHERE window_start < now() - $1::interval",
-		olderThan.String())
+		"DELETE FROM rollups WHERE window_end < now() - $1 * interval '1 second'",
+		olderThan.Seconds())
 	if err != nil {
 		return 0, fmt.Errorf("prune rollups: %w", err)
 	}
