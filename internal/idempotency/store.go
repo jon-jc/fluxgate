@@ -28,6 +28,7 @@ var ErrPayloadMismatch = errors.New("idempotency key reused with a different pay
 // Record is a completed outcome, replayed verbatim on a repeat.
 type Record struct {
 	// Batch is fixed before publishing, including server-assigned timestamps.
+	// Its points are reclaimed after confirmation; the response remains replayable.
 	Batch     telemetry.Batch
 	Published bool
 	// Status is the HTTP status code originally returned.

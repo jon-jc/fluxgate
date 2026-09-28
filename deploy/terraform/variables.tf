@@ -158,11 +158,11 @@ variable "max_delivery_attempts" {
   description = <<-EOT
     Deliveries before a message is dead-lettered.
 
-    Pub/Sub requires 5 to 100. Five distinguishes a transient blip from a
-    genuinely undeliverable message without retrying a hopeless one for hours.
+    Pub/Sub requires 5 to 100. Twenty gives temporary dependency outages
+    time to recover; alerting and the DLQ remain necessary.
   EOT
   type        = number
-  default     = 5
+  default     = 20
 
   validation {
     condition     = var.max_delivery_attempts >= 5 && var.max_delivery_attempts <= 100

@@ -437,7 +437,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			Concurrency:            l.integer("AGGREGATOR_CONCURRENCY", 2),
 			RollupRetention:        l.duration("ROLLUP_RETENTION", 30*24*time.Hour),
 			LedgerRetention:        l.duration("LEDGER_RETENTION", 32*24*time.Hour),
-			PruneInterval:          l.duration("PRUNE_INTERVAL", time.Hour),
+			PruneInterval:          l.duration("PRUNE_INTERVAL", 5*time.Minute),
 		},
 		Query: QueryConfig{
 			StreamMaxConcurrent: l.integer("QUERY_STREAM_MAX_CONCURRENT", 100),

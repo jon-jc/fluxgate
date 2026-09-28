@@ -61,6 +61,8 @@ jobs:
 
       - name: Fuzz every parser boundary
         id: fuzz
+        env:
+          FUZZ_BUDGET: ${{ github.event.inputs.fuzztime || '5m' }}
         run: |
           set -uo pipefail
           # target:package -- one entry per boundary that parses untrusted input.
@@ -74,7 +76,7 @@ jobs:
             "FuzzParseKeys:./internal/auth"
             "FuzzValidatePoint:./internal/telemetry"
           )
-          budget="${{ github.event.inputs.fuzztime || '5m' }}"
+          budget="$FUZZ_BUDGET"
           failed=()
           for entry in "${targets[@]}"; do
             target="${entry%%:*}"

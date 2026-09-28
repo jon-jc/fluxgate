@@ -36,6 +36,8 @@ Linux and Windows. Review dependency upgrades and commit the updated lock.
 
 3. Build and publish `ingest-api`, `aggregator`, `query-api` and `migrate` from the
    same reviewed commit using `build/docker/Dockerfile` and `--build-arg SERVICE`.
+   Pass `--build-arg COMMIT=COMMIT_SHA --build-arg VERSION=RELEASE_VERSION` so the
+   version endpoint identifies the running artifact.
    Use the `image_repository` output. Record the registry digest for each image
    in `images = { ingest = "...@sha256:...", aggregator = "...@sha256:...",
    query = "...@sha256:...", migrate = "...@sha256:..." }`. Tags alone are rejected.
@@ -98,6 +100,10 @@ users, rerun provisioning, and verify permissions before enabling them again.
 Take a verified backup before migrations. Run the new migration image using the
 same owner. **Migrations 0003 and 0005 require stopping every old aggregator before they
 run**: older writers do not understand the new delivery identity constraints or stream revisions.
+Migration 0006 builds the retention index; plan a maintenance window because index
+creation can block writes on large existing tables. Rerun the migration job's
+runtime-role provisioning with this release to grant the row-lock privileges used
+by cleanup. Verify that expired rows drain before resuming normal traffic.
 Existing deployments must move/import the renamed Cloud Run resource addresses
 into `google_cloud_run_v2_service.service["ingest"|"aggregator"|"query"]` and review
 all state changes. Do not apply the bootstrap defaults to an existing live stack.
@@ -118,6 +124,14 @@ observations again. Keep original tenant, batch ID and timestamps during replay.
 Pub/Sub wraps dead-letter messages: unwrap the original envelope before republishing.
 Only acknowledge inspected DLQ messages after successful republish. Diagnose and
 fix the cause first; temporary database or IAM failures also dead-letter messages.
+
+The default delivery-attempt limit is 20. Cleanup runs every five minutes in
+10,000-row transactions, with a 30-second time budget per table. Monitor cleanup
+errors and table growth, and tune the interval against measured traffic. Completed
+ingest retry records discard the original points; pending publishes retain them
+until confirmation or expiry. Point and stream limits apply per service instance,
+so autoscaling changes the total allowance. Hard tenant-wide quotas need a shared
+gateway or another coordinated admission mechanism.
 
 ## Release checks requiring a real staging project
 

@@ -41,6 +41,9 @@ func TestRetryReservationSurvivesNewRepository(t *testing.T) {
 	if err != nil || !found || !replayed.Published || !bytes.Equal(replayed.Body, reserved.Body) {
 		t.Fatalf("replay=%+v found=%v err=%v", replayed, found, err)
 	}
+	if replayed.Batch.ID != reserved.Batch.ID || len(replayed.Batch.Points) != 0 {
+		t.Fatal("completed outcome must preserve its identity and reclaim the telemetry payload")
+	}
 	if _, _, err = second.Get(ctx, tenant, "request", "changed-body"); !errors.Is(err, idempotency.ErrPayloadMismatch) {
 		t.Fatalf("mismatch: %v", err)
 	}

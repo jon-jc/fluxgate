@@ -35,7 +35,7 @@ services:
       - --host-port=0.0.0.0:8085
       - --project=fluxgate-local
     ports:
-      - "8681:8085"
+      - "127.0.0.1:8681:8085"
     healthcheck:
       # The emulator has no health endpoint; a TCP connect is the honest check.
       test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/localhost/8085' || exit 1"]
@@ -52,7 +52,7 @@ services:
       POSTGRES_PASSWORD: fluxgate
       POSTGRES_DB: fluxgate
     ports:
-      - "5442:5432"
+      - "127.0.0.1:5442:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -70,14 +70,17 @@ services:
         SERVICE: ingest-api
     container_name: fluxgate-ingest-api
     depends_on:
+      postgres:
+        condition: service_healthy
       pubsub:
         condition: service_healthy
       jaeger:
         condition: service_started
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       ENVIRONMENT: dev
+      DATABASE_URL: postgres://fluxgate:fluxgate@postgres:5432/fluxgate?sslmode=disable
       LOG_FORMAT: text
       LOG_LEVEL: debug
       GCP_PROJECT_ID: fluxgate-local
@@ -116,7 +119,7 @@ services:
         condition: service_started
     ports:
       # Probes only; the aggregator exposes no API of its own.
-      - "8081:8080"
+      - "127.0.0.1:8081:8080"
     environment:
       ENVIRONMENT: dev
       LOG_FORMAT: text
@@ -156,7 +159,7 @@ services:
       jaeger:
         condition: service_started
     ports:
-      - "8082:8080"
+      - "127.0.0.1:8082:8080"
     environment:
       ENVIRONMENT: dev
       LOG_FORMAT: text
@@ -189,8 +192,8 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "16686:16686"   # UI
-      - "4317:4317"     # OTLP gRPC, which is what the services export to
+      - "127.0.0.1:16686:16686"   # UI
+      - "127.0.0.1:4317:4317"     # OTLP gRPC, which is what the services export to
     # No healthcheck, and nothing gates on one. The services must not depend on
     # the collector being up: an exporter that cannot reach it retries in the
     # background, and instrumentation errors are handled rather than returned.
@@ -210,7 +213,7 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
 
   grafana:
     image: grafana/grafana:11.5.1
@@ -229,7 +232,7 @@ services:
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
 
 volumes:
   postgres-data:

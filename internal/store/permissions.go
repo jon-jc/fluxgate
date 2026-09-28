@@ -56,6 +56,9 @@ func (db *DB) ProvisionRuntimeRoles(ctx context.Context) error {
 		GRANT SELECT, INSERT, DELETE ON processed_batches TO fluxgate_aggregator;
 		GRANT SELECT, INSERT, UPDATE ON tenant_revisions TO fluxgate_aggregator;
 		GRANT SELECT, DELETE ON ingest_requests TO fluxgate_aggregator;
+		-- SELECT FOR UPDATE used by retention requires an UPDATE privilege.
+		GRANT UPDATE (expires_at) ON ingest_requests TO fluxgate_aggregator;
+		GRANT UPDATE (processed_at) ON processed_batches TO fluxgate_aggregator;
 		GRANT SELECT ON rollups TO fluxgate_query;
 		GRANT SELECT ON tenant_revisions TO fluxgate_query;
 	`)

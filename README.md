@@ -13,6 +13,7 @@ delivery, duplicate suppression, late-arriving data, and clean shutdown.
 flowchart LR
     C[Clients] -->|POST /v1/ingest| I[ingest-api]
     I -->|bounded queue<br/>batched publish| T((telemetry.raw))
+    I -->|durable retry reservations| P[(Postgres)]
     T --> A[aggregator]
     A -->|windowed rollups| P[(Postgres)]
     A -.->|poison messages| D((telemetry.dlq))
@@ -49,9 +50,9 @@ CPU throttling the flush timer would be throttled to a stop, and windows would
 only be written when a message happened to arrive.
 
 Permissions are split by what each service actually does. The ingest API holds
-no database credentials at all; the query API holds no Pub/Sub permissions. A
-compromise of one does not reach what the other can touch, and that is enforced
-by IAM rather than by discipline.
+credentials restricted to retry reservations; the query API holds no Pub/Sub
+permissions and can only read rollups and stream revisions. The separate migration
+job owns the schema. IAM and database grants enforce these service boundaries.
 
 ## Decision records
 
@@ -721,7 +722,7 @@ The ones that most often need changing:
 | `ENVIRONMENT` | `local` | `local`, `dev`, `staging` or `prod` |
 | `AUTH_DISABLED` | `true` on `local`, else `false` | Validation **refuses** `true` on staging and prod |
 | `API_KEYS` / `API_KEYS_FILE` | — | Required whenever authentication is on |
-| `RATE_LIMIT_POINTS_PER_SECOND` | `10000` | Per tenant; a key may override it |
+| `RATE_LIMIT_POINTS_PER_SECOND` | `10000` | Per tenant per instance; a key may override it |
 | `PUBSUB_ENABLED` | `false` on `local`, else `true` | Validation **refuses** `false` on staging and prod |
 | `GCP_PROJECT_ID` | -- | Required when the transport is enabled |
 | `PUBSUB_EMULATOR_HOST` | -- | Setting it also enables the transport and topology bootstrap |
@@ -822,3 +823,26 @@ Broker messages undergo the same structural checks, without rejecting retained
 messages based on their age at delivery. API key documents require one complete
 JSON array, bounded printable tenant identities, and simple ASCII key identifiers.
 Readiness reports dependency status publicly and keeps error details in logs.
+
+
+Run `python scripts/verify_pipeline.py` with Docker available to build all four
+images and verify the packaged pipeline. It creates an isolated network, uses
+random loopback ports, and removes its containers/volumes afterward. The check
+covers two ingest replicas, persisted retry identities, exact totals, tenant
+isolation, forced aggregator termination before commit, database outages, and
+multi-chunk retention under restricted database roles. CI runs the same check.
+Local Compose ports also bind only to loopback, and ingest uses PostgreSQL retry
+storage. Retention runs every five minutes in bounded 10,000-row transactions,
+with a 30-second deadline per table per pass. Monitor errors/disk growth if
+cleanup cannot keep up; size and test against your actual cardinality and traffic.
+
+Confirmed retry reservations reclaim their telemetry payload immediately, keeping
+only identity, fingerprint and response for the remaining TTL. Pending or
+ambiguous publishes retain the original points so retries remain safe.
+
+Migration 0006 adds the retention index; rerun the migration job with
+`-grant-runtime-roles` to install the cleanup privileges. Index creation can block
+writes on an existing large table, so use the planned migration maintenance window.
+Rate limits and stream limits apply per instance. Scaling replicas multiplies
+the available allowance; use a shared gateway quota if a tenant-wide hard cap is
+required.

@@ -91,7 +91,9 @@ func (p *Postgres) Reserve(ctx context.Context, tenantID, key string, candidate 
 // Complete confirms publication of this exact reservation. A timeout can leave
 // it pending even after broker acceptance; retrying republishes the same batch.
 func (p *Postgres) Complete(ctx context.Context, tenantID, key, batchID string) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE ingest_requests SET published=true
+	// Confirmed outcomes need only identity/fingerprint/response. Keeping every
+	// telemetry payload for the full retry TTL would dominate database storage.
+	tag, err := p.pool.Exec(ctx, `UPDATE ingest_requests SET published=true, batch=batch-'Points'
 	 WHERE tenant_id=$1 AND idempotency_key=$2 AND batch->>'ID'=$3 AND expires_at > now()`, tenantID, key, batchID)
 	if err != nil {
 		return fmt.Errorf("complete retry reservation: %w", err)

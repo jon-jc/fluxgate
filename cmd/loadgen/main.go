@@ -10,6 +10,7 @@ package main
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -45,6 +46,7 @@ type config struct {
 	metrics     int
 	hosts       int
 	idempotency bool
+	runID       string
 }
 
 func parseFlags() config {
@@ -72,6 +74,10 @@ type result struct {
 }
 
 func run(cfg config) error {
+	if cfg.workers < 1 || cfg.workers > 1000 || cfg.batchSize < 1 || cfg.batchSize > 1000 || cfg.metrics < 1 || cfg.hosts < 1 || cfg.duration <= 0 || cfg.rate < 0 || cfg.rate > 1_000_000 {
+		return fmt.Errorf("workers/batch must be 1..1000, metrics/hosts/duration positive, and rate 0..1000000")
+	}
+	cfg.runID = cryptorand.Text()
 	ctx, stop := signal.NotifyContext(
 		context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -217,7 +223,7 @@ func send(
 	req.Header.Set("Authorization", "Bearer "+cfg.apiKey)
 
 	if cfg.idempotency {
-		req.Header.Set("Idempotency-Key", fmt.Sprintf("loadgen-%d-%d", worker, seq))
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("loadgen-%s-%d-%d", cfg.runID, worker, seq))
 	}
 
 	resp, err := client.Do(req)
@@ -305,12 +311,15 @@ func report(s summary, cfg config) error {
 		}
 	}
 
-	// A non-zero exit on server errors, so this is usable in a script that
+	// A non-zero exit on HTTP or transport errors, so this is usable in a script that
 	// needs to know whether the run was clean.
 	for code, count := range s.byStatus {
-		if code >= 500 {
+		if code >= 400 {
 			return fmt.Errorf("%d responses with status %d", count, code)
 		}
+	}
+	if s.errors > 0 {
+		return fmt.Errorf("%d transport errors", s.errors)
 	}
 	return nil
 }
