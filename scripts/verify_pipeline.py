@@ -6,12 +6,14 @@ ports and local test credentials. Removes only resources created by this run.
 """
 
 import argparse
+from collections import Counter
 import concurrent.futures
 import datetime as dt
 import hashlib
 import json
 from pathlib import Path
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -46,12 +48,133 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def verify_load(batches, ingest_urls, query_base, health_urls, request, inspect):
+    """Reconcile every series after bounded concurrent traffic and replica retries."""
+    kinds = ("counter", "gauge", "histogram")
+    timestamp = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)).isoformat()
+    expected = {}
+    for n in range(batches * 500):
+        key = (kinds[n % 3], str(n % 200))
+        value = n % 17 + 1
+        row = expected.setdefault(key, dict(count=0, sum=0, min=value, max=value, last=value))
+        row["count"] += 1
+        row["sum"] += value
+        row["min"] = min(row["min"], value)
+        row["max"] = max(row["max"], value)
+        # Equal timestamps use the higher value as the deterministic last.
+        row["last"] = row["max"]
+
+    samples, probe_errors = {}, []
+    stopped = threading.Event()
+    aborted = threading.Event()
+
+    def probe():
+        while not stopped.is_set():
+            try:
+                for name, base in health_urls.items():
+                    require(request(base + "/healthz")[0] == 200, f"{name} liveness failed under load")
+                    text = request(base + "/metrics", raw=True)[1]
+                    rss = next(float(line.split()[1]) for line in text.splitlines()
+                               if line.startswith("process_resident_memory_bytes "))
+                    samples[name] = max(samples.get(name, 0), rss)
+            except Exception as exc:
+                probe_errors.append(str(exc))
+            stopped.wait(1)
+
+    monitor = threading.Thread(target=probe, daemon=True)
+
+    def send_batch(index):
+        pair_started = time.monotonic()
+        points = [dict(metric="verify.pressure." + kinds[n % 3], kind=kinds[n % 3],
+                       value=n % 17 + 1, timestamp=timestamp,
+                       labels=dict(host=str(n % 200), region="test", detail="x" * 128))
+                  for n in range(index * 500, (index + 1) * 500)]
+        body = {"points": points}
+        batch_id = None
+        observations = []
+        for replica in (index % 2, (index + 1) % 2):
+            deadline = time.monotonic() + 60
+            while True:
+                require(not aborted.is_set(), "load stopped after a prior worker failure")
+                started = time.monotonic()
+                code, result, headers = request(ingest_urls[replica], body, idem=f"pressure-{index}")
+                observations.append((code, time.monotonic() - started))
+                if code == 202:
+                    require(result["accepted"] == 500 and result["rejected"] == 0, "load batch partially accepted")
+                    require(batch_id is None or result["batch_id"] == batch_id, "load retry changed identity")
+                    batch_id = result["batch_id"]
+                    break
+                require(code in (429, 503), f"unexpected load status: {code}: {result}")
+                require(time.monotonic() < deadline, "load retry deadline exceeded")
+                time.sleep(min(5, max(0.1, float(headers.get("Retry-After", "1")))))
+        return observations, time.monotonic() - pair_started
+
+    def guarded_batch(index):
+        try:
+            require(not aborted.is_set(), "load stopped after a prior worker failure")
+            return send_batch(index)
+        except Exception:
+            # Executor.map queues the whole run. Fail remaining work promptly
+            # instead of spending a retry deadline on every queued batch.
+            aborted.set()
+            raise
+
+    started = time.monotonic()
+    monitor.start()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(guarded_batch, range(batches)))
+        observations = [item for batch, _ in results for item in batch]
+        pair_times = sorted(duration for _, duration in results)
+        submitted = time.monotonic() - started
+
+        def reconcile():
+            for kind in kinds:
+                for agg in ("count", "sum", "min", "max", "last"):
+                    url = f"{query_base}/v1/query?from=-1h&metric=verify.pressure.{kind}&agg={agg}"
+                    code, result, _ = request(url)
+                    require(code == 200 and not result.get("truncated"), "load query failed or truncated")
+                    actual = {}
+                    for series in result["series"]:
+                        require(series["kind"] == kind, "metric kind changed under load")
+                        require(len(series["points"]) == 1, "fixed-timestamp load split across windows")
+                        actual[series["labels"]["host"]] = series["points"][0]["v"]
+                    wanted = {host: row[agg] for (typ, host), row in expected.items() if typ == kind}
+                    if actual != wanted:
+                        return False
+            return True
+
+        wait_for("every load series and aggregate reconciled", reconcile, timeout=120)
+        elapsed = time.monotonic() - started
+    finally:
+        stopped.set()
+        monitor.join(timeout=65)
+    require(not monitor.is_alive() and not probe_errors, f"load probes failed: {probe_errors}")
+    require(len(samples) == len(health_urls), "memory/liveness probes did not cover every service")
+    for name in health_urls:
+        state = inspect(name)
+        require(state["Running"] and not state["OOMKilled"] and state["RestartCount"] == 0,
+                f"{name} restarted or exceeded memory under load")
+    accepted = sorted(latency for code, latency in observations if code == 202)
+    report = dict(points=batches * 500, series=len(expected), requests=len(observations),
+                  statuses=dict(Counter(code for code, _ in observations)),
+                  submit_seconds=round(submitted, 3), reconcile_seconds=round(elapsed, 3),
+                  accepted_attempt_p95_ms=round(accepted[int((len(accepted) - 1) * .95)] * 1000, 2),
+                  batch_pair_p95_ms=round(pair_times[int((len(pair_times) - 1) * .95)] * 1000, 2),
+                  sampled_peak_rss_mib={name: round(rss / 1024**2, 2) for name, rss in samples.items()})
+    print("PASS: load reconciliation " + json.dumps(report, sort_keys=True), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--image-prefix", default="fluxgate-validation")
     parser.add_argument("--tag", default="local")
+    parser.add_argument("--load-batches", type=int, default=0,
+                        help="also reconcile 500 points per batch under 16 concurrent clients (0..2000)")
     args = parser.parse_args()
+    if not 0 <= args.load_batches <= 2000:
+        parser.error("--load-batches must be 0..2000")
     images = {service: f"{args.image_prefix}/{service}:{args.tag}"
               for service in ("ingest-api", "aggregator", "query-api", "migrate")}
     if not args.skip_build:
@@ -183,6 +306,13 @@ def main():
         wait_for("40 unique points counted once", lambda: total("verify.load") == 40)
         require(total("verify.load", "b") == 0, "tenant isolation failed")
         print("PASS: auth, 40 concurrent requests, cross-replica/restart retries, exact totals and tenant isolation", flush=True)
+
+        if args.load_batches:
+            def inspect(name):
+                info = json.loads(command("docker", "inspect", name))[0]
+                return dict(info["State"], RestartCount=info["RestartCount"])
+            verify_load(args.load_batches, ingest_urls, base_url(reader),
+                        {name: base_url(name) for name in (first, second, aggregator, reader)}, request, inspect)
 
         # A future window cannot flush before the process is killed. Confirm the
         # message entered the engine, then kill it without a graceful final flush.
