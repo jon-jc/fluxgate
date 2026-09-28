@@ -37,9 +37,9 @@ resource "google_pubsub_subscription" "aggregator" {
 
   ack_deadline_seconds       = var.ack_deadline_seconds
   message_retention_duration = var.message_retention
-  # An acknowledged message is gone. Retaining them would mean a redeployed
-  # subscription silently reprocesses history the ledger would then suppress,
-  # burning quota to reach the same state.
+  # Normal delivery excludes acknowledged messages. Topic retention above still
+  # permits explicit replay after an incident; a database restore does not rewind
+  # subscription acknowledgments. Coordinate seek with the restored ledger.
   retain_acked_messages = false
 
   # Without an explicit retry policy a nacked message returns immediately. A

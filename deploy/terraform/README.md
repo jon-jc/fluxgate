@@ -136,6 +136,29 @@ gateway or another coordinated admission mechanism.
 
 ## Release checks requiring a real staging project
 
+A database restore does not rewind Pub/Sub acknowledgments. Keep consumers stopped
+while selecting a recovery point covered by retained topic messages or a matching
+snapshot, then deliberately replay and reconcile before reopening traffic. Topic
+retention permits this even though the subscription's `retain_acked_messages` is
+false; a routine redeploy does not trigger replay. Seek uses publication time and
+is eventually consistent. Follow the [Pub/Sub replay guide](https://cloud.google.com/pubsub/docs/replay-overview)
+and measure the procedure in staging.
+
+Restore `rollups`, `processed_batches`, `ingest_requests`, `tenant_revisions` and
+`schema_migrations` as one consistent database. Reapply runtime-role provisioning
+before starting services. If retry reservations were lost after the recovery point,
+keep ingestion closed until those records are recovered or affected clients have
+completed a coordinated cutover and stopped pre-restore retries. Broker replay
+alone cannot rebuild HTTP retry outcomes. Keep original message identities during
+replay and keep the recovery range inside the restored ledger's coverage.
+
+`scripts/verify_pipeline.py` also exercises a quiesced local logical backup and
+restore into a separate database. It compares all five tables, starts the restored
+services with restricted users, checks HTTP retry identity/conflicts, republishes
+an old batch to verify ledger suppression, and verifies a new write. This checks
+application recovery; it does not certify Cloud SQL PITR, an RPO/RTO, or recovery
+from a backup that lost accepted writes.
+
 - Confirm private SQL connectivity and denial of cross-service table access.
 - Publish, retry across replicas/restarts, query totals and compare to sent data.
 - Terminate aggregators mid-window, interrupt database connectivity, and verify
