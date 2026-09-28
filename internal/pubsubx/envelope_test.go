@@ -197,17 +197,9 @@ func DecodeEnvelopeErr() error {
 	return err
 }
 
-func TestEmptyBatchEncodesToAnEmptyPointList(t *testing.T) {
-	// The edge never publishes an empty batch, but the encoding must not
-	// produce a null that a consumer would then have to special-case.
-	envelope := NewEnvelope(telemetry.Batch{ID: "b", TenantID: "t"})
-
-	data, err := envelope.Encode()
-	if err != nil {
-		t.Fatalf("Encode: %v", err)
-	}
-	if !strings.Contains(string(data), `"points":[]`) {
-		t.Errorf("encoded as %s, want an empty array rather than null", data)
+func TestEmptyBatchCannotBePublished(t *testing.T) {
+	if _, err := NewEnvelope(telemetry.Batch{ID: "b", TenantID: "t", ReceivedAt: time.Now()}).Encode(); err == nil {
+		t.Fatal("empty batch accepted")
 	}
 }
 
@@ -216,9 +208,10 @@ func TestTimestampsSurviveAsUTC(t *testing.T) {
 	ts := time.Date(2026, 9, 3, 21, 0, 0, 0, tokyo)
 
 	batch := telemetry.Batch{
-		ID:       "b",
-		TenantID: "t",
-		Points:   []telemetry.Point{{Metric: "a.b", Kind: telemetry.KindGauge, Timestamp: ts}},
+		ID:         "b",
+		ReceivedAt: ts,
+		TenantID:   "t",
+		Points:     []telemetry.Point{{Metric: "a.b", Kind: telemetry.KindGauge, Timestamp: ts}},
 	}
 
 	data, err := NewEnvelope(batch).Encode()

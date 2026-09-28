@@ -112,7 +112,8 @@ func (h *Health) ReadinessHandler() http.Handler {
 			if err != nil {
 				code = http.StatusServiceUnavailable
 				body.Status = "degraded"
-				body.Checks[name] = err.Error()
+				body.Checks[name] = "unavailable"
+				LoggerFromContext(ctx).Warn("readiness dependency failed", "dependency", name, "error", err)
 				continue
 			}
 			body.Checks[name] = "ok"

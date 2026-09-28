@@ -811,3 +811,14 @@ deadline per frame. Query responses set `truncated` when the database row limit
 cuts off results; use a smaller time range or label filter to retrieve the rest.
 Migration 0005 adds commit revisions: stop old aggregators, run the migration and
 runtime-role provisioning, then deploy both new aggregators and query services.
+
+
+The input contract requires an explicit numeric `value` (zero is valid, missing
+or null is not), bounded to ±1e100 to keep aggregates finite. Counters carry
+nonnegative increments, not cumulative totals. Explicit zero timestamps are
+invalid; only omitted/null timestamps use arrival time. Last-value ordering uses
+PostgreSQL microsecond precision, choosing the higher value for a tied timestamp.
+Broker messages undergo the same structural checks, without rejecting retained
+messages based on their age at delivery. API key documents require one complete
+JSON array, bounded printable tenant identities, and simple ASCII key identifiers.
+Readiness reports dependency status publicly and keeps error details in logs.

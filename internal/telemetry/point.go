@@ -22,7 +22,7 @@ const (
 	// KindGauge is a point-in-time measurement that can move in any direction,
 	// such as a queue depth.
 	KindGauge Kind = "gauge"
-	// KindCounter is a monotonically increasing total, such as requests served.
+	// KindCounter is a nonnegative increment, such as requests since last report.
 	KindCounter Kind = "counter"
 	// KindHistogram is an observation to be bucketed for distribution
 	// analysis, such as a request duration.
@@ -120,6 +120,16 @@ func DefaultLimits() Limits {
 // as __tenant and pollute another tenant's series.
 const ReservedLabelPrefix = "__"
 
+// MaxValueMagnitude keeps accumulated sums finite even up to an int64 count.
+const MaxValueMagnitude = 1e100
+
+// ValidIdentity bounds routing/database keys and excludes ambiguous whitespace
+// and control characters, including PostgreSQL's unsupported NUL character.
+func ValidIdentity(s string) bool {
+	return s != "" && len(s) <= 255 && utf8.ValidString(s) &&
+		strings.TrimSpace(s) == s && strings.IndexFunc(s, isControl) < 0
+}
+
 // Validator applies the ingestion rules.
 //
 // Clock is injectable so that timestamp-window tests are deterministic rather
@@ -156,6 +166,16 @@ func (v Validator) Now() time.Time {
 // index positions the point within its batch so the returned field paths point
 // at the exact element the submitter needs to fix.
 func (v Validator) ValidatePoint(index int, p Point) []Violation {
+	return v.validatePoint(index, p, true)
+}
+
+// ValidateStoredPoint enforces the domain contract on broker/replay data without
+// rejecting a valid point merely because it spent time awaiting delivery.
+func (v Validator) ValidateStoredPoint(index int, p Point) []Violation {
+	return v.validatePoint(index, p, false)
+}
+
+func (v Validator) validatePoint(index int, p Point, checkAge bool) []Violation {
 	prefix := fmt.Sprintf("points.%d", index)
 	var violations []Violation
 
@@ -181,13 +201,15 @@ func (v Validator) ValidatePoint(index int, p Point) []Violation {
 		add("value", "must be a finite number, got NaN")
 	case math.IsInf(p.Value, 0):
 		add("value", "must be a finite number, got infinity")
+	case math.Abs(p.Value) > MaxValueMagnitude:
+		add("value", "absolute value must not exceed 1e100")
 	}
 
 	if p.Kind == KindCounter && p.Value < 0 {
 		add("value", "must not be negative for a counter")
 	}
 
-	violations = append(violations, v.validateTimestamp(prefix, p.Timestamp)...)
+	violations = append(violations, v.validateTimestamp(prefix, p.Timestamp, checkAge)...)
 	violations = append(violations, v.validateLabels(prefix, p.Labels)...)
 
 	return violations
@@ -220,12 +242,18 @@ func (v Validator) validateMetricName(name string) string {
 	return ""
 }
 
-func (v Validator) validateTimestamp(prefix string, ts time.Time) []Violation {
+func (v Validator) validateTimestamp(prefix string, ts time.Time, checkAge bool) []Violation {
 	if ts.IsZero() {
 		// An absent timestamp is filled in with the arrival time before
 		// validation, so a zero value here means the caller sent something
 		// that parsed to the zero instant.
 		return []Violation{{Field: prefix + ".timestamp", Message: "is required"}}
+	}
+	if ts.Year() < 1678 || ts.Year() > 2261 {
+		return []Violation{{Field: prefix + ".timestamp", Message: "year must be between 1678 and 2261"}}
+	}
+	if !checkAge {
+		return nil
 	}
 
 	now := v.Now()

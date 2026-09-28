@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -452,12 +453,12 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 		Telemetry: TelemetryConfig{
 			TracingEnabled: l.boolean("TRACING_ENABLED", otlpEndpoint != ""),
 			OTLPEndpoint:   otlpEndpoint,
-			OTLPInsecure:   l.boolean("OTEL_EXPORTER_OTLP_INSECURE", true),
+			OTLPInsecure:   l.boolean("OTEL_EXPORTER_OTLP_INSECURE", !env.IsProduction()),
 			// Sampling everything is affordable while developing and ruinous
 			// at ingest volumes, so the default follows the tier.
 			TraceSampleRatio:   l.float("TRACE_SAMPLE_RATIO", defaultSampleRatio(env)),
 			TraceExportTimeout: l.duration("TRACE_EXPORT_TIMEOUT", 10*time.Second),
-			MetricsEnabled:     l.boolean("METRICS_ENABLED", true),
+			MetricsEnabled:     l.boolean("METRICS_ENABLED", !env.IsProduction()),
 			MetricsPath:        l.str("METRICS_PATH", "/metrics"),
 		},
 	}
@@ -508,6 +509,7 @@ func (c Config) validate(l *loader) {
 		l.reject("SHUTDOWN_DRAIN_TIMEOUT", "must be greater than zero")
 	}
 
+	c.validateRuntimeBounds(l)
 	c.validateAuth(l)
 	c.validateIngest(l)
 	c.validatePubSub(l)
@@ -515,6 +517,79 @@ func (c Config) validate(l *loader) {
 	c.validateAggregator(l)
 	c.validateQuery(l)
 	c.validateTelemetry(l)
+}
+
+// Reject disabled deadlines and ticker panics before the process becomes ready.
+func (c Config) validateRuntimeBounds(l *loader) {
+	positive := map[string]time.Duration{
+		"HTTP_READ_HEADER_TIMEOUT":   c.HTTP.ReadHeaderTimeout,
+		"HTTP_READ_TIMEOUT":          c.HTTP.ReadTimeout,
+		"HTTP_WRITE_TIMEOUT":         c.HTTP.WriteTimeout,
+		"HTTP_IDLE_TIMEOUT":          c.HTTP.IdleTimeout,
+		"HTTP_HANDLER_TIMEOUT":       c.HTTP.HandlerTimeout,
+		"QUERY_DEFAULT_RANGE":        c.Query.DefaultRange,
+		"QUERY_STREAM_POLL_INTERVAL": c.Query.StreamPollInterval,
+		"QUERY_STREAM_HEARTBEAT":     c.Query.StreamHeartbeat,
+		"QUERY_STREAM_MAX_DURATION":  c.Query.StreamMaxDuration,
+		"TRACE_EXPORT_TIMEOUT":       c.Telemetry.TraceExportTimeout,
+	}
+	if c.Database.DSN != "" {
+		positive["DATABASE_CONNECT_TIMEOUT"] = c.Database.ConnectTimeout
+		positive["DATABASE_MAX_CONN_LIFETIME"] = c.Database.MaxConnLifetime
+	}
+	if l.requirements.Aggregator {
+		positive["AGGREGATOR_IDLE_TIMEOUT"] = c.Aggregator.IdleTimeout
+	}
+	for key, duration := range positive {
+		if duration <= 0 {
+			l.reject(key, "must be greater than zero")
+		}
+	}
+	if c.Database.MinConns < 0 {
+		l.reject("DATABASE_MIN_CONNS", "must not be negative")
+	}
+	if c.Ingest.MaxPointsPerBatch > 1000 {
+		l.reject("INGEST_MAX_POINTS_PER_BATCH", "must not exceed the broker envelope limit of 1000")
+	}
+	if c.Telemetry.MetricsEnabled {
+		path := c.Telemetry.MetricsPath
+		if !regexp.MustCompile(`^/[a-zA-Z0-9/_-]+$`).MatchString(path) || strings.HasPrefix(path, "/v1") || path == "/healthz" || path == "/readyz" {
+			l.reject("METRICS_PATH", "must be a literal path outside reserved API/probe routes")
+		}
+		if l.requirements.Auth && c.Environment.IsProduction() {
+			l.reject("METRICS_ENABLED", "public API scraping is disabled on staging/prod; use platform metrics")
+		}
+	}
+	if l.requirements.Aggregator {
+		if c.Aggregator.Concurrency <= 0 {
+			l.reject("AGGREGATOR_CONCURRENCY", "must be greater than zero")
+		}
+		if c.Aggregator.MaxOutstandingMessages <= 0 {
+			l.reject("AGGREGATOR_MAX_OUTSTANDING_MESSAGES", "must be greater than zero")
+		}
+		if c.Aggregator.WindowSize%time.Microsecond != 0 {
+			l.reject("AGGREGATOR_WINDOW_SIZE", "must be a whole number of microseconds for PostgreSQL window identities")
+		}
+	}
+	if l.requirements.PubSub && c.PubSub.Enabled {
+		if c.PubSub.BatchCount <= 0 || c.PubSub.BatchCount > 1000 {
+			l.reject("PUBSUB_BATCH_COUNT", "must be from 1 through 1000")
+		}
+		if c.PubSub.BatchDelay <= 0 {
+			l.reject("PUBSUB_BATCH_DELAY", "must be greater than zero")
+		}
+		if c.PubSub.BreakerCooldown <= 0 {
+			l.reject("PUBSUB_BREAKER_COOLDOWN", "must be greater than zero")
+		}
+		for key, duration := range map[string]time.Duration{"PUBSUB_RETENTION": c.PubSub.Retention, "PUBSUB_DLQ_RETENTION": c.PubSub.DeadLetterRetention} {
+			if duration < 10*time.Minute || duration > 31*24*time.Hour {
+				l.reject(key, "must be between 10m and 744h")
+			}
+		}
+	}
+	if c.Ingest.IdempotencyTTL > 7*24*time.Hour {
+		l.reject("IDEMPOTENCY_TTL", "must not exceed 168h; align the delivery ledger retention with this horizon")
+	}
 }
 
 // defaultSampleRatio trades completeness for cost by tier.
@@ -606,6 +681,9 @@ func (c Config) validateAggregator(l *loader) {
 	// publish round trip already costs tens of milliseconds -- and it is the
 	// kind of value that looks plausible in a config file while producing
 	// rollups nobody can interpret.
+	if c.Aggregator.WindowSize > 24*time.Hour {
+		l.reject("AGGREGATOR_WINDOW_SIZE", "must not exceed 24h")
+	}
 	if c.Aggregator.WindowSize < time.Second {
 		l.reject("AGGREGATOR_WINDOW_SIZE", "must be at least 1s")
 	}

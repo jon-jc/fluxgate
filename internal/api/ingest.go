@@ -47,7 +47,7 @@ const maxIdempotencyKeyLen = 255
 type pointPayload struct {
 	Metric    string            `json:"metric"`
 	Kind      string            `json:"kind"`
-	Value     float64           `json:"value"`
+	Value     *float64          `json:"value"`
 	Timestamp *time.Time        `json:"timestamp,omitempty"`
 	Labels    map[string]string `json:"labels,omitempty"`
 }
@@ -202,16 +202,21 @@ func (deps IngestDeps) validate(
 	var fieldErrors []httpx.FieldError
 
 	for i, p := range payloads {
+		if p.Value == nil {
+			fieldErrors = append(fieldErrors, httpx.FieldError{Field: fmt.Sprintf("points.%d.value", i), Message: "is required and must be a number"})
+			continue
+		}
 		point := telemetry.Point{
 			Metric: p.Metric,
 			Kind:   telemetry.Kind(p.Kind),
-			Value:  p.Value,
+			Value:  *p.Value,
 			Labels: p.Labels,
 		}
 		if p.Timestamp != nil {
-			point.Timestamp = *p.Timestamp
+			point.Timestamp = p.Timestamp.UTC()
+		} else {
+			point.Timestamp = receivedAt
 		}
-		point = point.Normalize(receivedAt)
 
 		violations := deps.Validator.ValidatePoint(i, point)
 		if len(violations) == 0 {

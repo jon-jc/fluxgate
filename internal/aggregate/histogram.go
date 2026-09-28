@@ -48,7 +48,11 @@ func bucketFor(v float64) int {
 	if v <= histogramMin {
 		return 0
 	}
-	idx := int(math.Log(v/histogramMin) / math.Log(histogramGrowth))
+	if math.IsInf(v, 1) {
+		return histogramBuckets
+	}
+	// Divide in log space: v/histogramMin overflows for large finite values.
+	idx := int((math.Log(v) - math.Log(histogramMin)) / math.Log(histogramGrowth))
 	if idx < 0 {
 		return 0
 	}

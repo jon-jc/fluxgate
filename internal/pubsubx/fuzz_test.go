@@ -136,6 +136,10 @@ func FuzzEnvelopeRoundTrip(f *testing.F) {
 			}},
 		}
 
+		// Only batches satisfying the public domain contract can be published.
+		if err := NewEnvelope(original).validate(); err != nil {
+			t.Skip()
+		}
 		data, err := NewEnvelope(original).Encode()
 		if err != nil {
 			// An unencodable value is a bug in the encoder, not a fuzz finding

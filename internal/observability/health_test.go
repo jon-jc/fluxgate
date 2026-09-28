@@ -89,8 +89,8 @@ func TestReadinessReportsPerDependencyDetail(t *testing.T) {
 		t.Errorf("pubsub check = %q, want ok", body.Checks["pubsub"])
 	}
 	// Naming the failing dependency turns a page into a diagnosis.
-	if body.Checks["postgres"] != "too many connections" {
-		t.Errorf("postgres check = %q, want the failure reason", body.Checks["postgres"])
+	if body.Checks["postgres"] != "unavailable" {
+		t.Errorf("postgres check = %q, want a redacted failure", body.Checks["postgres"])
 	}
 }
 
