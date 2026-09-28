@@ -121,15 +121,16 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 	// flush, including non-overlapping entries; redelivery rebuilds those safely.
 	claims := append([]Contribution(nil), contributions...)
 	sort.Slice(claims, func(i, j int) bool { return claims[i].Key() < claims[j].Key() })
-	for _, c := range claims {
-		tag, err := tx.Exec(ctx, `INSERT INTO processed_batches (tenant_id, batch_id, window_start)
+	claimBatch := &pgx.Batch{}
+	for i, c := range claims {
+		claimBatch.Queue(`INSERT INTO processed_batches (tenant_id, batch_id, window_start)
    VALUES ($1, $2, $3) ON CONFLICT (tenant_id, batch_id, window_start) DO NOTHING`,
 			c.TenantID, c.BatchID, c.WindowStart)
-		if err != nil {
-			return fmt.Errorf("claim contribution: %w", err)
-		}
-		if tag.RowsAffected() != 1 && len(rollups) > 0 {
-			return ErrContributionConflict
+		if claimBatch.Len() == flushBatchRows || i == len(claims)-1 {
+			if err := executeFlushBatch(ctx, tx, claimBatch, len(rollups) > 0); err != nil {
+				return fmt.Errorf("claim contributions: %w", err)
+			}
+			claimBatch = &pgx.Batch{}
 		}
 	}
 	// Consistent row ordering prevents concurrent multi-series flush deadlocks.
@@ -182,25 +183,38 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 			buckets,
 			revisions[r.Key.TenantID],
 		)
-	}
-
-	results := tx.SendBatch(ctx, batch)
-	// Every queued statement must be consumed before the batch can be closed,
-	// or pgx reports the connection as busy on its next use.
-	for i := range batch.Len() {
-		if _, err := results.Exec(); err != nil {
-			_ = results.Close()
-			return fmt.Errorf("flush: statement %d of %d: %w", i+1, batch.Len(), err)
+		if batch.Len() == flushBatchRows || i == len(rollups)-1 {
+			if err := executeFlushBatch(ctx, tx, batch, false); err != nil {
+				return fmt.Errorf("write rollups: %w", err)
+			}
+			batch = &pgx.Batch{}
 		}
-	}
-	if err := results.Close(); err != nil {
-		return fmt.Errorf("flush: close batch: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("flush: commit: %w", err)
 	}
 	return nil
+}
+
+// Bound encoded SQL buffers while retaining ONE transaction for every claim
+// and rollup. A later chunk failure must roll back all earlier chunks.
+const flushBatchRows = 256
+
+func executeFlushBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch, requireInsert bool) error {
+	results := tx.SendBatch(ctx, batch)
+	for range batch.Len() {
+		tag, err := results.Exec()
+		if err != nil {
+			_ = results.Close()
+			return err
+		}
+		if requireInsert && tag.RowsAffected() != 1 {
+			_ = results.Close()
+			return ErrContributionConflict
+		}
+	}
+	return results.Close()
 }
 
 // SeenContributions returns which of the given (batch, window) pairs have

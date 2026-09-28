@@ -71,6 +71,10 @@ def main():
         name = prefix + "-" + suffix
         containers.append(name)
         cmd = ["docker", "run", "-d", "--name", name, "--network", prefix]
+        if image in images.values():
+            memory = "1g" if image == images["aggregator"] else "512m"
+            cmd += ["--memory", memory, "--read-only", "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges"]
         if port:
             cmd += ["-p", f"127.0.0.1::{port}"]
         for key, value in (env or {}).items():
@@ -137,6 +141,7 @@ def main():
                         HTTP_MAX_CONCURRENT="8", HTTP_HANDLER_TIMEOUT="3s", HTTP_WRITE_TIMEOUT="5s", PUBSUB_PUBLISH_TIMEOUT="2s")
 
         aggregator_env = runtime_env("aggregator")
+        aggregator_env["GOMEMLIMIT"] = "700MiB"
         aggregator_env.update(AGGREGATOR_WINDOW_SIZE="5s", AGGREGATOR_ALLOWED_LATENESS="1s",
                               AGGREGATOR_FLUSH_INTERVAL="1s", AGGREGATOR_IDLE_TIMEOUT="1s", PRUNE_INTERVAL="1s")
         aggregator = start("aggregator", images["aggregator"], aggregator_env, port=8080)

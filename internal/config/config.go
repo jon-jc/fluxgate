@@ -144,6 +144,8 @@ type DatabaseConfig struct {
 
 // AggregatorConfig configures windowed aggregation.
 type AggregatorConfig struct {
+	MaxBufferedBytes    int64
+	MaxOutstandingBytes int
 	// WindowSize is the tumbling window width. Every rollup covers exactly
 	// this much event time.
 	WindowSize time.Duration
@@ -434,6 +436,8 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			WindowSize:             l.duration("AGGREGATOR_WINDOW_SIZE", time.Minute),
 			AllowedLateness:        l.duration("AGGREGATOR_ALLOWED_LATENESS", 30*time.Second),
 			MaxSeries:              l.integer("AGGREGATOR_MAX_SERIES", 100_000),
+			MaxBufferedBytes:       l.bytes("AGGREGATOR_MAX_BUFFERED_BYTES", 128<<20),
+			MaxOutstandingBytes:    int(l.bytes("AGGREGATOR_MAX_OUTSTANDING_BYTES", 16<<20)),
 			IdleTimeout:            l.duration("AGGREGATOR_IDLE_TIMEOUT", 30*time.Second),
 			FlushInterval:          l.duration("AGGREGATOR_FLUSH_INTERVAL", 15*time.Second),
 			MaxOutstandingMessages: l.integer("AGGREGATOR_MAX_OUTSTANDING_MESSAGES", 1000),
@@ -695,6 +699,12 @@ func (c Config) validateAggregator(l *loader) {
 	}
 	if c.Aggregator.MaxSeries <= 0 {
 		l.reject("AGGREGATOR_MAX_SERIES", "must be greater than zero")
+	}
+	if c.Aggregator.MaxBufferedBytes < 32<<20 {
+		l.reject("AGGREGATOR_MAX_BUFFERED_BYTES", "must be at least 32MB to admit a maximum-size batch")
+	}
+	if c.Aggregator.MaxOutstandingBytes < 10<<20 {
+		l.reject("AGGREGATOR_MAX_OUTSTANDING_BYTES", "must be at least 10MB to admit a maximum-size broker envelope")
 	}
 	if c.Aggregator.FlushInterval <= 0 {
 		l.reject("AGGREGATOR_FLUSH_INTERVAL", "must be greater than zero")

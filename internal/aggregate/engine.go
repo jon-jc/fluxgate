@@ -80,6 +80,8 @@ type Config struct {
 	// windows. Cardinality is the failure mode that kills a metrics system, and
 	// a bound that sheds is survivable in a way that an OOM kill is not.
 	MaxSeries int
+	// MaxBytes bounds estimated retained series memory, including label width.
+	MaxBytes int64
 	// IdleTimeout is how long a stream may be silent before the watermark is
 	// allowed to advance on processing time instead of event time.
 	//
@@ -102,6 +104,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxSeries <= 0 {
 		c.MaxSeries = 100_000
+	}
+	if c.MaxBytes <= 0 {
+		c.MaxBytes = 128 << 20
 	}
 	if c.IdleTimeout < 0 {
 		c.IdleTimeout = 0
@@ -128,6 +133,7 @@ type IngestResult struct {
 type Stats struct {
 	OpenWindows      int
 	TrackedSeries    int
+	BufferedBytes    int64
 	PointsAccepted   int64
 	PointsLate       int64
 	PointsShed       int64
@@ -164,7 +170,8 @@ type Engine struct {
 	// Anything for a window ending at or before it is late by definition.
 	flushedThrough time.Time
 	// seriesCount tracks distinct series across all open windows.
-	seriesCount int
+	seriesCount   int
+	bufferedBytes int64
 	// lastIngestAt is processing time, not event time: it answers "has this
 	// stream gone quiet", which event time cannot.
 	lastIngestAt time.Time
@@ -174,6 +181,7 @@ type Engine struct {
 type seriesState struct {
 	labels map[string]string
 	acc    *Accumulator
+	bytes  int64
 }
 
 // New returns an engine ready to accept points.
@@ -210,13 +218,17 @@ func (e *Engine) IngestDurable(batch telemetry.Batch) (IngestResult, error) {
 		key   SeriesKey
 	}
 	added := make(map[entry]struct{})
+	var addedBytes int64
 	for _, p := range batch.Points {
 		k := entry{WindowFor(p.Timestamp, e.cfg.WindowSize).Start.UnixNano(), SeriesKeyFor(batch.TenantID, p)}
 		if _, exists := e.windows[k.start][k.key]; !exists {
-			added[k] = struct{}{}
+			if _, counted := added[k]; !counted {
+				added[k] = struct{}{}
+				addedBytes += seriesBytes(k.key, p.Labels)
+			}
 		}
 	}
-	if e.seriesCount+len(added) > e.cfg.MaxSeries {
+	if e.seriesCount+len(added) > e.cfg.MaxSeries || addedBytes > e.cfg.MaxBytes-e.bufferedBytes {
 		return IngestResult{}, ErrCapacity
 	}
 	return e.ingestLocked(batch, true), nil
@@ -249,26 +261,28 @@ func (e *Engine) ingestLocked(batch telemetry.Batch, corrections bool) IngestRes
 
 		key := SeriesKeyFor(batch.TenantID, p)
 		series, ok := e.windows[window.Start.UnixNano()]
-		if !ok && e.seriesCount < e.cfg.MaxSeries {
-			series = make(map[SeriesKey]*seriesState)
-			e.windows[window.Start.UnixNano()] = series
-		}
-
 		state, exists := series[key]
 		if !exists {
-			if e.seriesCount >= e.cfg.MaxSeries {
+			cost := seriesBytes(key, p.Labels)
+			if e.seriesCount >= e.cfg.MaxSeries || cost > e.cfg.MaxBytes-e.bufferedBytes {
 				// Shedding a point is recoverable. Running out of memory takes
 				// the process down and loses every window it was holding.
 				result.Shed++
 				e.stats.PointsShed++
 				continue
 			}
+			if !ok {
+				series = make(map[SeriesKey]*seriesState)
+				e.windows[window.Start.UnixNano()] = series
+			}
 			state = &seriesState{
 				labels: copyLabels(p.Labels),
 				acc:    NewAccumulator(p.Kind),
+				bytes:  cost,
 			}
 			series[key] = state
 			e.seriesCount++
+			e.bufferedBytes += cost
 		}
 
 		state.acc.Observe(p.Value, p.Timestamp.UnixNano())
@@ -438,6 +452,7 @@ func (e *Engine) collect(all bool) ([]Rollup, []Window) {
 				Acc:    state.acc,
 			})
 			e.seriesCount--
+			e.bufferedBytes -= state.bytes
 		}
 		delete(e.windows, start)
 		windows = append(windows, window)
@@ -454,6 +469,7 @@ func (e *Engine) Stats() Stats {
 	s := e.stats
 	s.OpenWindows = len(e.windows)
 	s.TrackedSeries = e.seriesCount
+	s.BufferedBytes = e.bufferedBytes
 	return s
 }
 
@@ -497,4 +513,18 @@ func copyLabels(labels map[string]string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// Conservative admission accounting for state, map capacity, labels and fixed
+// histogram storage. Flush buffers and decoded broker deliveries are budgeted
+// separately; this is not a process RSS measurement.
+func seriesBytes(key SeriesKey, labels map[string]string) int64 {
+	n := int64(1024 + 2*(len(key.TenantID)+len(key.Metric)+len(key.LabelHash)) + 128*len(labels))
+	for k, v := range labels {
+		n += int64(2 * (len(k) + len(v)))
+	}
+	if key.Kind == telemetry.KindHistogram {
+		n += 2048
+	}
+	return n
 }

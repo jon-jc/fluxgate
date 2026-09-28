@@ -847,6 +847,15 @@ Rate limits and stream limits apply per instance. Scaling replicas multiplies
 the available allowance; use a shared gateway quota if a tenant-wide hard cap is
 required.
 
+Aggregator admission also accounts for label width and histogram storage through
+`AGGREGATOR_MAX_BUFFERED_BYTES` (128 MiB by default). It rejects an entire batch
+for redelivery when the budget is full. The subscriber separately limits retained
+wire data to 16 MiB by default. SQL flushes send at most 256 statements at once,
+with all chunks and delivery claims committing in one transaction. Monitor
+`fluxgate_aggregate_buffered_bytes` alongside process memory and backlog age.
+Migration 0007 corrects the retention index's column; apply it in the same planned
+maintenance window as other indexing work.
+
 Data routes admit at most `HTTP_MAX_CONCURRENT` active non-stream requests per
 instance (default 4). Excess work receives 503 with `Retry-After`; health probes
 remain available. Query materialization has an 8 MiB conservative allocation
