@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"sort"
 	"time"
 
+	"cloud.google.com/go/cloudsqlconn"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -21,6 +23,8 @@ var migrationFS embed.FS
 
 // Config describes how to reach Postgres.
 type Config struct {
+	// Instance enables IAM-authorized, TLS-verified Cloud SQL private-IP connections.
+	Instance string
 	// DSN is the connection string.
 	DSN string
 	// MaxConns caps the pool. It should be sized against the database's own
@@ -71,8 +75,9 @@ func (c *Config) applyDefaults() {
 
 // DB is a Postgres-backed store.
 type DB struct {
-	pool *pgxpool.Pool
-	log  *slog.Logger
+	pool   *pgxpool.Pool
+	log    *slog.Logger
+	dialer *cloudsqlconn.Dialer
 }
 
 // Open connects to Postgres and verifies the connection.
@@ -99,14 +104,34 @@ func Open(ctx context.Context, cfg Config, log *slog.Logger) (*DB, error) {
 	poolCfg.MaxConnLifetime = cfg.MaxConnLifetime
 	poolCfg.MaxConnIdleTime = cfg.MaxConnIdleTime
 	poolCfg.ConnConfig.ConnectTimeout = cfg.ConnectTimeout
+	var dialer *cloudsqlconn.Dialer
+	if cfg.Instance != "" {
+		dialer, err = cloudsqlconn.NewDialer(ctx, cloudsqlconn.WithLazyRefresh())
+		if err != nil {
+			return nil, fmt.Errorf("store: cloud SQL connector: %w", err)
+		}
+		// The connector authenticates and encrypts the transport. Prevent pgx
+		// from layering database TLS or alternate hosts over that connection.
+		poolCfg.ConnConfig.TLSConfig = nil
+		poolCfg.ConnConfig.Fallbacks = nil
+		poolCfg.ConnConfig.DialFunc = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.Dial(ctx, cfg.Instance, cloudsqlconn.WithPrivateIP())
+		}
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
+		if dialer != nil {
+			_ = dialer.Close()
+		}
 		return nil, fmt.Errorf("store: create pool: %w", err)
 	}
 
 	if err := waitForDatabase(ctx, pool, cfg, log); err != nil {
 		pool.Close()
+		if dialer != nil {
+			_ = dialer.Close()
+		}
 		return nil, err
 	}
 
@@ -115,7 +140,7 @@ func Open(ctx context.Context, cfg Config, log *slog.Logger) (*DB, error) {
 		slog.String("database", poolCfg.ConnConfig.Database),
 		slog.Int("max_conns", int(cfg.MaxConns)))
 
-	return &DB{pool: pool, log: log}, nil
+	return &DB{pool: pool, log: log, dialer: dialer}, nil
 }
 
 // waitForDatabase verifies the connection, retrying a startup race.
@@ -167,7 +192,12 @@ func waitForDatabase(ctx context.Context, pool *pgxpool.Pool, cfg Config, log *s
 }
 
 // Close releases the pool.
-func (db *DB) Close() { db.pool.Close() }
+func (db *DB) Close() {
+	db.pool.Close()
+	if db.dialer != nil {
+		_ = db.dialer.Close()
+	}
+}
 
 // Pool exposes the underlying pool for packages that need direct access.
 func (db *DB) Pool() *pgxpool.Pool { return db.pool }
@@ -197,13 +227,17 @@ func (db *DB) Migrate(ctx context.Context) error {
 		return fmt.Errorf("migrate: acquire advisory lock: %w", lockErr)
 	}
 	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
 		// Released explicitly rather than relying on the session ending, so a
 		// pooled connection does not carry the lock into its next user.
 		if _, unlockErr := conn.Exec(
-			context.WithoutCancel(ctx),
+			unlockCtx,
 			"SELECT pg_advisory_unlock($1)", advisoryLockID,
 		); unlockErr != nil {
 			db.log.Warn("releasing migration lock", slog.Any("error", unlockErr))
+			// A session-level lock must never leak back into the pool.
+			_ = conn.Conn().Close(unlockCtx)
 		}
 	}()
 

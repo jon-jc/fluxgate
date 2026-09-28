@@ -54,7 +54,7 @@ func main() {
 }
 
 func run() error {
-	cfg, err := config.Load(serviceName, config.Requirements{Database: true, PubSub: true})
+	cfg, err := config.Load(serviceName, config.Requirements{Database: true, PubSub: true, Aggregator: true})
 	if err != nil {
 		return err
 	}
@@ -89,7 +89,7 @@ func run() error {
 
 	health := observability.NewHealth(5 * time.Second)
 
-	db, err := store.Open(ctx, store.Config{
+	db, err := store.Open(ctx, store.Config{Instance: cfg.Database.Instance,
 		DSN:             cfg.Database.DSN,
 		MaxConns:        cfg.Database.MaxConns,
 		MinConns:        cfg.Database.MinConns,
@@ -100,6 +100,11 @@ func run() error {
 		return err
 	}
 	defer db.Close()
+	if cfg.Environment.IsProduction() {
+		if roleErr := db.RequireRuntimeRole(ctx, serviceName); roleErr != nil {
+			return roleErr
+		}
+	}
 
 	if cfg.Database.Migrate {
 		if migrateErr := db.Migrate(ctx); migrateErr != nil {
@@ -144,6 +149,7 @@ func run() error {
 		Engine:        engine,
 		Store:         db,
 		FlushInterval: cfg.Aggregator.FlushInterval,
+		DrainTimeout:  cfg.Shutdown.DrainTimeout,
 		Metrics:       metrics,
 		Logger:        logger,
 	})

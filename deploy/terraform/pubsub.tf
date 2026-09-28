@@ -6,9 +6,10 @@
 # request path, which is a far larger blast radius than publish-and-subscribe.
 
 resource "google_pubsub_topic" "raw" {
-  name    = "${local.name}-telemetry-raw"
-  labels  = local.common_labels
-  project = var.project_id
+  depends_on = [google_project_service.required, terraform_data.deployment_gate]
+  name       = "${local.name}-telemetry-raw"
+  labels     = local.common_labels
+  project    = var.project_id
 
   message_retention_duration = var.message_retention
 
@@ -17,9 +18,10 @@ resource "google_pubsub_topic" "raw" {
 }
 
 resource "google_pubsub_topic" "dead_letter" {
-  name    = "${local.name}-telemetry-dlq"
-  labels  = local.common_labels
-  project = var.project_id
+  depends_on = [google_project_service.required]
+  name       = "${local.name}-telemetry-dlq"
+  labels     = local.common_labels
+  project    = var.project_id
 
   # Poisoned messages are kept far longer than live ones. They are, by
   # definition, the ones somebody will want to look at -- and they will not
@@ -62,7 +64,6 @@ resource "google_pubsub_subscription" "aggregator" {
   }
 
   depends_on = [
-    google_pubsub_subscription_iam_member.dead_letter_subscriber,
     google_pubsub_topic_iam_member.dead_letter_publisher,
   ]
 }
@@ -93,12 +94,15 @@ resource "google_pubsub_subscription" "dead_letter_inspect" {
 # simply keep being redelivered forever. It is the single most common way a
 # dead-letter policy is configured and never actually fires.
 
-data "google_project" "current" {
-  project_id = var.project_id
+resource "google_project_service_identity" "pubsub" {
+  provider   = google-beta
+  project    = var.project_id
+  service    = "pubsub.googleapis.com"
+  depends_on = [google_project_service.required]
 }
 
 locals {
-  pubsub_service_agent = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+  pubsub_service_agent = google_project_service_identity.pubsub.member
 }
 
 resource "google_pubsub_topic_iam_member" "dead_letter_publisher" {
@@ -109,12 +113,9 @@ resource "google_pubsub_topic_iam_member" "dead_letter_publisher" {
 }
 
 resource "google_pubsub_subscription_iam_member" "dead_letter_subscriber" {
-  subscription = "${local.name}-telemetry-aggregator"
+  subscription = google_pubsub_subscription.aggregator.name
   role         = "roles/pubsub.subscriber"
   member       = local.pubsub_service_agent
   project      = var.project_id
 
-  # Named rather than referenced, because the subscription depends on this
-  # binding: referencing it would be a cycle.
-  depends_on = [google_pubsub_topic.raw]
 }

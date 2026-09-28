@@ -1,11 +1,11 @@
 output "ingest_url" {
   description = "Public URL of the ingest API."
-  value       = google_cloud_run_v2_service.ingest.uri
+  value       = try(google_cloud_run_v2_service.service["ingest"].uri, null)
 }
 
 output "query_url" {
   description = "Public URL of the query API."
-  value       = google_cloud_run_v2_service.query.uri
+  value       = try(google_cloud_run_v2_service.service["query"].uri, null)
 }
 
 output "raw_topic" {
@@ -50,4 +50,13 @@ output "api_keys_secret" {
       gcloud secrets versions add <this> --data-file=keys.json
   EOT
   value       = google_secret_manager_secret.api_keys.secret_id
+}
+
+output "image_repository" {
+  description = "Build/push destination for all four images."
+  value       = local.image_base
+}
+output "migration_job" {
+  description = "Run successfully before enabling services."
+  value       = try(google_cloud_run_v2_job.migrate[0].name, null)
 }

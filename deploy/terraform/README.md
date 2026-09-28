@@ -1,123 +1,136 @@
 # Deploying Fluxgate
 
-Terraform for the whole platform: Pub/Sub topology, Cloud SQL, three Cloud Run
-services, per-service identities, secrets and alert policies.
+This directory prepares private Cloud SQL, Pub/Sub, four service identities,
+Secret Manager, Artifact Registry, alerts, a migration job and three Cloud Run
+services. It defaults to infrastructure only. Local validation never deploys.
 
-## What gets created
+## Validate without a GCP project
 
-| | |
+```sh
+terraform init -backend=false
+terraform fmt -check -recursive
+terraform validate
+terraform test
+```
+
+The six mocked plan tests cover bootstrap, immutable images, incomplete service
+configuration, connection limits and production gates. They do not prove live
+IAM, networking, organization policy, or capacity. The provider lock file covers
+Linux and Windows. Review dependency upgrades and commit the updated lock.
+
+## First deployment (operator procedure)
+
+1. Choose an isolated project and region, enable billing, and create a restricted
+   GCS state bucket with versioning and audit logging. State contains database
+   passwords. Grant the deployment principal the required resource management
+   permissions and permission to act as the four service accounts. Enable the
+   Service Usage API if the project is new; Terraform enables its service APIs.
+2. Copy `dev.tfvars.example` or `prod.tfvars.example`, fill in the project, retain
+   `deploy_services = false`, and initialize the GCS backend:
+
+   ```sh
+   terraform init -backend-config="bucket=YOUR_STATE_BUCKET" -backend-config="prefix=fluxgate/prod"
+   terraform plan -var-file=prod.tfvars -out=bootstrap.plan
+   terraform apply bootstrap.plan
+   ```
+
+3. Build and publish `ingest-api`, `aggregator`, `query-api` and `migrate` from the
+   same reviewed commit using `build/docker/Dockerfile` and `--build-arg SERVICE`.
+   Use the `image_repository` output. Record the registry digest for each image
+   in `images = { ingest = "...@sha256:...", aggregator = "...@sha256:...",
+   query = "...@sha256:...", migrate = "...@sha256:..." }`. Tags alone are rejected.
+4. Populate the `api_keys_secret` output with a valid nonempty API key JSON
+   document (see the root README). Store only secret hashes there. Send plaintext
+   keys through your credential channel. Run `gcloud secrets versions add
+   SECRET_ID --data-file=keys.json --project=PROJECT`, and set `api_keys_version`
+   to that numeric version. Remove the local credential document securely.
+5. Apply the image configuration with services still disabled. Run the migration
+   job and wait for success:
+
+   ```sh
+   gcloud run jobs execute fluxgate-prod-migrate --region=REGION --project=PROJECT --wait
+   ```
+
+   The job applies schema migrations and removes the default Cloud SQL
+   administrative grants from all three runtime database users. The owner
+   credential is readable only by the migration identity. Services refuse to
+   start on staging/prod with an owner or unprovisioned runtime credential.
+   Terraform creates the job; it does not execute or verify its success.
+6. Set `deploy_services = true`, review a saved plan, then apply. Production
+   requires regional SQL, warm ingest instances and notification channels.
+   The capacity gate reserves connections for two complete revisions at maximum
+   scale plus administration. Verify the selected SQL tier can afford the
+   configured `max_connections`; the arithmetic gate is not a memory benchmark.
+7. Exercise the release checks below before sending production traffic.
+
+Cloud SQL connections use the Go connector over private VPC IPs, with IAM
+connection authorization and certificate-verified encryption. The DSN uses
+`sslmode=disable` because the connector itself establishes TLS. Never copy that
+DSN into a client without the connector. No service-account keys are needed.
+
+Ingest and query are public at the Cloud Run layer; the application API key is
+required for data routes. The aggregator has internal ingress and no public
+invoker binding. Organization policies may forbid `allUsers`; in that case add
+your approved authenticated gateway and adapt the invocation policy before apply.
+Public APIs disable the unauthenticated Prometheus endpoint. Native Cloud Run,
+SQL and Pub/Sub metrics back the supplied alerts. Optional traces need an actual
+TLS OTLP collector via `otlp_endpoint`; there is no implicit Cloud Run collector.
+
+## Runtime access
+
+| Identity | Database permissions |
 | --- | --- |
-| **Pub/Sub** | Raw topic, dead-letter topic, working subscription with a retry and dead-letter policy, and an inspection subscription on the DLQ |
-| **Cloud SQL** | Postgres 17, private IP only, automated backups, point-in-time recovery on production tiers |
-| **Cloud Run** | `ingest-api` (public), `aggregator` (internal), `query-api` (public) |
-| **IAM** | One service account per service, each holding only what that service does |
-| **Secret Manager** | API key document and the database URL, mounted rather than passed as plain environment variables |
-| **Monitoring** | Four alert policies, each documented with what to check and in what order |
+| ingest | Read, insert and update retry reservations |
+| aggregator | Read/write rollups, claim delivery ledger entries, prune retained data |
+| query | Read rollups only |
+| migrate | Own schema and provision runtime grants |
 
-## Prerequisites
+Tenant isolation remains enforced by API authorization and SQL filters; these
+roles isolate services, not individual tenants. The provisioning command assumes
+an isolated Fluxgate database, fixed role names and the `public` schema. It
+rejects unexpected role memberships or privileged attributes. Do not grant extra
+memberships or table ownership to runtime users. After adding tables, explicitly
+update the grants and integration tests. Stop services before replacing database
+users, rerun provisioning, and verify permissions before enabling them again.
 
-The state bucket has to exist before the first `init` — Terraform cannot create
-the bucket that holds its own state:
+## Upgrades and rollback
 
-```bash
-gsutil mb -l us-central1 gs://fluxgate-tfstate-$PROJECT
-gsutil versioning set on gs://fluxgate-tfstate-$PROJECT
-```
+Take a verified backup before migrations. Run the new migration image using the
+same owner. **Migration 0003 requires stopping every old aggregator before it
+runs**: older writers do not understand the new delivery identity constraints.
+Existing deployments must move/import the renamed Cloud Run resource addresses
+into `google_cloud_run_v2_service.service["ingest"|"aggregator"|"query"]` and review
+all state changes. Do not apply the bootstrap defaults to an existing live stack.
 
-Versioning is not optional. It is what makes a corrupted state file recoverable.
+For compatible schema changes, pin the previous service image digests and key
+version and apply the reviewed plan. A destructive or incompatible migration
+needs a tested forward repair or database restore; changing an image is not a
+schema rollback. Rotate one secret version and revision at a time and verify
+readiness before retiring old versions.
 
-Enable the APIs:
+## Retention and recovery
 
-```bash
-gcloud services enable \
-  run.googleapis.com pubsub.googleapis.com sqladmin.googleapis.com \
-  secretmanager.googleapis.com servicenetworking.googleapis.com \
-  vpcaccess.googleapis.com artifactregistry.googleapis.com \
-  monitoring.googleapis.com cloudtrace.googleapis.com
-```
+The ledger covers raw retention plus seven days in the DLQ, the 24-hour ingest
+retry horizon and a safety day. Keep those horizons aligned when changing limits.
+Topic snapshots, exported archives or replay beyond that horizon require retaining
+or rebuilding the ledger first. Otherwise replay can count previously processed
+observations again. Keep original tenant, batch ID and timestamps during replay.
+Pub/Sub wraps dead-letter messages: unwrap the original envelope before republishing.
+Only acknowledge inspected DLQ messages after successful republish. Diagnose and
+fix the cause first; temporary database or IAM failures also dead-letter messages.
 
-## Applying
+## Release checks requiring a real staging project
 
-```bash
-cp dev.tfvars.example dev.tfvars   # then fill it in
+- Confirm private SQL connectivity and denial of cross-service table access.
+- Publish, retry across replicas/restarts, query totals and compare to sent data.
+- Terminate aggregators mid-window, interrupt database connectivity, and verify
+  recovery, duplicate suppression, DLQ handling and alert delivery.
+- Sustain expected peak traffic plus headroom while measuring latency, memory,
+  SQL connections, backlog age and per-instance quotas; adjust capacity limits.
+- Restore a backup into a separate instance, measure recovery time, and reconcile
+  the replay/ledger horizon before enabling writes.
+- Verify key rotation, rollback, on-call ownership, regional requirements and
+  agreed retention/RPO/RTO. Record results with the release.
 
-terraform init \
-  -backend-config="bucket=fluxgate-tfstate-$PROJECT" \
-  -backend-config="prefix=fluxgate/dev"
-
-terraform plan  -var-file=dev.tfvars
-terraform apply -var-file=dev.tfvars
-```
-
-`image_tag` has no default and rejects `latest`: a mutable tag makes a rollback
-ambiguous and makes it impossible to tell from state which build is running. Use
-the commit SHA that CI built.
-
-## After the first apply
-
-The API key document is created empty, because putting it in a variable would
-put the plaintext in state — which lives in a bucket readable by anyone who can
-run a plan. Populate it out of band:
-
-```bash
-SECRET=$(openssl rand -hex 32)
-DIGEST=$(printf %s "$SECRET" | sha256sum | cut -d' ' -f1)
-
-cat > keys.json <<JSON
-[{"key_id":"acme01","tenant_id":"acme","secret_sha256":"$DIGEST",
-  "rate_limit_per_second":50000,"burst":100000}]
-JSON
-
-gcloud secrets versions add "$(terraform output -raw api_keys_secret)" \
-  --data-file=keys.json
-rm keys.json
-
-echo "give the client: fxg_acme01_$SECRET"
-```
-
-The service stores only the digest, so this is the one moment the plaintext
-exists. Losing it means issuing a new key, not recovering the old one.
-
-## Things worth knowing before you apply
-
-**Dead lettering silently does nothing without two IAM bindings.** Pub/Sub's own
-service agent — not the consumer — performs the dead-letter publish, and it
-needs `pubsub.publisher` on the dead-letter topic and `pubsub.subscriber` on the
-source subscription. Get this wrong and there is no error at apply time and none
-at run time: messages simply keep being redelivered forever. Both bindings are
-in `pubsub.tf`, and the subscription depends on them.
-
-**The aggregator is deliberately not autoscaled.** Each instance holds open
-windows in memory and writes them only when they close, so scaling in mid-window
-hands the survivors a redelivery of everything the departing instance had not
-yet flushed. Correct, thanks to the delivery ledger, but pure rework. Change the
-instance count deliberately, ideally when traffic is low.
-
-**`cpu_idle` is false on the aggregator and the query API.** Both do work
-between requests — flushing on a timer, polling for a live tail. With idle CPU
-throttling, the flush timer would be throttled to a stop and windows would only
-be written when a message happened to arrive.
-
-**Deletion protection is on for the database, on every tier.** A destroyed
-Cloud SQL instance is not recoverable from Terraform state.
-
-## Rolling back
-
-Cloud Run keeps revisions. The fastest rollback does not involve Terraform:
-
-```bash
-gcloud run services update-traffic fluxgate-prod-ingest-api \
-  --to-revisions=PREVIOUS=100 --region=us-central1
-```
-
-Then re-apply with the previous `image_tag` so state matches reality. Doing it in
-that order means the outage ends before the paperwork starts.
-
-## What is not here
-
-- **CI/CD.** The workflow builds and tests; it does not deploy. Wiring apply to
-  a merge needs Workload Identity Federation and an approval gate, which is a
-  decision about who may deploy rather than a Terraform question.
-- **A custom domain and TLS.** Cloud Run's generated URL is used directly.
-- **Multi-region.** One region, one database. Cross-region would need a
-  replication story for the rollups that does not exist yet.
+These cloud exercises are deliberately separate from preparation and local CI.
+Do not describe an untested deployment as production proven.

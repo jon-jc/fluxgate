@@ -45,6 +45,8 @@ type Options struct {
 	// data has arrived. Without it, a producer that goes quiet would leave its
 	// last window unwritten and its messages unacknowledged indefinitely.
 	FlushInterval time.Duration
+	// DrainTimeout bounds the final flush within the host shutdown budget.
+	DrainTimeout time.Duration
 	// Metrics records flush outcomes. Optional; a nil value disables
 	// instrumentation rather than panicking.
 	Metrics *observability.Metrics
@@ -53,6 +55,9 @@ type Options struct {
 }
 
 func (o *Options) applyDefaults() {
+	if o.DrainTimeout <= 0 {
+		o.DrainTimeout = 5 * time.Second
+	}
 	if o.FlushInterval <= 0 {
 		o.FlushInterval = 15 * time.Second
 	}
@@ -75,6 +80,7 @@ type Runner struct {
 	engine        *aggregate.Engine
 	store         Store
 	flushInterval time.Duration
+	drainTimeout  time.Duration
 	metrics       *observability.Metrics
 	log           *slog.Logger
 
@@ -133,6 +139,7 @@ func New(opts Options) (*Runner, error) {
 		engine:        opts.Engine,
 		store:         opts.Store,
 		flushInterval: opts.FlushInterval,
+		drainTimeout:  opts.DrainTimeout,
 		metrics:       opts.Metrics,
 		log:           opts.Logger,
 		inflight:      make(map[int64][]*pendingMessage),
@@ -528,7 +535,7 @@ func (r *Runner) drain(ctx context.Context) error {
 	r.closing = true
 	r.admission.Unlock()
 	drainCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx), 30*time.Second)
+		context.WithoutCancel(ctx), r.drainTimeout)
 	defer cancel()
 
 	if err := r.FlushAll(drainCtx); err != nil {

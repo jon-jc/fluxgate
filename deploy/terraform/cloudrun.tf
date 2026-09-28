@@ -1,354 +1,166 @@
-# The three services.
-#
-# Cloud Run rather than GKE: there is no shared state between instances, no
-# sidecar, and no need for a scheduler. A cluster would add an operational
-# surface that buys nothing this workload uses.
-
 locals {
-  # Every service reports the same tier, project and collector.
+  runtime_accounts = {
+    ingest     = google_service_account.ingest.email
+    aggregator = google_service_account.aggregator.email
+    query      = google_service_account.query.email
+  }
+  services = {
+    ingest     = { suffix = "ingest-api", min = var.ingest_min_instances, max = var.ingest_max_instances, concurrency = 80 }
+    aggregator = { suffix = "aggregator", min = var.aggregator_instances, max = var.aggregator_instances, concurrency = 1 }
+    query      = { suffix = "query-api", min = var.query_min_instances, max = var.query_max_instances, concurrency = 40 }
+  }
   shared_env = {
-    ENVIRONMENT    = var.environment
-    GCP_PROJECT_ID = var.project_id
-    LOG_FORMAT     = "json"
-    LOG_LEVEL      = local.is_production ? "info" : "debug"
-
+    ENVIRONMENT                    = var.environment
+    GCP_PROJECT_ID                 = var.project_id
+    LOG_FORMAT                     = "json"
+    LOG_LEVEL                      = "info"
     PUBSUB_TOPIC_RAW               = google_pubsub_topic.raw.name
     PUBSUB_TOPIC_DLQ               = google_pubsub_topic.dead_letter.name
     PUBSUB_SUBSCRIPTION_AGGREGATOR = google_pubsub_subscription.aggregator.name
-
-    # Deployed topology comes from this Terraform, never from a runtime admin
-    # call. Configuration validation refuses it on production tiers anyway;
-    # setting it explicitly makes the intent legible here too.
-    PUBSUB_BOOTSTRAP = "false"
-
-    # Cloud Run's built-in OpenTelemetry sidecar listens here.
-    OTEL_EXPORTER_OTLP_ENDPOINT = "localhost:4317"
-    TRACE_SAMPLE_RATIO          = local.is_production ? "0.05" : "1"
+    PUBSUB_BOOTSTRAP               = "false"
+    PUBSUB_RETENTION               = var.message_retention
+    PUBSUB_DLQ_RETENTION           = "604800s"
+    # Include a client's retry horizon before a fresh publish and a safety day.
+    LEDGER_RETENTION       = "${try(tonumber(trimsuffix(var.message_retention, "s")), 86400) + 604800 + 172800}s"
+    CLOUD_SQL_INSTANCE     = google_sql_database_instance.main.connection_name
+    DATABASE_MIGRATE       = "false"
+    DATABASE_MAX_CONNS     = tostring(var.database_pool_connections)
+    DATABASE_MIN_CONNS     = "0"
+    SHUTDOWN_GRACE_PERIOD  = "0s"
+    SHUTDOWN_DRAIN_TIMEOUT = "5s"
+    PUBSUB_PUBLISH_TIMEOUT = "4s"
+    HTTP_HANDLER_TIMEOUT   = "6s"
+    HTTP_WRITE_TIMEOUT     = "10s"
+    # Platform metrics work without a collector. Optional tracing requires one.
+    OTEL_EXPORTER_OTLP_ENDPOINT = var.otlp_endpoint
+    OTEL_EXPORTER_OTLP_INSECURE = "false"
+    TRACE_SAMPLE_RATIO          = "0.05"
   }
 }
 
-resource "google_cloud_run_v2_service" "ingest" {
-  name     = "${local.name}-ingest-api"
-  location = var.region
+resource "google_cloud_run_v2_service" "service" {
+  for_each = var.deploy_services ? local.services : {}
   project  = var.project_id
+  name     = "${local.name}-${each.value.suffix}"
+  location = var.region
   labels   = local.common_labels
-
-  # The edge is public by design; the API key is the boundary.
-  ingress = "INGRESS_TRAFFIC_ALL"
-
-  depends_on = [google_cloud_run_v2_service.aggregator, google_secret_manager_secret_iam_member.ingest_database_url]
-
+  ingress  = each.key == "aggregator" ? "INGRESS_TRAFFIC_INTERNAL_ONLY" : "INGRESS_TRAFFIC_ALL"
+  depends_on = [
+    terraform_data.deployment_gate, google_project_service.required,
+    google_secret_manager_secret_iam_member.runtime_database_url,
+    google_secret_manager_secret_iam_member.api_keys,
+    google_project_iam_member.ingest_sql_client, google_project_iam_member.aggregator_sql_client,
+    google_project_iam_member.query_sql_client,
+    google_pubsub_subscription_iam_member.aggregator_subscriber,
+    google_pubsub_subscription_iam_member.dead_letter_subscriber,
+    google_pubsub_topic_iam_member.ingest_publisher,
+  ]
   template {
-    service_account = google_service_account.ingest.email
-
+    service_account = local.runtime_accounts[each.key]
     scaling {
-      min_instance_count = var.ingest_min_instances
-      max_instance_count = var.ingest_max_instances
+      min_instance_count = each.value.min
+      max_instance_count = each.value.max
     }
-
-    # A publish is I/O-bound, so one instance can serve many requests at once.
-    # The number is bounded by the publisher's own outstanding-message limit,
-    # not by CPU.
-    max_instance_request_concurrency = 80
-
+    max_instance_request_concurrency = each.value.concurrency
+    timeout                          = each.key == "query" ? "3600s" : "30s"
     vpc_access {
       connector = google_vpc_access_connector.main.id
       egress    = "PRIVATE_RANGES_ONLY"
     }
-
     containers {
-      image = "${local.image_base}/ingest-api:${var.image_tag}"
-
+      image = var.images[each.key]
       resources {
-        limits = {
-          cpu    = "1"
-          memory = "512Mi"
-        }
-        # CPU only while a request is in flight. The edge does no background
-        # work, so paying for always-allocated CPU would buy nothing.
-        cpu_idle          = true
+        limits            = { cpu = "1", memory = each.key == "aggregator" ? "1Gi" : "512Mi" }
+        cpu_idle          = each.key == "ingest"
         startup_cpu_boost = true
       }
-
-      ports {
-        container_port = 8080
-      }
-
+      ports { container_port = 8080 }
       dynamic "env" {
-        for_each = local.shared_env
+        for_each = merge(local.shared_env, { METRICS_ENABLED = each.key == "aggregator" ? "true" : "false" })
         content {
           name  = env.key
           value = env.value
         }
       }
-
-      env {
-        name = "API_KEYS"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.api_keys.secret_id
-            version = "latest"
-          }
-        }
-      }
-
       env {
         name = "DATABASE_URL"
         value_source {
           secret_key_ref {
-            secret  = google_secret_manager_secret.database_url.secret_id
-            version = "latest"
+            secret  = google_secret_manager_secret.runtime_database_url[each.key].secret_id
+            version = google_secret_manager_secret_version.runtime_database_url[each.key].version
           }
         }
       }
-
-      env {
-        name  = "DATABASE_MIGRATE"
-        value = "false"
-      }
-
-      # Behind Cloud Run's load balancer, X-Forwarded-For is rewritten and can
-      # be trusted. It must stay false anywhere it is not.
-      env {
-        name  = "HTTP_TRUST_PROXY_HEADER"
-        value = "true"
-      }
-
-      startup_probe {
-        # Readiness, not liveness: the instance should not take traffic until
-        # its publisher is usable.
-        http_get {
-          path = "/readyz"
-        }
-        initial_delay_seconds = 2
-        period_seconds        = 3
-        failure_threshold     = 10
-      }
-
-      liveness_probe {
-        # Liveness asks only whether the process is wedged. Pointing it at
-        # readiness would restart every instance during a broker outage, which
-        # does not fix the broker and does lose every in-flight request.
-        http_get {
-          path = "/healthz"
-        }
-        period_seconds    = 30
-        failure_threshold = 3
-      }
-    }
-  }
-
-  traffic {
-    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
-    percent = 100
-  }
-}
-
-resource "google_cloud_run_v2_service" "aggregator" {
-  name     = "${local.name}-aggregator"
-  location = var.region
-  project  = var.project_id
-  labels   = local.common_labels
-
-  # No public ingress. The aggregator serves probes and a scrape endpoint and
-  # nothing else; exposing it would be surface for no purpose.
-  ingress = "INGRESS_TRAFFIC_INTERNAL_ONLY"
-
-  template {
-    service_account = google_service_account.aggregator.email
-
-    scaling {
-      # Fixed, not autoscaled: see the variable's comment. Scaling in mid-window
-      # hands the survivors a redelivery of everything the departing instance
-      # had not flushed.
-      min_instance_count = var.aggregator_instances
-      max_instance_count = var.aggregator_instances
-    }
-
-    vpc_access {
-      connector = google_vpc_access_connector.main.id
-      egress    = "PRIVATE_RANGES_ONLY"
-    }
-
-    containers {
-      image = "${local.image_base}/aggregator:${var.image_tag}"
-
-      resources {
-        limits = {
-          cpu = "1"
-          # Windows are held in memory until they close, so the footprint
-          # follows series cardinality rather than request rate.
-          memory = "1Gi"
-        }
-        # The aggregator works between requests -- consuming, windowing,
-        # flushing on a timer -- so its CPU must stay allocated. With cpu_idle
-        # the flush timer would be throttled to a stop and windows would only
-        # be written when a message happened to arrive.
-        cpu_idle = false
-      }
-
-      ports {
-        container_port = 8080
-      }
-
       dynamic "env" {
-        for_each = local.shared_env
+        for_each = each.key == "aggregator" ? [] : [1]
         content {
-          name  = env.key
-          value = env.value
-        }
-      }
-
-      env {
-        name = "DATABASE_URL"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.database_url.secret_id
-            version = "latest"
+          name = "API_KEYS"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.api_keys.secret_id
+              version = var.api_keys_version
+            }
           }
         }
       }
-
-      # The aggregator owns the schema. The query API deliberately does not, so
-      # a read replica rolling out first cannot apply a change the writer is
-      # not yet running.
-      env {
-        name  = "DATABASE_MIGRATE"
-        value = "true"
-      }
-
       startup_probe {
-        http_get {
-          path = "/readyz"
-        }
+        http_get { path = "/readyz" }
         initial_delay_seconds = 5
         period_seconds        = 3
         failure_threshold     = 20
       }
-
       liveness_probe {
-        http_get {
-          path = "/healthz"
-        }
+        http_get { path = "/healthz" }
         period_seconds    = 30
         failure_threshold = 3
       }
     }
   }
-
   traffic {
     type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
     percent = 100
   }
 }
 
-resource "google_cloud_run_v2_service" "query" {
-  name     = "${local.name}-query-api"
-  location = var.region
-  project  = var.project_id
-  labels   = local.common_labels
-
-  ingress = "INGRESS_TRAFFIC_ALL"
-
+# Terraform creates the job but never executes it. The operator must review and
+# run it, then enable the services. A separate identity owns schema changes.
+resource "google_cloud_run_v2_job" "migrate" {
+  count      = var.images.migrate == "" ? 0 : 1
+  project    = var.project_id
+  name       = "${local.name}-migrate"
+  location   = var.region
+  labels     = local.common_labels
+  depends_on = [google_secret_manager_secret_iam_member.migrate_database_url, google_project_iam_member.migrate_sql_client, google_sql_user.runtime]
   template {
-    service_account = google_service_account.query.email
-
-    scaling {
-      min_instance_count = var.query_min_instances
-      max_instance_count = var.query_max_instances
-    }
-
-    # Lower than the edge's: a query holds a database connection for its
-    # duration, and the pool is the scarce resource here rather than CPU.
-    max_instance_request_concurrency = 40
-
-    # The live tail holds a connection open for minutes at a time, so the
-    # request timeout has to exceed the stream's own bound.
-    timeout = "3600s"
-
-    vpc_access {
-      connector = google_vpc_access_connector.main.id
-      egress    = "PRIVATE_RANGES_ONLY"
-    }
-
-    containers {
-      image = "${local.image_base}/query-api:${var.image_tag}"
-
-      resources {
-        limits = {
-          cpu    = "1"
-          memory = "512Mi"
+    template {
+      service_account = google_service_account.migrate.email
+      timeout         = "600s"
+      max_retries     = 0
+      vpc_access {
+        connector = google_vpc_access_connector.main.id
+        egress    = "PRIVATE_RANGES_ONLY"
+      }
+      containers {
+        image = var.images.migrate
+        args  = ["-grant-runtime-roles"]
+        env {
+          name  = "ENVIRONMENT"
+          value = var.environment
         }
-        # A live tail polls between requests, so CPU stays allocated for the
-        # same reason as the aggregator.
-        cpu_idle          = false
-        startup_cpu_boost = true
-      }
-
-      ports {
-        container_port = 8080
-      }
-
-      dynamic "env" {
-        for_each = local.shared_env
-        content {
-          name  = env.key
-          value = env.value
+        env {
+          name  = "CLOUD_SQL_INSTANCE"
+          value = google_sql_database_instance.main.connection_name
         }
-      }
-
-      env {
-        name = "API_KEYS"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.api_keys.secret_id
-            version = "latest"
+        env {
+          name = "DATABASE_URL"
+          value_source {
+            secret_key_ref {
+              secret  = google_secret_manager_secret.database_url.secret_id
+              version = google_secret_manager_secret_version.database_url.version
+            }
           }
         }
       }
-
-      env {
-        name = "DATABASE_URL"
-        value_source {
-          secret_key_ref {
-            secret  = google_secret_manager_secret.database_url.secret_id
-            version = "latest"
-          }
-        }
-      }
-
-      # Read-only: schema changes belong to the writer.
-      env {
-        name  = "DATABASE_MIGRATE"
-        value = "false"
-      }
-
-      env {
-        name  = "HTTP_TRUST_PROXY_HEADER"
-        value = "true"
-      }
-
-      startup_probe {
-        http_get {
-          path = "/readyz"
-        }
-        initial_delay_seconds = 2
-        period_seconds        = 3
-        failure_threshold     = 10
-      }
-
-      liveness_probe {
-        http_get {
-          path = "/healthz"
-        }
-        period_seconds    = 30
-        failure_threshold = 3
-      }
     }
-  }
-
-  traffic {
-    type    = "TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST"
-    percent = 100
   }
 }

@@ -19,20 +19,48 @@ variable "environment" {
   }
 }
 
-variable "image_tag" {
-  description = <<-EOT
-    Container image tag to deploy, e.g. a commit SHA.
-
-    Deliberately not defaulted to "latest": a mutable tag makes a rollback
-    ambiguous and makes it impossible to say from the Terraform state which
-    build is actually running.
-  EOT
-  type        = string
-
+variable "images" {
+  description = "Immutable image references for the four binaries. Empty during infrastructure bootstrap."
+  type        = object({ ingest = string, aggregator = string, query = string, migrate = string })
+  default     = { ingest = "", aggregator = "", query = "", migrate = "" }
   validation {
-    condition     = var.image_tag != "latest"
-    error_message = "image_tag must be immutable. 'latest' cannot be rolled back to a known state."
+    condition     = alltrue([for image in values(var.images) : image == "" || can(regex("^[^@]+@sha256:[0-9a-f]{64}$", image))])
+    error_message = "Each image must be empty or pinned to a sha256 digest."
   }
+}
+
+variable "deploy_services" {
+  description = "Enable runtime services only after populating secrets and successfully running the migration job."
+  type        = bool
+  default     = false
+}
+
+variable "api_keys_version" {
+  description = "Numeric Secret Manager version of the populated API key document; empty during bootstrap."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.api_keys_version == "" || can(regex("^[1-9][0-9]*$", var.api_keys_version))
+    error_message = "Pin a numeric API key secret version, never latest."
+  }
+}
+
+variable "database_pool_connections" {
+  description = "Maximum connections per runtime instance. Leaves capacity for migrations and administration."
+  type        = number
+  default     = 5
+}
+
+variable "database_max_connections" {
+  description = "Cloud SQL max_connections, sized for the selected tier and the total replica pool budget."
+  type        = number
+  default     = 400
+}
+
+variable "otlp_endpoint" {
+  description = "Optional external TLS OTLP gRPC collector host:port. Empty disables tracing; Cloud Run provides no automatic collector."
+  type        = string
+  default     = ""
 }
 
 variable "artifact_registry_repository" {

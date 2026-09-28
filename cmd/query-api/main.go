@@ -91,7 +91,7 @@ func run() error {
 
 	health := observability.NewHealth(cfg.HTTP.HandlerTimeout)
 
-	db, err := store.Open(ctx, store.Config{
+	db, err := store.Open(ctx, store.Config{Instance: cfg.Database.Instance,
 		DSN:             cfg.Database.DSN,
 		MaxConns:        cfg.Database.MaxConns,
 		MinConns:        cfg.Database.MinConns,
@@ -102,6 +102,11 @@ func run() error {
 		return err
 	}
 	defer db.Close()
+	if cfg.Environment.IsProduction() {
+		if roleErr := db.RequireRuntimeRole(ctx, serviceName); roleErr != nil {
+			return roleErr
+		}
+	}
 
 	// The read path does not own the schema. Migrations belong to the writer,
 	// so a read replica rolling out first cannot apply a change the writer is

@@ -41,6 +41,27 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestProductionInfrastructureSafeguards(t *testing.T) {
+	for _, tc := range []struct{ key, value string }{
+		{"PUBSUB_EMULATOR_HOST", "localhost:8681"},
+		{"DATABASE_MIGRATE", "true"},
+		{"LEDGER_RETENTION", "24h"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			values := map[string]string{"ENVIRONMENT": "prod", "DATABASE_URL": "postgres://db/fluxgate", "GCP_PROJECT_ID": "test", "PUBSUB_BOOTSTRAP": "false"}
+			values[tc.key] = tc.value
+			_, err := load(env(values), "aggregator", Requirements{Database: true, Aggregator: true, PubSub: true})
+			if err == nil || !strings.Contains(err.Error(), tc.key) {
+				t.Fatalf("wanted %s rejection, got %v", tc.key, err)
+			}
+		})
+	}
+	_, err := load(env(map[string]string{"DATABASE_URL": "postgres://db/fluxgate", "AGGREGATOR_WINDOW_SIZE": "0s"}), "query", Requirements{Database: true})
+	if err != nil {
+		t.Fatalf("query must not validate unused aggregator settings: %v", err)
+	}
+}
+
 func TestDeployedIngestRequiresSharedRetryStorage(t *testing.T) {
 	for _, tier := range []string{"staging", "prod"} {
 		_, err := load(env(map[string]string{"ENVIRONMENT": tier}), "ingest", Requirements{Ingest: true})
@@ -343,7 +364,7 @@ func TestAuthIsNotRequiredOfBackgroundServices(t *testing.T) {
 		"ENVIRONMENT":    "prod",
 		"GCP_PROJECT_ID": "fluxgate",
 		"DATABASE_URL":   "postgres://localhost/fluxgate",
-	}), "fluxgate-aggregator", Requirements{Database: true})
+	}), "fluxgate-aggregator", Requirements{Database: true, Aggregator: true})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -356,7 +377,7 @@ func TestDatabaseIsRequiredWhenDeclared(t *testing.T) {
 	_, err := load(env(map[string]string{
 		"ENVIRONMENT":    "prod",
 		"GCP_PROJECT_ID": "fluxgate",
-	}), "fluxgate-aggregator", Requirements{Database: true})
+	}), "fluxgate-aggregator", Requirements{Database: true, Aggregator: true})
 	if err == nil {
 		t.Fatal("load succeeded with no DATABASE_URL for a service that needs one")
 	}
@@ -381,7 +402,7 @@ func TestFlushIntervalMustNotExceedTheWindow(t *testing.T) {
 		"DATABASE_URL":              "postgres://localhost/fluxgate",
 		"AGGREGATOR_WINDOW_SIZE":    "1m",
 		"AGGREGATOR_FLUSH_INTERVAL": "5m",
-	}), "fluxgate-aggregator", Requirements{Database: true})
+	}), "fluxgate-aggregator", Requirements{Database: true, Aggregator: true})
 	if err == nil {
 		t.Fatal("a flush interval longer than the window was accepted")
 	}
@@ -397,7 +418,7 @@ func TestLedgerRetentionMustOutliveTheWindow(t *testing.T) {
 		"DATABASE_URL":           "postgres://localhost/fluxgate",
 		"AGGREGATOR_WINDOW_SIZE": "10m",
 		"LEDGER_RETENTION":       "1m",
-	}), "fluxgate-aggregator", Requirements{Database: true})
+	}), "fluxgate-aggregator", Requirements{Database: true, Aggregator: true})
 	if err == nil {
 		t.Fatal("a ledger retention shorter than the window was accepted")
 	}
@@ -409,7 +430,7 @@ func TestLedgerRetentionMustOutliveTheWindow(t *testing.T) {
 func TestAggregatorDefaults(t *testing.T) {
 	cfg, err := load(env(map[string]string{
 		"DATABASE_URL": "postgres://localhost/fluxgate",
-	}), "fluxgate-aggregator", Requirements{Database: true})
+	}), "fluxgate-aggregator", Requirements{Database: true, Aggregator: true})
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
