@@ -893,3 +893,15 @@ CycloneDX SBOMs, and fails on any known HIGH or CRITICAL finding, including thos
 without an available fix. CI preserves these reports for 30 days. Reachability
 analysis (`govulncheck`) also runs separately: an unused vulnerable component
 still blocks the packaged-image check. Scanner/database failures fail the job.
+
+Add `--load-batches 2000` to `scripts/verify_pipeline.py` for a one-million-point
+local acceptance run. Sixteen clients submit 500-point batches across two ingest
+replicas and replay every batch through the other replica. The check honors
+429/503 backpressure, reconciles count/sum/min/max/last for every series across
+counter, gauge and histogram data, and checks liveness, sampled process RSS and
+container restarts/OOM status. CI runs 200 batches (100,000 points). The report
+separates accepted-attempt latency (including fast replays) from batch-pair
+latency including retry delays. This is a reproducible correctness check under
+local resource limits, not a cloud throughput or latency guarantee. The fixture
+uses 600 series, eight admitted requests per API replica and fixed timestamps;
+validate your own cardinality, query mix and traffic duration in staging.

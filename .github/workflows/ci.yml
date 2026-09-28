@@ -576,8 +576,8 @@ jobs:
 
           echo "confirmed: metrics exposed with bounded route labels"
 
-      - name: Verify replica retries, crash recovery and restricted roles
-        run: python3 scripts/verify_pipeline.py --skip-build --image-prefix fluxgate --tag ci
+      - name: Verify load, replica retries, crash recovery and restricted roles
+        run: python3 scripts/verify_pipeline.py --skip-build --image-prefix fluxgate --tag ci --load-batches 200
 
       - name: Container logs on failure
         if: failure()
