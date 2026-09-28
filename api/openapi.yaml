@@ -177,8 +177,9 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           description: |
-            The batch could not be handed to the pipeline and was **not**
-            stored. Retry with the same `Idempotency-Key`.
+            Capacity or a dependency prevented confirmation. Publication may
+            already have happened. Retry with the same `Idempotency-Key` and
+            identical body; respect `Retry-After` when present.
           $ref: '#/components/responses/Problem'
         '504':
           description: The request exceeded its processing deadline.
@@ -246,8 +247,11 @@ paths:
                 $ref: '#/components/schemas/QueryResult'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Capacity exhausted; respect Retry-After before retrying.
+          $ref: '#/components/responses/Problem'
         '422':
-          description: A parameter was invalid. Every problem is reported at once.
+          description: A parameter was invalid or the read exceeded its byte budget. Narrow the time range or add label filters for an oversized result.
           $ref: '#/components/responses/Problem'
         '504':
           description: The query exceeded its processing deadline.
@@ -283,6 +287,9 @@ paths:
                       $ref: '#/components/schemas/MetricSummary'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Capacity exhausted; respect Retry-After before retrying.
+          $ref: '#/components/responses/Problem'
 
   /v1/labels:
     get:
@@ -325,6 +332,9 @@ paths:
                       type: string
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Capacity exhausted; respect Retry-After before retrying.
+          $ref: '#/components/responses/Problem'
         '422':
           $ref: '#/components/responses/Problem'
 
@@ -374,6 +384,9 @@ paths:
                 : keep-alive
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '503':
+          description: Capacity exhausted; respect Retry-After before retrying.
+          $ref: '#/components/responses/Problem'
         '422':
           $ref: '#/components/responses/Problem'
 

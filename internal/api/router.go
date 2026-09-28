@@ -57,7 +57,8 @@ func NewRouter(deps Deps) http.Handler {
 	// something a reviewer can see at a glance rather than infer from a path
 	// prefix convention.
 	authenticated := auth.Middleware(deps.Auth)
-	mux.Handle("POST /v1/ingest", authenticated(handleIngest(deps.Ingest)))
+	admit := httpx.AdmitConcurrent(deps.Config.HTTP.MaxConcurrent)
+	mux.Handle("POST /v1/ingest", authenticated(admit(handleIngest(deps.Ingest))))
 
 	// ServeMux's implicit 404 is a plain-text body, which would make this the
 	// only endpoint in the API that does not speak problem+json. Registering a

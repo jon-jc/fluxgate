@@ -39,10 +39,11 @@ func NewQueryRouter(deps QueryRouterDeps) http.Handler {
 	mountMetrics(mux, deps.Config, deps.Metrics)
 
 	authenticated := auth.Middleware(deps.Auth)
+	admit := httpx.AdmitConcurrent(deps.Config.HTTP.MaxConcurrent)
 
-	mux.Handle("GET /v1/query", authenticated(handleQuery(deps.Query)))
-	mux.Handle("GET /v1/metrics", authenticated(handleMetrics(deps.Query)))
-	mux.Handle("GET /v1/labels", authenticated(handleLabels(deps.Query)))
+	mux.Handle("GET /v1/query", authenticated(admit(handleQuery(deps.Query))))
+	mux.Handle("GET /v1/metrics", authenticated(admit(handleMetrics(deps.Query))))
+	mux.Handle("GET /v1/labels", authenticated(admit(handleLabels(deps.Query))))
 	mux.Handle("GET /v1/stream", authenticated(handleStream(deps.Query)))
 
 	mux.Handle("/", handleUnmatched(mux))
