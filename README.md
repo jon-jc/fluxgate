@@ -1,916 +1,487 @@
 # Fluxgate
 
-A distributed, event-driven telemetry ingestion and stream-aggregation platform
-written in Go and built for Google Cloud Pub/Sub.
-
-Fluxgate accepts high-volume metric points over HTTP, publishes them onto a
-durable event bus, aggregates them into time windows across a fleet of stateless
-workers, and serves the rollups back over a query API. It is built to make the
-hard parts of a streaming pipeline explicit: backpressure, at-least-once
-delivery, duplicate suppression, late-arriving data, and clean shutdown.
-
-```mermaid
-flowchart LR
-    C[Clients] -->|POST /v1/ingest| I[ingest-api]
-    I -->|bounded queue<br/>batched publish| T((telemetry.raw))
-    I -->|durable retry reservations| P[(Postgres)]
-    T --> A[aggregator]
-    A -->|windowed rollups| P[(Postgres)]
-    A -.->|poison messages| D((telemetry.dlq))
-    P --> Q[query-api]
-    Q -->|REST + SSE| C
-```
-
-
-## Deploying
-
-[`deploy/terraform`](deploy/terraform) provisions the whole platform on GCP:
-Pub/Sub topology with dead-lettering, Cloud SQL on a private IP, three Cloud Run
-services, one service account per service, secrets in Secret Manager, and four
-alert policies. See [its README](deploy/terraform/README.md) for the apply, and
-for the parts that bite.
-
-Three decisions in there are worth calling out, because each is a mistake that
-produces no error message:
-
-**Dead lettering silently does nothing without two IAM bindings.** Pub/Sub's own
-service agent performs the dead-letter publish — not the consumer — so it needs
-publish rights on the dead-letter topic and subscribe rights on the source
-subscription. Without them there is no failure at apply time and none at run
-time: messages simply keep being redelivered forever.
-
-**The aggregator is not autoscaled.** Each instance holds open windows in memory
-and writes them only when they close, so scaling in mid-window hands the
-survivors a redelivery of everything the departing instance had not yet flushed.
-Correct, thanks to the delivery ledger, and pure rework.
-
-**CPU stays allocated on the aggregator and the query API.** Both work between
-requests — flushing on a timer, polling for a live tail. With Cloud Run's idle
-CPU throttling the flush timer would be throttled to a stop, and windows would
-only be written when a message happened to arrive.
-
-Permissions are split by what each service actually does. The ingest API holds
-credentials restricted to retry reservations; the query API holds no Pub/Sub
-permissions and can only read rollups and stream revisions. The separate migration
-job owns the schema. IAM and database grants enforce these service boundaries.
-
-## Decision records
-
-The choices that were genuinely contested, each with what it cost and what would
-make us revisit it — [`docs/adr`](docs/adr):
-
-| # | Decision |
-| --- | --- |
-| [1](docs/adr/0001-event-driven-pipeline.md) | Asynchronous pipeline rather than synchronous writes |
-| [2](docs/adr/0002-exactly-once-accumulation.md) | Exactly-once accumulation via a per-window delivery ledger |
-| [3](docs/adr/0003-json-envelope.md) | Versioned JSON on the wire rather than protobuf |
-| [4](docs/adr/0004-fixed-histogram-layout.md) | Fixed-layout histograms rather than adaptive sketches |
-| [5](docs/adr/0005-postgres-not-a-tsdb.md) | Postgres rather than a purpose-built time-series database |
-| [6](docs/adr/0006-separate-read-and-write-services.md) | Separate read and write services |
-| [7](docs/adr/0007-deferred-alerting.md) | Alerting deferred, and why |
-
-## Observability
-
-The pipeline is asynchronous and spans three processes, which makes the obvious
-question — *what happened to this point?* — the hard one. Tracing answers it.
-
-### One trace across the broker
-
-A request to the ingest API, the publish it triggers, and the aggregation that
-happens seconds later in another process are all one trace:
-
-```
-SERVICE                  SPAN                           KIND       DURATION
-fluxgate-ingest-api      POST /v1/ingest                server      12.1ms
-fluxgate-ingest-api      publish telemetry-raw          producer    12.0ms
-fluxgate-aggregator      consume telemetry-aggregator   consumer     0.6ms
-```
-
-The publisher writes W3C trace context into the Pub/Sub message attributes; the
-consumer reads it back out and starts its span as a child. Nothing is shared
-between the processes but the message itself.
-
-The propagator is installed **even when tracing is disabled**. A service that
-dropped the header because it was not itself sampling would silently break
-every trace passing through it, turning one unsampled hop into a permanently
-broken chain.
-
-Sampling is `ParentBased`: once the edge decides to record a request, every
-downstream hop honours that decision instead of re-rolling the dice and
-producing a trace with holes in it. The default ratio follows the tier — 1 on
-local and dev, 0.05 on staging and prod — because tracing every request is
-affordable while developing and ruinous at ingest volumes.
-
-**Telemetry can never take the service down.** OpenTelemetry errors are handled,
-not returned; the exporter batches rather than blocking the request path; and
-nothing in the compose stack gates a service on the collector being healthy.
-Telemetry being down costs visibility, never availability.
-
-### Metrics
-
-Every service exposes `/metrics` on its own listener. The instruments worth
-knowing about:
-
-| Metric | Why it matters |
-| --- | --- |
-| `fluxgate_aggregate_watermark_lag_seconds` | How far event time trails the wall clock. A rising line means the pipeline is falling behind, long before a queue-depth alarm would notice. |
-| `fluxgate_aggregate_tracked_series` | The number the cardinality bound applies to. Rising without traffic rising is the shape of a cardinality problem. |
-| `fluxgate_resilience_breaker_state` | 0 closed, 1 half-open, 2 open. Above zero means the edge is failing fast rather than waiting out timeouts. |
-| `fluxgate_publish_batches_total` | By outcome. Anything but `ok` means shedding, or an unhealthy broker. |
-| `fluxgate_consume_messages_total` | By outcome. `rejected` means something is heading for the dead-letter queue. |
-
-**Labels are bounded by construction.** Requests are labelled by *route pattern*
-— `POST /v1/ingest` — never by path, and every unmatched request shares one
-`unmatched` label so a scan for URLs that do not exist cannot mint a series per
-probe. Status codes are bucketed by class, because alerts are written against
-classes and the exact code is already in the access log where it can be read in
-context.
-
-That is not an incidental choice. This is a telemetry system: shipping one with
-an unbounded metric label would be a bad joke.
-
-### Logs, traces and metrics agree
-
-A request ID is generated at the edge, bound to the logger, carried in the
-response header, published as a message attribute, and re-attached by the
-consumer. Trace and span IDs are bound to the same logger. So a log line names
-the trace it belongs to, a trace names the request that produced it, and a
-metric shares the route label with both — which is what makes it possible to
-start anywhere and reach the other two.
-
-### Seeing it
-
-`make up` brings up Jaeger, Prometheus and a provisioned Grafana alongside the
-services:
-
-```
-Jaeger      http://localhost:16686   traces spanning all three services
-Prometheus  http://localhost:9090
-Grafana     http://localhost:3000    the "Fluxgate pipeline" dashboard, no login
-```
-
-## The query API
-
-Rollups are read back through a separate process on a separate port. Reads and
-writes scale on different axes and fail in different ways: an expensive
-dashboard query should not be able to slow telemetry ingestion, and an ingest
-spike should not make dashboards unreadable. The read path also holds only a
-read-shaped database pool and no publisher at all.
-
-```bash
-curl -H 'Authorization: Bearer fxg_local_local-dev-secret' \
-  'localhost:8082/v1/query?metric=http.request.duration_ms&from=-15m&agg=p95&label.status=500'
-```
-
-```json
-{
-  "metric": "http.request.duration_ms",
-  "kind": "histogram",
-  "aggregation": "p95",
-  "from": "2026-09-04T01:21:24Z",
-  "to": "2026-09-04T01:36:24Z",
-  "series": [
-    {
-      "labels": {"service": "checkout", "status": "500"},
-      "points": [{"t": "2026-09-04T01:36:00Z", "v": 219.48}]
-    }
-  ]
-}
-```
-
-**Percentiles come from the stored histogram buckets**, not from a recomputation
-over raw points that no longer exist. Asking for `p99` of a gauge returns an
-empty series *and a warning*, rather than a zero: a fabricated percentile
-rendered on a dashboard is worse than a gap, because nobody can tell it is
-wrong.
-
-**Relative ranges are first class.** `from=-15m` is what a human actually
-wants, and forcing them to compute two timestamps is how a dashboard ends up
-with a hard-coded range that silently goes stale. `from` is measured from `to`,
-not from now, so the two compose. The response echoes the resolved range, so a
-caller can see what a relative range actually meant.
-
-**Label filters are namespaced** as `label.<key>`. Without the prefix, a metric
-labelled `agg` or `from` would be unqueryable. Filtering uses JSONB containment
-against a GIN index rather than a join through a normalised label table: the
-rollup already carries its labels, so containment answers the question in one
-index lookup.
-
-**Every limit is a bound on a real failure.** A single unbounded query over a
-year of one-minute windows across a thousand series is half a billion rows, and
-the client that asked for it is usually a dashboard that will ask again in
-thirty seconds. Responses that hit a limit are marked `truncated`, so a caller
-can tell an incomplete answer from an empty one.
-
-**The tenant always comes from the credential.** There is no parameter for
-selecting one — a caller able to name someone else's tenant could read their
-data.
-
-### Live tail
-
-`GET /v1/stream` pushes rollups over server-sent events as the aggregator
-commits them:
-
-```
-retry: 2000
-
-event: rollup
-data: {"metric":"live.demo","labels":{},"window_start":"2026-09-04T01:36:30Z","count":3,"sum":600,"min":100,"max":300,"last":300}
-
-: keep-alive
-```
-
-SSE rather than WebSocket: the traffic is one-directional, every HTTP client
-already speaks it, it survives proxies that mangle upgrades, and reconnection is
-part of the protocol rather than of every client.
-
-The tail polls an indexed column rather than subscribing to a topic. A
-per-instance Pub/Sub subscription would deliver changes sooner, but every
-replica would need one created and torn down with the instance — runtime
-topology management, for a feature whose usable latency floor is a human
-looking at a screen.
-
-The cursor advances on **committed tenant revisions**, not event timestamps.
-Concurrent flushes for a tenant lock its revision counter until commit, so a
-slow transaction cannot arrive behind a cursor already sent to a reader. Pages
-also carry the row identity to handle multiple rows in one revision. Updates to
-the same rollup between polls may coalesce: this is a live view of current totals,
-not an event archive. Reconnecting starts at the current revision; refresh
-`/v1/query` to reconcile anything missed while disconnected.
-
-One routing detail worth noting: the request timeout is applied to every
-endpoint *except* the stream. A blanket timeout would sever each stream at the
-deadline, which a client cannot distinguish from a server fault — it would
-reconnect, be cut off again, and settle into a reconnect loop that looks exactly
-like an outage. The stream bounds itself with its own, much longer, budget.
-
-## The aggregator
-
-The aggregator consumes batches, folds their points into tumbling windows keyed
-by event time, and commits each closed window to Postgres. It is a separate
-binary from the ingest API, because the two scale on different axes: the edge
-scales with request rate, the aggregator with series cardinality.
-
-### Exactly-once, and how it is actually achieved
-
-Pub/Sub delivers at least once. Counting a redelivered batch twice would
-silently corrupt every aggregate it touches, and nothing downstream could
-detect it. Three things together make accumulation exactly-once:
-
-1. **The message is acknowledged only when its data is durable.** Acknowledging
-   on receipt would mean a crash between accepting a point and writing its
-   window loses the point while the broker believes it was delivered. The
-   subscriber runs in manual-acknowledgement mode and the runner settles each
-   message once every window it fed has committed.
-2. **Rollups and a delivery ledger commit in one transaction.** There is no
-   interval where the data is stored but the batch is not recorded, or the
-   reverse.
-3. **The ledger is keyed on (tenant, batch, window).** A batch that
-   straddles a boundary feeds two windows that flush at different times. Keyed
-   on the batch alone, one whose first window committed and whose second failed
-   would be recorded as fully processed -- and the retry that should have
-   rebuilt the second window would be skipped, losing it silently.
-
-The two crash windows both come out correct:
-
-| Crash point | Ledger | Acknowledged | On redelivery |
-| --- | --- | --- | --- |
-| Before commit | absent | no | Re-accumulated; correct |
-| After commit, before ack | present | no | Skipped; correct |
-
-Duplicate suppression has an in-memory half and a durable half, and both are
-needed: a redelivery arriving *before* the flush is not in the database yet, and
-one arriving *after a restart* is not in memory. A third state exists for a
-redelivery that lands *during* a write -- the outcome is not knowable yet, so
-the message is handed back rather than guessed at.
-
-Database transactions claim every contribution before updating any rollup.
-An overlapping claim rolls back the entire flush; redelivery excludes the
-contributions that another replica committed. This closes the race between the
-initial ledger lookup and a concurrent writer. The subscriber waits for settlement
-inside its Receive callback so the Pub/Sub client retains flow control and leases.
-
-### Watermarks and late data
-
-Watermarks determine when buffered windows are written. They do not reject
-already accepted telemetry: late batches and retries create additive corrections,
-even when a newer window has committed. This keeps backfill and recovery safe
-across replicas with different watermarks. The ingestion API bounds timestamp
-age; the durable ledger suppresses duplicate contributions.
-
-Admission is atomic for each batch. If the series capacity is exhausted, the
-whole batch is returned for redelivery instead of acknowledging a partial
-aggregate. Monitor the dead-letter subscription during sustained overload.
-
-Event-time watermarks have one structural weakness: they only advance when data
-arrives, so a producer that stops sending strands its final window one
-observation short of closing, permanently. After a configurable silence the
-watermark is allowed to advance on processing time instead, far enough to close
-the oldest open window and no further -- jumping it to the wall clock would slam
-every window shut at once, including ones a resuming producer could still fill.
-
-### What is stored
-
-One row per series per window: count, sum, min, max, last, and for histogram
-series a fixed-layout bucket vector. The upsert merges additively, so a window
-written in two pieces -- by two replicas, or by one across a restart -- totals
-the same as if it had been written once. That is sound only because every
-statistic is associative, which is also why `last` is resolved by event time
-rather than by whichever write arrived second. Equal timestamps choose the
-larger value, giving a deterministic tie break in memory and SQL. Different
-metric kinds remain separate series, even with identical names and labels.
-
-Histogram buckets are exponential with a fixed layout, so absolute error grows
-with the value: a 1ms measurement is resolved far more finely than a 10s one,
-which is the right trade when the question is "is p99 2ms or 20ms". The layout
-is fixed rather than adaptive precisely so two accumulators can always be merged
-by adding their bucket counts -- including inside SQL, via a small immutable
-function, which keeps the upsert a single statement instead of a
-read-modify-write race between replicas.
-
-## The event transport
-
-Accepted batches are published to Pub/Sub and consumed asynchronously. The
-whole path -- validation, publish, broker, consume -- is exercised in CI against
-a real emulator rather than a mock.
-
-**A 202 is a durability guarantee, not a hopeful one.** `Publish` waits for the
-broker to acknowledge the message before the handler returns. The faster
-alternative, accepting into an in-process buffer and replying 202 immediately,
-is quietly dishonest: it reports success for data that a crash, a deploy or an
-OOM kill silently discards. Client-side batching is what keeps that honesty
-from costing throughput.
-
-**Load is shed, not buffered.** Publisher flow control signals an error rather
-than blocking. A blocked publish holds an HTTP connection open with no upper
-bound, so a slow broker quietly converts into an exhausted server; rejecting
-the request lets the client retry against an instance that has capacity.
-
-**A circuit breaker turns an outage into a fast 503.** The problem with a
-dependency being down is not the failure, it is the queue behind it: every
-publish waits out its full timeout holding a connection, a goroutine and a
-request worth of memory. After a few consecutive failures the breaker opens and
-fails immediately, then admits a limited number of probes after a cooldown --
-enough to notice recovery, not enough to knock over a broker that is only just
-coming back. Readiness reads the breaker rather than making its own probe call,
-so an instance that cannot publish leaves rotation instead of accepting batches
-it will only reject.
-
-**Message ordering is deliberately off.** It would pin publishing to one region
-and serialise delivery per key. Every aggregation downstream is sum, count, min
-or max, all commutative, so ordering would be a throughput ceiling bought in
-exchange for nothing.
-
-**Retryable and permanent failures are different things.** A consumer whose
-database blinked must retry; a consumer handed a body that is not valid JSON
-must not, because the thousandth attempt fails exactly like the first while
-burning quota. Permanent failures are nacked straight through to a dead-letter
-queue, where the payload is preserved and inspectable. Every working
-subscription the bootstrap creates has a dead-letter policy attached, because
-one without it redelivers a poisoned message forever.
-
-**Attributes are a routing surface, not decoration.** Pub/Sub subscription
-filters can only match on attributes, so tenant, schema version, batch ID and
-point count travel there as well as in the body: a per-tenant subscription can
-be filtered server-side without every consumer deserialising messages it is
-about to discard. The request ID rides along too, which is what lets a trace
-continue from the HTTP edge into an aggregator running minutes later on a
-different machine.
-
-**The envelope is versioned JSON.** At this message size the bandwidth saving
-of a binary format is immaterial next to the operational cost of a payload an
-engineer cannot read straight off a dead-letter queue at 3am. The schema
-version is the hedge: consumers reject a version they were not written for
-rather than guessing, so changing encodings later is a version bump, not a
-rewrite.
-
-## The ingest endpoint
-
-`POST /v1/ingest` takes a batch of metric points. The full contract is in
-[api/openapi.yaml](api/openapi.yaml); the decisions behind it are below.
-
-```bash
-curl -X POST localhost:8080/v1/ingest   -H 'Authorization: Bearer fxg_k1_<secret>'   -H 'Content-Type: application/json'   -d '{"points":[
-        {"metric":"http.request.duration_ms","kind":"histogram","value":12.5,
-         "labels":{"service":"checkout","region":"us-central1"}},
-        {"metric":"queue.depth","kind":"gauge","value":42}
-      ]}'
-```
-
-```json
-{"batch_id":"9f2c1a4be6d84f0fa1c3e7b25d908146","accepted":2,"rejected":0}
-```
-
-**Partial success is the point.** A batch with one bad point admits the other
-999 and reports the failure with its exact index. Rejecting the whole batch
-would let a single misbehaving call site in a client silently blind an entire
-service's telemetry — and telemetry is exactly what you need working when
-something is going wrong. A 202 does not mean everything was accepted; check
-`rejected`.
-
-```json
-{"batch_id":"47f5...","accepted":1,"rejected":2,"errors":[
-  {"field":"points.1.metric","message":"contains \"9\" at position 0; use letters, digits, '_', '.' and '-', starting with a letter or '_'"},
-  {"field":"points.2.labels.__tenant","message":"uses the reserved \"__\" prefix"}
-]}
-```
-
-**Validation protects specific downstream resources**, and the tightest rule is
-the 20-label ceiling: cardinality is multiplicative, and an unbounded label set
-is the fastest way to make a time-series store unqueryable. Non-finite values
-are rejected because a single NaN turns a whole window's mean into NaN with
-nothing left to identify which point caused it. Timestamps may run 5 minutes
-ahead — client clocks drift, and rejecting those senders loses real data — but
-not 7 days behind, since that data arrives after its aggregation window has
-closed. Labels prefixed `__` are reserved, so a tenant cannot forge a system
-dimension and write into another tenant's series.
-
-**Quota is metered in points per second, not requests per second.** A thousand
-points in one batch and a thousand single-point requests place identical load
-on everything downstream, so charging per request would let a caller evade its
-allowance simply by batching. The limiter is a sharded token bucket: a fixed
-window would admit a double-rate spike across its boundary, which is precisely
-the traffic shape that overwhelms a downstream service. Denials carry
-`Retry-After` — unless waiting cannot help, because the batch is larger than the
-burst will ever hold, in which case the response says to split it instead.
-
-**Retries with a shared store are safe within `IDEMPOTENCY_TTL`.** A client that times out cannot tell whether its batch
-landed. Send `Idempotency-Key` and repeat the identical body: the original
-response is replayed rather than the data being counted twice. Reusing a key
-with a *different* body is a 409. The batch identity, server timestamps, and
-response are reserved in Postgres **before** publishing. If a publish times out
-ambiguously, retries publish the identical batch and the delivery ledger prevents
-double counting. A confirmed response is shared across replicas and restarts.
-Without a key, each HTTP attempt is a new batch. Expired keys may be reused for
-new work; do not retry an old operation beyond its TTL.
-
-`DATABASE_URL` is required for ingestion on staging and prod. Local and dev may
-use a bounded in-memory store; retries there do not survive a process restart.
-Apply migration 0004 before starting ingest replicas. The aggregator reclaims
-expired retry payloads during retention maintenance.
-
-**Authentication is bearer API keys** in the form `fxg_<key id>_<secret>`. Only
-a SHA-256 digest is stored, so a leaked configuration file does not hand anyone
-working credentials. Every failure returns a byte-identical 401 regardless of
-cause: a client that could distinguish "unknown key" from "bad secret" has an
-oracle for enumerating valid key IDs. Verification runs a constant-time
-comparison against a placeholder digest even when the key ID does not exist, so
-timing does not leak what the response body refuses to.
-
-The tenant always comes from the credential, never from the request body.
-
-## The foundation
-
-Milestone 1 is the substrate every service in the platform is built on.
-
-**Configuration** (`internal/config`) is resolved once from the environment and
-validated eagerly, so a bad deployment fails during boot — while an orchestrator
-can still roll it back — rather than on the first request. Every problem is
-reported at once, so one boot attempt surfaces every typo instead of one
-redeploy per typo. Byte sizes accept `4MB` as readily as `4194304`, and `PORT`
-overrides the listener address because that is what Cloud Run injects.
-
-**Structured logging** (`internal/observability`) emits JSON keyed the way Cloud
-Logging expects (`severity`, `message`, `timestamp`), so severity-based alerting
-works without a log-router transformation in between. A request-scoped logger is
-bound into the context once, so every downstream record carries the request ID
-without a single handler having to remember it.
-
-**HTTP middleware** (`internal/httpx`) covers correlation IDs, client IP
-resolution, panic recovery, access logging, request deadlines, body size limits,
-and security headers. A few decisions worth calling out:
-
-- **Correlation IDs are sanitised, not trusted.** An inbound `X-Request-Id` is
-  reused so a trace survives across service hops, but only if it is short and
-  alphanumeric. Without that check, a client could inject CRLF into a response
-  header or forge structure into every JSON log line the request produces.
-- **`X-Forwarded-For` is off by default.** Honouring it without a proxy in front
-  lets any caller spoof its address and walk straight through per-IP limits.
-- **Request timeouts use context, not `http.TimeoutHandler`.** The standard
-  handler buffers the entire response in memory to be able to discard it, which
-  breaks the streaming endpoints milestone 5 adds.
-
-**Error handling** is total and uniform. Handlers return errors; a single
-adapter decides the status code and renders an RFC 9457 `application/problem+json`
-document — including the 404 from the router itself, so there is no endpoint in
-the API that speaks a different dialect on failure. Internal causes are logged
-and never serialised: a client sees `internal_error`, not a database address.
-The JSON decoder rejects unknown fields and names the offending key, so a client
-that sends `timestmap` hears about the typo immediately instead of debugging why
-its data silently vanished.
-
-**Health probes** separate liveness from readiness, because they answer
-different questions. Liveness asks whether the process is wedged and needs a
-restart; readiness asks whether this instance should receive traffic. A database
-blip should drain an instance, not kill it — restarting does not fix the
-database, and a restart loop across the fleet turns a dependency blip into an
-outage. Dependency checks run concurrently, are bounded by a probe timeout, and
-a panic in one is contained rather than taking the process down.
-
-**Graceful shutdown** is three-phase, which is what keeps a rolling deploy from
-shedding requests:
-
-1. Fail readiness immediately, so the load balancer stops routing new work here.
-2. Keep serving for a grace period, because the balancer has not noticed yet and
-   requests arriving in that window should be served, not refused.
-3. Close the listener and drain in-flight requests under a bounded timeout,
-   forcing connections closed if a handler ignores its context.
-
-Skipping step 2 is the usual cause of a handful of 502s on every deploy.
-
-### Under load
-
-`make load` drives synthetic telemetry at a running stack. On a laptop, against
-the full compose stack — every service, the emulator and Postgres sharing one
-machine with the load generator:
-
-```
-  batches         897 (45/s)
-  points          179400 (8970/s)
-  status
-    202           897
-  latency (client-side, includes the broker acknowledgement)
-    p50           55.5ms
-    p90           57.9ms
-    p99           60.7ms
-```
-
-Those 179,400 points became **240 rollup rows** — four metrics across ten hosts
-over the run's windows — and the percentiles were queryable per series
-immediately afterwards. Watermark lag held at 4.2s against a 10s window.
-
-The latency is dominated by the broker acknowledgement, which is the honest
-cost of a 202 that means *durable* rather than *buffered*. See
-[ADR 1](docs/adr/0001-event-driven-pipeline.md) for why that trade is made
-deliberately.
-
-Removing the `-rate` cap is also worth doing once: the run saturates, and 2163
-of 3261 batches come back 429 with `Retry-After`. That is the rate limiter
-working — quota is metered in points per second, so a bigger batch consumes
-proportionally more of it.
+[![CI](https://github.com/jon-jc/fluxgate/actions/workflows/ci.yml/badge.svg)](https://github.com/jon-jc/fluxgate/actions/workflows/ci.yml)
+
+A Go telemetry pipeline built on Google Cloud Pub/Sub and PostgreSQL. Fluxgate
+accepts metric batches over HTTP, aggregates them into event-time windows, and
+serves the results through REST queries and server-sent events.
+
+The pipeline handles retries across replicas, duplicate deliveries, late data,
+bounded resource use, and recovery after process or database failures. Deployment
+configuration targets Cloud Run and private Cloud SQL, with separate runtime and
+migration identities.
+
+**Status:** production hardening is implemented and exercised in local/CI tests.
+Real GCP staging, capacity, IAM, alerting, and recovery validation remain release
+gates. See [production deployment](#production-deployment) before serving live traffic.
+
+[Quick start](#quick-start) · [Architecture](#architecture) · [API](#api) ·
+[Verification](#verification) · [Configuration](#configuration) ·
+[Production deployment](#production-deployment) · [Development](#development)
 
 ## Quick start
 
-The full stack -- Pub/Sub emulator and the ingest API -- comes up with one
-command. Requires Docker.
+Requires Docker with Compose. The stack includes the three services, PostgreSQL,
+the Pub/Sub emulator, Jaeger, Prometheus, and Grafana. No GCP project is needed.
 
-```bash
+```sh
 git clone https://github.com/jon-jc/fluxgate.git
 cd fluxgate
-make up
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-Send a batch through the real broker:
+`make up` runs the same command if Make and Bash are available. Published ports
+bind to loopback; the example credential belongs only to this local stack.
 
-```bash
-curl -X POST localhost:8080/v1/ingest \
+| Service | Local address |
+| --- | --- |
+| Ingest API | http://localhost:8080 |
+| Aggregator probes | http://localhost:8081 |
+| Query API | http://localhost:8082 |
+| Jaeger | http://localhost:16686 |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 — preconfigured dashboard, no login |
+| Pub/Sub emulator | `localhost:8681` |
+| PostgreSQL | `localhost:5442` — database/user/password: `fluxgate` |
+
+Send a batch, using Bash/curl syntax:
+
+```sh
+curl -sS http://localhost:8080/v1/ingest \
   -H 'Authorization: Bearer fxg_local_local-dev-secret' \
   -H 'Content-Type: application/json' \
-  -d '{"points":[{"metric":"queue.depth","kind":"gauge","value":42}]}'
+  -H 'Idempotency-Key: quickstart-001' \
+  -d '{"points":[
+    {"metric":"queue.depth","kind":"gauge","value":42},
+    {"metric":"http.request.duration_ms","kind":"histogram","value":12.5,
+     "labels":{"service":"checkout"}}
+  ]}'
 ```
+
+A successful response reports the batch identity and per-point outcome:
 
 ```json
-{"batch_id":"7f0c8e8327d609ba5917480caeea6a7b","accepted":1,"rejected":0}
+{"batch_id":"<generated-id>","accepted":2,"rejected":0}
 ```
 
-Within a few seconds the aggregator closes the window, and the rollup is
-readable:
+After the local aggregation window closes, query the result:
 
-```bash
-curl -H 'Authorization: Bearer fxg_local_local-dev-secret' \
-  'localhost:8082/v1/query?metric=queue.depth&from=-15m&agg=sum'
+```sh
+curl -sS -H 'Authorization: Bearer fxg_local_local-dev-secret' \
+  'http://localhost:8082/v1/query?metric=queue.depth&from=-15m&agg=sum'
 ```
 
-```json
-{"metric":"queue.depth","aggregation":"sum",
- "series":[{"labels":{},"points":[{"t":"2026-09-04T01:05:40Z","v":42}]}]}
+Repeat the same body and idempotency key to replay the original outcome. Use a
+new key for a new observation. In PowerShell, the equivalent ingestion call is:
+
+```powershell
+$headers = @{ Authorization = 'Bearer fxg_local_local-dev-secret'; 'Idempotency-Key' = 'quickstart-powershell-001' }
+$body = '{"points":[{"metric":"queue.depth","kind":"gauge","value":42}]}'
+Invoke-RestMethod -Uri http://localhost:8080/v1/ingest -Method Post -Headers $headers -ContentType 'application/json' -Body $body
 ```
 
-Readiness reports each service's own dependencies:
+Check `/healthz`, `/readyz`, and `/v1/version` on each service. Readiness reports
+dependency status and keeps error details in logs. Stop the stack while retaining
+its PostgreSQL volume with:
 
-```bash
-curl -s localhost:8080/readyz   # {"status":"ok","checks":{"pubsub-publisher":"ok"}}
-curl -s localhost:8081/readyz   # {"status":"ok","checks":{"postgres":"ok"}}
-curl -s localhost:8082/readyz   # {"status":"ok","checks":{"postgres":"ok"}}
+```sh
+docker compose -f deploy/docker-compose.yml down
 ```
 
-`make psql` opens a shell on the database; `make down` discards the stack and
-its state.
+The emulator's state is ephemeral. `make down` also removes the PostgreSQL volume
+and discards local database data.
 
-### Without Docker
+### Ingest-only development
 
-Requires Go 1.27 or newer. Runs against the in-memory sink with authentication
-off:
+CI and container builds use Go 1.27; the module minimum is Go 1.26. With no
+configuration overrides, this starts the local ingest process:
 
-```bash
-make run
+```sh
+go run ./cmd/ingest-api
 ```
 
-In another shell:
+Local defaults disable authentication and use an in-memory sink. This mode is
+useful for handler development; it does not persist telemetry or run the query
+pipeline. Use Compose or the packaged verification below for the complete flow.
 
-```bash
-curl -s localhost:8080/healthz
-curl -s localhost:8080/readyz
-curl -s localhost:8080/v1/version
+To build and run that same local-only mode in a container:
+
+```sh
+docker build -f build/docker/Dockerfile --build-arg SERVICE=ingest-api -t fluxgate/ingest-api:local .
+docker run --rm -p 127.0.0.1:8080:8080 -e ENVIRONMENT=local fluxgate/ingest-api:local
 ```
 
-Every response carries an `X-Request-Id`. Quote it when reporting a problem —
-it is in the logs too.
+## Architecture
 
-To see the error envelope:
-
-```bash
-curl -s -i localhost:8080/v1/nope
+```mermaid
+flowchart LR
+    C[Clients] -->|HTTP batches| I[ingest-api]
+    I -->|retry reservations| P[(PostgreSQL)]
+    I -->|confirmed publish| T((Pub/Sub raw topic))
+    T --> A[aggregator]
+    T -.->|dead-letter policy| D((Dead-letter topic))
+    A -->|rollups + delivery ledger| P
+    P --> Q[query-api]
+    Q -->|REST + SSE| C
+    M[migrate job] -->|schema + runtime grants| P
 ```
 
-### Container
+| Component | Responsibility |
+| --- | --- |
+| `ingest-api` | Authenticate, validate, meter points, reserve retry identity, and publish |
+| `aggregator` | Consume, buffer bounded windows, persist rollups, acknowledge durable work, and prune retained data |
+| `query-api` | Read tenant-scoped rollups, metric/label metadata, and committed live updates |
+| `migrate` | Apply schema migrations and provision restricted database roles |
+| `loadgen` | Generate synthetic HTTP traffic for development and measurements |
 
-```bash
-docker build -f build/docker/Dockerfile --build-arg SERVICE=ingest-api -t fluxgate/ingest-api .
-docker run --rm -p 8080:8080 -e ENVIRONMENT=dev fluxgate/ingest-api
-```
+### Delivery and aggregation guarantees
 
-The runtime image is `distroless/static` running as a non-root user: no shell,
-no package manager, nothing for an attacker who achieves code execution to
-pivot with.
+With Pub/Sub enabled, a `202` follows broker-confirmed publication, or replays a
+previously confirmed outcome. Aggregation is asynchronous: acceptance does not
+mean a rollup is immediately queryable. A timeout or `503` can leave publication
+ambiguous, so retry with the same idempotency key and identical body.
 
-## Development
+PostgreSQL reserves the batch identity, server timestamps, and response before
+publication. Shared retry outcomes survive replica changes and restarts within
+`IDEMPOTENCY_TTL` (24 hours by default). A changed body with the same key returns
+`409`; without a key, each HTTP attempt is a new batch. Do not retry an old
+operation after its key expires. Completed reservations release their point
+payload; pending publications retain it for safe retry.
 
-```bash
-make help              # list every target
-make test              # unit tests with the race detector
-make test-integration  # tests needing a real broker and database
-make psql              # a shell on the local database
-make cover             # coverage profile and per-package summary
-make lint              # golangci-lint
-make vulncheck         # known vulnerabilities in dependencies
-make load              # drive synthetic telemetry at a running stack
-make tf-check          # format and validate the Terraform
-make ci                # what the pipeline enforces
-```
+Pub/Sub delivers at least once. Fluxgate suppresses duplicate accumulation using
+transactional claims keyed by **tenant, batch, and window**. Rollups and claims
+commit together, and the message is acknowledged only after every contributing
+window is durable. Overlapping claims roll back the flush for redelivery.
 
-The integration tests skip themselves when `PUBSUB_EMULATOR_HOST` and
-`TEST_DATABASE_URL` are unset, so `go test ./...` stays green without Docker.
-CI runs them against a real emulator and a real Postgres under the race
-detector, and fails the build if they report a skip -- a suite that silently
-stops covering anything is worse than one that fails.
+| Failure point | Recovery |
+| --- | --- |
+| Before commit | Unacknowledged work is redelivered and accumulated again |
+| After commit, before acknowledgment | The persisted ledger suppresses the duplicate |
+| During an overlapping replica flush | The transaction rolls back; retry excludes contributions already committed |
 
-Using a real database rather than a mock is deliberate: the additive upsert, the
-histogram merge function and the ledger's composite key are exactly the parts a
-mock would get wrong in agreement with its author.
+This guarantee lasts only as long as the delivery ledger is retained. Archive
+replay beyond that horizon needs the ledger preserved or rebuilt first.
 
-`make test` needs cgo for the race detector. On a machine without a C toolchain,
-use `make test-short` locally — CI runs the race detector on Linux regardless.
+Workers use event-time watermarks with an idle timeout to close buffered windows.
+Late accepted data produces additive corrections, including after a window has
+already committed. Admission is atomic for each batch: capacity exhaustion
+returns the whole batch for redelivery. Sustained overload can reach the
+configured dead-letter policy and requires operator attention.
 
-### Fuzzing
+Each rollup is keyed by tenant, metric name, kind, labels, and window. Stored
+statistics are count, sum, min, max, and last, plus fixed exponential buckets for
+histograms. Last-value ordering uses event timestamps at PostgreSQL microsecond
+precision; equal timestamps choose the larger value. Histogram percentiles are
+estimates derived from the stored buckets.
 
-Every boundary that parses input the service does not control has a fuzz target,
-and each one asserts a property rather than merely checking for a panic:
+## API
 
-| Target | Boundary | Property held |
+Data routes require `Authorization: Bearer fxg_<key_id>_<secret>` when
+authentication is enabled. The credential selects the tenant; clients cannot
+select another tenant through a request parameter. Only SHA-256 secret digests
+are stored. Credential identifiers and secret lengths are bounded before lookup.
+
+See [the OpenAPI contract](api/openapi.yaml) for request/response schemas and
+error codes. Errors use `application/problem+json` with a stable `code` field;
+internal causes are logged rather than exposed.
+
+| Endpoint | Service | Purpose |
 | --- | --- | --- |
-| `FuzzDecodeEnvelope` | broker message | never panics; every decode failure is permanent, so a poison message reaches the dead-letter queue instead of redelivering forever |
-| `FuzzEnvelopeRoundTrip` | publish/consume | anything the edge publishes, a consumer reads back byte-identical |
-| `FuzzParse` | query string | a request Parse blesses has a non-inverted range within the limit and an aggregation the builder implements |
-| `FuzzHashLabels` | series identity | equal label sets hash equally; distinct ones never collide |
-| `FuzzWindowFor` | event-time windowing | windows tile the timeline with no gaps and no overlaps, and every point lands in the one containing it |
-| `FuzzVerify` | credentials | no token but the issued one authenticates, and a rejection returns no partial identity |
-| `FuzzParseKeys` | key document | a malformed document never yields a store that accepts a blank credential |
-| `FuzzValidatePoint` | ingest validation | a point that passes is safe for every assumption the aggregator makes without rechecking |
+| `POST /v1/ingest` | Ingest | Submit a batch of points |
+| `GET /v1/query` | Query | Read a metric's aggregated series |
+| `GET /v1/metrics` | Query | List stored metric metadata |
+| `GET /v1/labels` | Query | Discover label keys or values |
+| `GET /v1/stream` | Query | Stream committed rollup updates over SSE |
+| `GET /healthz`, `GET /readyz`, `GET /v1/version` | All three services | Process health, dependencies, and build identity |
 
-Run one locally:
+### Input and retry rules
 
-```bash
-go test -run '^$' -fuzz FuzzValidatePoint -fuzztime 60s ./internal/telemetry
+- Batches contain at most 1,000 points. Valid points can be accepted while invalid
+  points are rejected; always inspect `accepted`, `rejected`, and `errors` on a
+  `202` response. Error lists may be truncated while counts remain exact.
+- Kinds are `gauge`, `counter`, and `histogram`. Counters are nonnegative
+  increments, not cumulative totals.
+- `value` is required, finite, and bounded to ±1e100. Zero is valid; missing or
+  null values are rejected.
+- Omitted/null timestamps use arrival time; explicit zero timestamps are invalid.
+  The default HTTP acceptance range is
+  seven days of backfill and five minutes of future clock skew. Broker delivery
+  validates structure without rejecting retained messages for their age.
+- A point has at most 20 labels. Names, label sizes, and UTF-8 are validated;
+  labels beginning with `__` are reserved.
+- Point-rate limits and stream quotas apply per tenant **per instance**. Scaling
+  replicas multiplies the allowance. Hard tenant-wide quotas require a shared
+  gateway or another coordinated mechanism.
+- Honor `Retry-After` on `429`/`503` responses. Preserve the same body and
+  idempotency key across retries, including ambiguous publication failures.
+
+### Queries and live updates
+
+Queries accept RFC 3339 timestamps or relative ranges such as `from=-15m`.
+Relative `from` is measured from `to`; responses echo the resolved range. Label
+filters use `label.<name>`, for example `label.service=checkout`.
+
+```sh
+curl -sS -H 'Authorization: Bearer fxg_local_local-dev-secret' \
+  'http://localhost:8082/v1/query?metric=http.request.duration_ms&from=-15m&agg=p95&label.service=checkout'
+
+curl -N -H 'Authorization: Bearer fxg_local_local-dev-secret' \
+  'http://localhost:8082/v1/stream?metric=queue.depth'
 ```
 
-Fuzzing runs nightly rather than on pull requests. It is a randomised search, so
-a target that passes on one run can fail on the next with no change to the code
-— blocking every pull request on that teaches people a red check means "run it
-again", which is worse than not having the check at all. What blocks is fully
-deterministic instead: the seed corpus and every crasher ever found are committed
-under `testdata/`, and `go test ./...` replays all of them on every pull request.
-A bug found at night becomes a permanent regression test by morning.
+Percentiles require histogram data; unsupported percentile queries return
+warnings rather than fabricated values. Row/series limits set `truncated` when
+results are cut short. Reads that exceed the materialization byte budget return
+`422`; narrow the time range or add label filters.
 
-This was worth doing twice over.
+SSE follows committed tenant revisions, so a slow transaction cannot commit
+behind an already advanced cursor. Updates to the same rollup between polls may
+coalesce. Reconnects begin at the current revision; refresh REST queries to
+reconcile missed updates. Streams have separate connection quotas, bounded
+polls, socket-write deadlines, and maximum lifetimes.
 
-`FuzzParseKeys` found that a key document with a whitespace-only `tenant_id` was
-accepted. The tenant ID is the partition key for every stored row and every
-query, so `" "` is a real, addressable tenant that no operator meant to create —
-and one that reads as blank in any config file, log line or dashboard. A
-deployment typo would have issued a working credential whose data landed
-somewhere nobody would ever look, which is exactly what validating the document
-at startup is supposed to prevent.
+## Verification
 
-`FuzzEnvelopeRoundTrip` found that a label value
-containing invalid UTF-8 was silently rewritten: Go's JSON decoder replaces the
-bad bytes with U+FFFD and returns no error, so the client received a `202` for a
-point this service had quietly altered, with nothing anywhere recording the
-difference. RFC 8259 requires JSON text to be UTF-8, so the fix was to reject
-it — at the HTTP edge, and again in the validator, which is the domain-level
-contract any future non-JSON ingestion path would inherit.
+Requires Docker and Python 3. Run the same packaged workload used by CI:
+
+```sh
+python scripts/verify_pipeline.py --load-batches 200
+python scripts/verify_build_context.py
+python scripts/audit_images.py --output-dir ../image-audit/reports --cache-dir ../image-audit/cache
+```
+
+The pipeline script builds all four release images, creates disposable containers
+on a unique network with random loopback ports, and removes its test resources
+when finished. Use `--skip-build` to reuse local validation images, or
+`--load-batches 2000` for one million points. No cloud resources are used.
+
+The check covers:
+
+- Two ingest replicas, persisted retry identities, changed-body conflicts, and
+  tenant isolation.
+- Sixteen concurrent clients submitting 500-point batches, with every batch
+  replayed through the other replica. All 600 series reconcile count, sum, min,
+  max, and last across counter, gauge, and histogram data.
+- Rate/concurrency backpressure, liveness during load, sampled resident memory,
+  and container restart/OOM status. APIs have 512 MiB limits; the aggregator has
+  1 GiB. Services run as nonroot with read-only filesystems and dropped capabilities.
+- Aggregator termination before commit, broker redelivery, database outages, and
+  retention spanning more than one 10,000-row cleanup transaction.
+- A quiesced PostgreSQL backup restored into a separate database. All five
+  application tables are compared before restricted services verify HTTP retry
+  identity, broker duplicate suppression, and a fresh write.
+
+### Recorded local results
+
+The September 28, 2026 million-point fixture reconciled **1,000,000 points across
+600 series in 49.1 seconds**, including cross-replica replays. It handled 658
+rate-limit and 24 concurrency-limit rejections. Sampled aggregator RSS peaked at
+116.94 MiB. The fixture used fixed timestamps and eight admitted requests per API
+replica; the default is four. These are local observations, not GCP capacity or
+latency guarantees. The final crypto dependency refresh was subsequently checked
+with the complete 100,000-point load and recovery run.
+
+### CI and release scanning
+
+[CI](.github/workflows/ci.yml) runs race-enabled Go tests, PostgreSQL/Pub/Sub
+integration, lint, reachable-code vulnerability checks, Terraform validation and
+mocked plans, container builds, and the packaged load/recovery check. Integration
+checks fail if their required fixtures silently skip.
+
+Compiler/runtime base images and GitHub Actions use immutable pins. Docker's
+allowlist admits only compilation inputs, with a regression check that excludes
+dummy credential files at the root and inside source directories. Images use a
+nonroot distroless runtime.
+
+The pinned Trivy scanner uses a current advisory database and blocks MEDIUM,
+HIGH, and CRITICAL findings, including unfixed ones. Scanner failures fail CI.
+JSON reports and CycloneDX inventories are retained for 30 days. LOW/UNKNOWN
+findings remain visible for review; [dated advisory notes](docs/security-scanning.md)
+explain the current OpenPGP and timezone-data findings. A passing scan is not a
+claim that the service is free of vulnerabilities.
 
 ## Configuration
 
-Every setting has a working default; an empty environment boots correctly. See
-[.env.example](.env.example) for the full list with defaults and constraints.
+Settings are read from the environment and validated at startup. See
+[.env.example](.env.example) for examples and
+[the configuration loader](internal/config/config.go) for defaults and constraints.
+The application does not automatically load `.env` files. Local example values
+are not production credentials or deployment settings.
 
-The ones that most often need changing:
+| Setting | Default / behavior |
+| --- | --- |
+| `ENVIRONMENT` | `local`; also supports `dev`, `staging`, `prod` |
+| `API_KEYS` / `API_KEYS_FILE` | JSON key document; required when authentication is enabled |
+| `AUTH_DISABLED` | True locally; forbidden on staging/prod |
+| `PUBSUB_ENABLED` | False locally unless an emulator is configured; required on staging/prod |
+| `GCP_PROJECT_ID` | Required when Pub/Sub is enabled |
+| `DATABASE_URL` | Required for aggregator/query and for shared ingest retries on staging/prod |
+| `CLOUD_SQL_INSTANCE` | Enables the IAM-authorized private-IP Cloud SQL connector |
+| `DATABASE_MIGRATE` | False and required to remain false on staging/prod; use the migration job |
+| `IDEMPOTENCY_TTL` | `24h`; retry identities must survive the client's retry horizon |
+| `RATE_LIMIT_POINTS_PER_SECOND` / `RATE_LIMIT_BURST` | `10000` / `20000` per tenant per instance; key configuration can override |
+| `HTTP_MAX_CONCURRENT` | 4 active non-stream data requests per API instance; excess receives `503` |
+| `AGGREGATOR_WINDOW_SIZE` / `AGGREGATOR_ALLOWED_LATENESS` | `1m` / `30s` |
+| `AGGREGATOR_MAX_SERIES` | 100,000 tracked series |
+| `AGGREGATOR_MAX_BUFFERED_BYTES` | 128 MiB estimated accumulation budget |
+| `AGGREGATOR_MAX_OUTSTANDING_BYTES` | 16 MiB subscriber wire-data budget |
+| `QUERY_MAX_RANGE` / `QUERY_MAX_SERIES` / `QUERY_MAX_POINTS` | `744h` / 500 / 50,000 |
+| `QUERY_STREAM_MAX_CONCURRENT` / `QUERY_STREAM_MAX_PER_TENANT` | 100 / 8 per instance; tenant exhaustion returns `429`, total exhaustion `503` |
+| `ROLLUP_RETENTION` / `LEDGER_RETENTION` | `720h` / `768h`; align the ledger with raw, dead-letter, and retry retention |
+| `PRUNE_INTERVAL` | `5m`; cleanup uses bounded chunks and per-table deadlines |
+| `HTTP_TRUST_PROXY_HEADER` / `HTTP_TRUST_TRACE_PARENT` | False; enable only behind a gateway that rewrites/authenticates the corresponding headers |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | A configured endpoint enables tracing; production requires a real TLS collector |
+| `TRACE_SAMPLE_RATIO` | 1 on local/dev; 0.05 on staging/prod |
 
-| Variable | Default | Notes |
-| -------- | ------- | ----- |
-| `ENVIRONMENT` | `local` | `local`, `dev`, `staging` or `prod` |
-| `AUTH_DISABLED` | `true` on `local`, else `false` | Validation **refuses** `true` on staging and prod |
-| `API_KEYS` / `API_KEYS_FILE` | — | Required whenever authentication is on |
-| `RATE_LIMIT_POINTS_PER_SECOND` | `10000` | Per tenant per instance; a key may override it |
-| `PUBSUB_ENABLED` | `false` on `local`, else `true` | Validation **refuses** `false` on staging and prod |
-| `GCP_PROJECT_ID` | -- | Required when the transport is enabled |
-| `PUBSUB_EMULATOR_HOST` | -- | Setting it also enables the transport and topology bootstrap |
-| `DATABASE_URL` | -- | Required by aggregator/query; required for shared ingest retries on staging/prod |
-| `AGGREGATOR_WINDOW_SIZE` | `1m` | Event time covered by each rollup |
-| `AGGREGATOR_ALLOWED_LATENESS` | `30s` | Freshness traded for out-of-order tolerance |
-| `QUERY_MAX_RANGE` | `744h` | Longest span one query may cover |
-| `QUERY_MAX_SERIES` | `500` | Distinct series in one response |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | -- | Setting it also enables tracing |
-| `TRACE_SAMPLE_RATIO` | `1` local/dev, `0.05` prod | Completeness traded for cost |
-| `HTTP_TRUST_PROXY_HEADER` | `false` | Enable only behind a proxy that rewrites `X-Forwarded-For` |
-
-Two settings are boot failures rather than documented warnings, because both
-would be silently catastrophic. `AUTH_DISABLED=true` on a deployed tier lets
-anyone write into any tenant's data, and `PUBSUB_ENABLED=false` there means the
-service acknowledges batches it then discards. `PUBSUB_BOOTSTRAP=true` is
-refused for a third reason: creating topology needs runtime admin credentials,
-a far larger blast radius than publish-and-subscribe, and deployed topology
-belongs in Terraform.
+Additional fixed bounds include an 8 MiB query materialization budget, 256 KiB
+live-update pages, a 32 KiB HTTP header setting, and at most 256 SQL statements
+per flush batch within one transaction. Memory budgets estimate admitted data;
+they are not RSS limits. Measure actual container memory before increasing them.
 
 ### Issuing an API key
 
-The service stores only the digest, so generate the secret yourself and keep it:
+Generate a secret and its SHA-256 digest, for example in Bash:
 
-```bash
+```sh
 SECRET=$(openssl rand -hex 32)
-echo "give this to the client: fxg_k1_$SECRET"
+echo "client credential: fxg_k1_$SECRET"
 printf %s "$SECRET" | sha256sum | cut -d' ' -f1
 ```
 
-Put the digest in the key document:
+Place the digest in `API_KEYS`, a file referenced by `API_KEYS_FILE`, or the
+Secret Manager document used by the deployment:
 
 ```json
 [{"key_id":"k1","tenant_id":"acme","secret_sha256":"<digest>",
   "rate_limit_per_second":5000,"burst":10000}]
 ```
 
-## Repository layout
+Keep the plaintext credential in the client's secret store. The document must be
+one complete JSON array with valid tenant/key identifiers. See the deployment
+runbook for secret versions, rotation, and service identities.
 
+## Observability
+
+Local Compose includes a provisioned Grafana dashboard, Prometheus, and Jaeger.
+Each service exposes `/metrics` when enabled. The GCP configuration disables
+public application metrics and uses native Cloud Run, SQL, and Pub/Sub metrics
+for its four operational alert policies.
+
+| Signal | Purpose |
+| --- | --- |
+| `fluxgate_aggregate_watermark_lag_seconds` | Event-time progress relative to wall clock |
+| `fluxgate_aggregate_tracked_series` | Cardinality pressure |
+| `fluxgate_aggregate_buffered_bytes` | Estimated accumulation memory |
+| `fluxgate_publish_batches_total` | Successful, failed, or shed publishes |
+| `fluxgate_consume_messages_total` | Accepted, retried, or rejected deliveries |
+| `fluxgate_resilience_breaker_state` | Closed, half-open, or open publish circuit |
+
+Metrics use bounded route patterns, method labels, and status classes. Unknown
+methods share `_OTHER`. Request IDs, trace IDs, and span IDs connect structured
+logs with HTTP and broker work.
+
+Public HTTP trace parents are linked to a fresh locally sampled trace; arbitrary
+baggage is discarded. Trusted gateways can opt into parent continuation.
+Internal Pub/Sub propagation preserves the edge's sampling decision. Span data
+and export queues are bounded; collector failures are handled without making
+export success a request-path dependency.
+
+Liveness and readiness are separate. Shutdown fails readiness, allows a grace
+period, and drains work within a deadline. Uncommitted broker deliveries remain
+available for retry if the process cannot finish.
+
+## Production deployment
+
+Use the [GCP deployment and recovery runbook](deploy/terraform/README.md).
+Terraform provisions Pub/Sub and dead-letter topology, private Cloud SQL,
+service-specific IAM and database roles, Secret Manager, Cloud Run services, a
+migration job, and operational alerts.
+
+Deployment is staged: bootstrap with `deploy_services = false`, publish reviewed
+images and record their digests, select an explicit API-key secret version, run
+the migration job with runtime-role provisioning, and only then enable services.
+Runtime processes cannot migrate the deployed schema or create broker topology.
+The aggregator uses a fixed instance count; aggregator/query CPU remains
+allocated between requests. Connection budgets account for overlapping revisions.
+
+Before production traffic, validate in a real staging project:
+
+1. Private SQL connectivity, Cloud Run lifecycle behavior, and actual IAM/database
+   permission boundaries.
+2. Broker redelivery, dead-letter handling, and alert delivery.
+3. Expected peak traffic, cardinality, query mix, and retention throughput, with
+   agreed latency, memory, backlog, and connection headroom.
+4. Backup/PITR restore, replay, client cutover, key rotation, and rollback, with
+   measured recovery objectives and operational ownership.
+
+For existing deployments, take a verified backup and stop old aggregators before
+migrations **0003 and 0005**. Migration **0007** corrects the retention-index
+collision in 0006; index creation can block writes, so schedule a maintenance
+window. Rerun runtime-role provisioning. Changing an image does not undo an
+incompatible schema change.
+
+A database restore does not rewind Pub/Sub acknowledgments. Restore rollups,
+delivery claims, retry reservations, stream revisions, and migration records
+consistently, then coordinate replay. If retry reservations were lost, recover
+them or coordinate affected clients before reopening ingestion: broker replay
+alone cannot reconstruct HTTP retry outcomes. The local restore check uses
+quiesced writers and does not certify Cloud SQL PITR or production recovery time.
+
+Tenant rule evaluation and notification delivery are not implemented. The
+supplied alerts cover the pipeline's own operational health; see
+[ADR 7](docs/adr/0007-deferred-alerting.md).
+
+## Development
+
+Make targets require Make and Bash. Useful commands include:
+
+```sh
+make help              # available targets
+make build             # build every command
+make test              # Go tests with the race detector; requires cgo
+make test-short        # Go tests without the race detector
+make test-integration  # start local dependencies and run integration tests
+make lint              # requires golangci-lint
+make vulncheck         # Go reachable-code vulnerability analysis
+make load              # synthetic traffic against the local stack
+make psql              # local database shell
+make tf-check          # Terraform formatting and validation
 ```
-api/openapi.yaml        the public API contract
-cmd/ingest-api/         the edge: validates and publishes
-cmd/aggregator/         the consumer: windows, aggregates and persists
-cmd/query-api/          the read path: queries and the live tail
-cmd/loadgen/            synthetic load, for seeing what the pipeline does
-internal/aggregate/     windowing, watermarks, accumulators, histograms
-internal/aggregator/    delivery, flushing and acknowledgement lifecycle
-internal/api/           route table and request handlers
-internal/auth/          API key verification and tenant resolution
-internal/config/        environment configuration and validation
-internal/httpx/         handler contract, error envelope, middleware, server
-internal/idempotency/   replaying outcomes for retried requests
-internal/ingest/        the sink seam between HTTP and the delivery pipeline
-internal/observability/ logging, probes, tracing and metrics
-internal/pubsubx/       envelope, publisher, subscriber runtime, topology
-internal/query/         query parsing, limits and result shaping
-internal/ratelimit/     sharded token-bucket throttling
-internal/resilience/    circuit breaker
-internal/store/         Postgres schema, migrations and the delivery ledger
-internal/telemetry/     the metric domain model and its validation rules
-internal/version/       build provenance
-build/docker/           multi-stage Dockerfile shared by every service
-deploy/                 docker-compose stack, Prometheus scrape config,
-                        provisioned Grafana dashboards
-deploy/terraform/       GCP infrastructure
-docs/adr/               architecture decision records
+
+Tests needing external services skip locally when `PUBSUB_EMULATOR_HOST` and
+`TEST_DATABASE_URL` are unset. CI supplies both. `make ci` covers module tidiness,
+vet, and Go tests; the complete release checks also include the CI jobs and
+packaged verification described above.
+
+[Fuzzing](.github/workflows/fuzz.yml) runs nightly across envelope parsing,
+query parsing, label identity, window boundaries, credentials, key documents,
+and point validation. Committed seeds and crash reproducers run with ordinary
+tests on every PR. To fuzz one boundary locally:
+
+```sh
+go test -run '^$' -fuzz FuzzValidatePoint -fuzztime 60s ./internal/telemetry
 ```
+
+## Design notes and repository layout
+
+[Architecture decisions](docs/adr) cover the asynchronous pipeline, delivery
+ledger, JSON envelopes, fixed histograms, PostgreSQL, separate read/write
+services, and deferred tenant alerting.
+
+| Path | Contents |
+| --- | --- |
+| `cmd/` | Ingest, aggregator, query, migration, and load-generator commands |
+| `internal/aggregate/`, `internal/aggregator/` | Windowing, accumulation, flush and acknowledgment lifecycle |
+| `internal/api/`, `internal/httpx/` | Routes, handlers, middleware, admission, and server lifecycle |
+| `internal/auth/`, `internal/idempotency/`, `internal/ratelimit/` | Credentials, retry storage, and quotas |
+| `internal/pubsubx/`, `internal/ingest/`, `internal/resilience/` | Broker transport, sink interfaces, and circuit breaker |
+| `internal/store/`, `internal/query/`, `internal/telemetry/` | Schema/migrations, read shaping, and metric validation |
+| `internal/config/`, `internal/observability/`, `internal/version/` | Runtime configuration, instrumentation, and build identity |
+| `scripts/` | Packaged load/recovery verification, build-context checks, and image audits |
+| `api/openapi.yaml` | Public API contract |
+| `build/docker/`, `deploy/` | Shared service image, local Compose stack, dashboards, and Terraform |
+| `docs/` | Decision records and release security assessments |
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-
-### Production rollout preparation
-
-The [GCP deployment guide](deploy/terraform/README.md) describes staged bootstrap,
-digest-pinned builds, the separate migration job, runtime database permissions,
-capacity budgets, recovery procedures and staging release checks. Cloud SQL uses
-the private-IP Go connector. Public service metrics are disabled in the deployed
-configuration; native platform metrics back the alerts. Traces require a configured
-collector. Local/CI validation is not evidence of live cloud readiness.
-
-
-Live streams cap concurrent connections (`QUERY_STREAM_MAX_CONCURRENT`, default
-100 per instance), bound every database poll, and renew a bounded socket write
-deadline per frame. Query responses set `truncated` when the database row limit
-cuts off results; use a smaller time range or label filter to retrieve the rest.
-Migration 0005 adds commit revisions: stop old aggregators, run the migration and
-runtime-role provisioning, then deploy both new aggregators and query services.
-
-
-The input contract requires an explicit numeric `value` (zero is valid, missing
-or null is not), bounded to ±1e100 to keep aggregates finite. Counters carry
-nonnegative increments, not cumulative totals. Explicit zero timestamps are
-invalid; only omitted/null timestamps use arrival time. Last-value ordering uses
-PostgreSQL microsecond precision, choosing the higher value for a tied timestamp.
-Broker messages undergo the same structural checks, without rejecting retained
-messages based on their age at delivery. API key documents require one complete
-JSON array, bounded printable tenant identities, and simple ASCII key identifiers.
-Readiness reports dependency status publicly and keeps error details in logs.
-
-
-Run `python scripts/verify_pipeline.py` with Docker available to build all four
-images and verify the packaged pipeline. It creates an isolated network, uses
-random loopback ports, and removes its containers/volumes afterward. The check
-covers two ingest replicas, persisted retry identities, exact totals, tenant
-isolation, forced aggregator termination before commit, database outages, and
-multi-chunk retention under restricted database roles. CI runs the same check.
-Local Compose ports also bind only to loopback, and ingest uses PostgreSQL retry
-storage. Retention runs every five minutes in bounded 10,000-row transactions,
-with a 30-second deadline per table per pass. Monitor errors/disk growth if
-cleanup cannot keep up; size and test against your actual cardinality and traffic.
-
-Confirmed retry reservations reclaim their telemetry payload immediately, keeping
-only identity, fingerprint and response for the remaining TTL. Pending or
-ambiguous publishes retain the original points so retries remain safe.
-
-Migrations 0006/0007 install the retention index; rerun the migration job with
-`-grant-runtime-roles` to install the cleanup privileges. Index creation can block
-writes on an existing large table, so use the planned migration maintenance window.
-Rate limits and stream limits apply per instance. Scaling replicas multiplies
-the available allowance; use a shared gateway quota if a tenant-wide hard cap is
-required.
-
-Public HTTP trace headers are linked to a fresh locally sampled trace; arbitrary
-baggage is discarded at the HTTP boundary. Set `HTTP_TRUST_TRACE_PARENT=true`
-only behind a gateway that authenticates/replaces trace context. Internal broker
-propagation still preserves the edge's sampling decision. Span attributes and
-export queues are bounded. Unknown HTTP methods share `_OTHER`, following the
-[OpenTelemetry HTTP convention](https://opentelemetry.io/docs/specs/semconv/registry/attributes/http/).
-Credential identifiers are limited to 128 ASCII characters and secrets to 1024
-printable ASCII characters before lookup or logging.
-
-Each tenant may hold at most `QUERY_STREAM_MAX_PER_TENANT` streams per instance
-(default 8, bounded by total capacity). Tenant exhaustion returns 429; total
-capacity exhaustion returns 503. Both include `Retry-After`. Closing streams
-releases their slots; different API keys for the same tenant share the quota.
-
-Aggregator admission also accounts for label width and histogram storage through
-`AGGREGATOR_MAX_BUFFERED_BYTES` (128 MiB by default). It rejects an entire batch
-for redelivery when the budget is full. The subscriber separately limits retained
-wire data to 16 MiB by default. SQL flushes send at most 256 statements at once,
-with all chunks and delivery claims committing in one transaction. Monitor
-`fluxgate_aggregate_buffered_bytes` alongside process memory and backlog age.
-Migration 0007 corrects the retention index's column; apply it in the same planned
-maintenance window as other indexing work.
-
-Data routes admit at most `HTTP_MAX_CONCURRENT` active non-stream requests per
-instance (default 4). Excess work receives 503 with `Retry-After`; health probes
-remain available. Query materialization has an 8 MiB conservative allocation
-budget in addition to row limits. Oversized results receive 422 with instructions
-to narrow the range or labels. Live-tail pages use a 256 KiB budget and resume
-from the last returned row. These budgets account for decoded data, not process
-RSS; measure container memory before increasing concurrency. HTTP headers are
-limited with a 32 KiB server setting.
-
-Release images use digest-pinned compiler/runtime bases and an allowlisted build
-context containing only Go sources, module manifests and embedded migrations.
-Local credentials and scratch files cannot enter build layers or remote caches.
-CI actions are pinned to reviewed commits. Update those pins explicitly, rebuild,
-and run the complete validation before releasing a dependency refresh.
-
-After building, run `python scripts/audit_images.py --output-dir <reports>
---cache-dir <scanner-cache>` (on one line) to scan all four local validation
-images. Use `--image-prefix fluxgate --tag ci` for CI tags. The pinned Trivy
-scanner downloads its current vulnerability database, exports JSON reports and
-CycloneDX SBOMs, and fails on any known MEDIUM, HIGH or CRITICAL finding, including those
-without an available fix. CI preserves these reports for 30 days. Reachability
-analysis (`govulncheck`) also runs separately: an unused vulnerable component
-still blocks the packaged-image check. Scanner/database failures fail the job.
-Review remaining LOW/UNKNOWN entries with the release; the current
-[advisory notes](docs/security-scanning.md) describe the retained findings.
-
-Add `--load-batches 2000` to `scripts/verify_pipeline.py` for a one-million-point
-local acceptance run. Sixteen clients submit 500-point batches across two ingest
-replicas and replay every batch through the other replica. The check honors
-429/503 backpressure, reconciles count/sum/min/max/last for every series across
-counter, gauge and histogram data, and checks liveness, sampled process RSS and
-container restarts/OOM status. CI runs 200 batches (100,000 points). The report
-separates accepted-attempt latency (including fast replays) from batch-pair
-latency including retry delays. This is a reproducible correctness check under
-local resource limits, not a cloud throughput or latency guarantee. The fixture
-uses 600 series, eight admitted requests per API replica and fixed timestamps;
-validate your own cardinality, query mix and traffic duration in staging.
-
-The packaged check finishes by stopping writers, restoring a logical backup into
-a separate local database, comparing application-table fingerprints, and running
-the restored services with restricted users. It verifies preserved HTTP retries,
-payload conflicts, broker duplicate suppression and fresh writes. The deployment
-guide explains the separate acknowledgment/replay and client cutover requirements
-for recovering an older production database.
