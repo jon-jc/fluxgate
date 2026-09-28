@@ -121,11 +121,16 @@ func run() error {
 
 	var retries idempotency.Repository = idempotency.New(cfg.Ingest.IdempotencyTTL)
 	if cfg.Database.DSN != "" {
-		db, openErr := store.Open(ctx, store.Config{DSN: cfg.Database.DSN, MaxConns: cfg.Database.MaxConns, MinConns: cfg.Database.MinConns, MaxConnLifetime: cfg.Database.MaxConnLifetime, ConnectTimeout: cfg.Database.ConnectTimeout}, logger)
+		db, openErr := store.Open(ctx, store.Config{Instance: cfg.Database.Instance, DSN: cfg.Database.DSN, MaxConns: cfg.Database.MaxConns, MinConns: cfg.Database.MinConns, MaxConnLifetime: cfg.Database.MaxConnLifetime, ConnectTimeout: cfg.Database.ConnectTimeout}, logger)
 		if openErr != nil {
 			return openErr
 		}
 		defer db.Close()
+		if cfg.Environment.IsProduction() {
+			if roleErr := db.RequireRuntimeRole(ctx, serviceName); roleErr != nil {
+				return roleErr
+			}
+		}
 		if cfg.Database.Migrate && !cfg.Environment.IsProduction() {
 			if migrateErr := db.Migrate(ctx); migrateErr != nil {
 				return migrateErr

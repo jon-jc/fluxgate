@@ -8,13 +8,15 @@
 # should be able to do.
 
 resource "google_service_account" "ingest" {
+  depends_on   = [google_project_service.required]
   account_id   = "${local.name}-ingest"
   display_name = "Fluxgate ingest API (${var.environment})"
-  description  = "Publishes validated batches. No database access, no subscribe."
+  description  = "Publishes validated batches. Reserves retry identities and publishes; cannot read rollups."
   project      = var.project_id
 }
 
 resource "google_service_account" "aggregator" {
+  depends_on   = [google_project_service.required]
   account_id   = "${local.name}-aggregator"
   display_name = "Fluxgate aggregator (${var.environment})"
   description  = "Consumes batches and writes rollups. No publish rights."
@@ -22,6 +24,7 @@ resource "google_service_account" "aggregator" {
 }
 
 resource "google_service_account" "query" {
+  depends_on   = [google_project_service.required]
   account_id   = "${local.name}-query"
   display_name = "Fluxgate query API (${var.environment})"
   description  = "Reads rollups. No Pub/Sub access of any kind."
@@ -63,43 +66,28 @@ resource "google_project_iam_member" "query_sql_client" {
   member  = "serviceAccount:${google_service_account.query.email}"
 }
 
-# --- shared -------------------------------------------------------------------
 
-# Every service writes traces and metrics. These are grants to *write*
-# telemetry, never to read it: a compromised service should not be able to
-# enumerate what the rest of the fleet is doing.
-resource "google_project_iam_member" "trace_agent" {
-  for_each = {
-    ingest     = google_service_account.ingest.email
-    aggregator = google_service_account.aggregator.email
-    query      = google_service_account.query.email
-  }
-
-  project = var.project_id
-  role    = "roles/cloudtrace.agent"
-  member  = "serviceAccount:${each.value}"
+resource "google_service_account" "migrate" {
+  project      = var.project_id
+  account_id   = "${local.name}-migrate"
+  display_name = "Fluxgate schema migration owner"
+  depends_on   = [google_project_service.required]
 }
-
-resource "google_project_iam_member" "metric_writer" {
-  for_each = {
-    ingest     = google_service_account.ingest.email
-    aggregator = google_service_account.aggregator.email
-    query      = google_service_account.query.email
-  }
-
+resource "google_project_iam_member" "ingest_sql_client" {
   project = var.project_id
-  role    = "roles/monitoring.metricWriter"
-  member  = "serviceAccount:${each.value}"
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.ingest.email}"
 }
-
-resource "google_project_iam_member" "log_writer" {
-  for_each = {
-    ingest     = google_service_account.ingest.email
-    aggregator = google_service_account.aggregator.email
-    query      = google_service_account.query.email
-  }
-
+resource "google_project_iam_member" "migrate_sql_client" {
   project = var.project_id
-  role    = "roles/logging.logWriter"
-  member  = "serviceAccount:${each.value}"
+  role    = "roles/cloudsql.client"
+  member  = "serviceAccount:${google_service_account.migrate.email}"
+}
+resource "google_cloud_run_v2_service_iam_member" "public_api" {
+  for_each = var.deploy_services ? toset(["ingest", "query"]) : toset([])
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_service.service[each.key].name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
 }

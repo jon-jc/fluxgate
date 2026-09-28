@@ -5,6 +5,7 @@
 # debug a connection at 2am and forgets to remove it.
 
 resource "google_compute_network" "main" {
+  depends_on              = [google_project_service.required, terraform_data.deployment_gate]
   name                    = "${local.name}-network"
   auto_create_subnetworks = false
   project                 = var.project_id
@@ -78,7 +79,7 @@ resource "google_sql_database_instance" "main" {
       ipv4_enabled    = false
       private_network = google_compute_network.main.id
       # Even on the private network: the aggregator and the query API both
-      # connect through the Cloud SQL proxy, which authenticates by IAM.
+      # connect through the Cloud SQL Go connector, which authenticates by IAM.
       ssl_mode = "ENCRYPTED_ONLY"
     }
 
@@ -109,6 +110,11 @@ resource "google_sql_database_instance" "main" {
       # connection comes from the proxy, so the field is noise with a privacy
       # cost attached.
       record_client_address = false
+    }
+
+    database_flags {
+      name  = "max_connections"
+      value = tostring(var.database_max_connections)
     }
 
     database_flags {
@@ -150,4 +156,19 @@ resource "google_vpc_access_connector" "main" {
 
   min_instances = 2
   max_instances = 3
+}
+
+# Only the migration job uses the owner credential above. Runtime users are
+# stripped of default Cloud SQL administrative grants by that job before use.
+resource "random_password" "runtime" {
+  for_each = toset(["ingest", "aggregator", "query"])
+  length   = 32
+  special  = false
+}
+resource "google_sql_user" "runtime" {
+  for_each = random_password.runtime
+  name     = "fluxgate_${each.key}"
+  instance = google_sql_database_instance.main.name
+  project  = var.project_id
+  password = each.value.result
 }

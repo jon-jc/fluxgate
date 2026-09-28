@@ -5,34 +5,30 @@
 # An alert nobody acts on trains people to ignore the ones that matter.
 
 resource "google_monitoring_alert_policy" "dead_letter_backlog" {
+  depends_on   = [google_project_service.required]
   display_name = "${local.name}: messages are being dead-lettered"
   project      = var.project_id
   combiner     = "OR"
 
   documentation {
     content   = <<-EOT
-      Messages are arriving on the dead-letter topic, which means the aggregator
-      rejected them ${var.max_delivery_attempts} times.
-
-      This is almost always a poisoned payload -- an envelope the consumer
-      cannot decode, or a schema version this build does not understand. It is
-      never transient: a message reaches the dead-letter queue only after the
-      retry policy has already given it several chances.
-
-      Pull one from ${google_pubsub_subscription.dead_letter_inspect.name} and
-      read it. The payload is JSON precisely so this step needs no tooling.
+      Dead-letter messages remain unacknowledged. Inspect payloads and service
+      errors before replay: malformed input, a database outage, or permission
+      failures can all exhaust the approximate delivery-attempt budget.
+      Inspect ${google_pubsub_subscription.dead_letter_inspect.name} and preserve
+      original batch identities during replay. See the deployment runbook.
     EOT
     mime_type = "text/markdown"
   }
 
   conditions {
-    display_name = "Dead-letter topic receiving messages"
+    display_name = "Unacknowledged dead-letter messages"
 
     condition_threshold {
       filter = join(" AND ", [
-        "resource.type = \"pubsub_topic\"",
-        "resource.labels.topic_id = \"${google_pubsub_topic.dead_letter.name}\"",
-        "metric.type = \"pubsub.googleapis.com/topic/send_message_operation_count\"",
+        "resource.type = \"pubsub_subscription\"",
+        "resource.labels.subscription_id = \"${google_pubsub_subscription.dead_letter_inspect.name}\"",
+        "metric.type = \"pubsub.googleapis.com/subscription/num_undelivered_messages\"",
       ])
 
       comparison      = "COMPARISON_GT"
@@ -41,7 +37,7 @@ resource "google_monitoring_alert_policy" "dead_letter_backlog" {
 
       aggregations {
         alignment_period   = "300s"
-        per_series_aligner = "ALIGN_RATE"
+        per_series_aligner = "ALIGN_MAX"
       }
     }
   }
@@ -54,6 +50,7 @@ resource "google_monitoring_alert_policy" "dead_letter_backlog" {
 }
 
 resource "google_monitoring_alert_policy" "subscription_backlog" {
+  depends_on   = [google_project_service.required]
   display_name = "${local.name}: the aggregator is falling behind"
   project      = var.project_id
   combiner     = "OR"
@@ -102,6 +99,7 @@ resource "google_monitoring_alert_policy" "subscription_backlog" {
 }
 
 resource "google_monitoring_alert_policy" "ingest_errors" {
+  depends_on   = [google_project_service.required]
   display_name = "${local.name}: the ingest API is returning server errors"
   project      = var.project_id
   combiner     = "OR"
@@ -127,7 +125,7 @@ resource "google_monitoring_alert_policy" "ingest_errors" {
     condition_threshold {
       filter = join(" AND ", [
         "resource.type = \"cloud_run_revision\"",
-        "resource.labels.service_name = \"${google_cloud_run_v2_service.ingest.name}\"",
+        "resource.labels.service_name = \"${local.name}-ingest-api\"",
         "metric.type = \"run.googleapis.com/request_count\"",
         "metric.labels.response_code_class = \"5xx\"",
       ])
@@ -149,6 +147,7 @@ resource "google_monitoring_alert_policy" "ingest_errors" {
 }
 
 resource "google_monitoring_alert_policy" "database_disk" {
+  depends_on   = [google_project_service.required]
   display_name = "${local.name}: the database disk is filling"
   project      = var.project_id
   combiner     = "OR"

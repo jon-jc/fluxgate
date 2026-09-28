@@ -6,7 +6,9 @@ region      = "us-central1"
 environment = "dev"
 
 # An immutable tag, normally the commit SHA that CI built.
-image_tag = "a1b2c3d4"
+deploy_services = false # follow README bootstrap steps before changing
+# images = { ingest = "...@sha256:...", aggregator = "...@sha256:...", query = "...@sha256:...", migrate = "...@sha256:..." }
+# api_keys_version = "1"
 
 # Small and cheap. Production overrides all of these.
 ingest_min_instances = 0

@@ -789,3 +789,13 @@ docs/adr/               architecture decision records
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+
+### Production rollout preparation
+
+The [GCP deployment guide](deploy/terraform/README.md) describes staged bootstrap,
+digest-pinned builds, the separate migration job, runtime database permissions,
+capacity budgets, recovery procedures and staging release checks. Cloud SQL uses
+the private-IP Go connector. Public service metrics are disabled in the deployed
+configuration; native platform metrics back the alerts. Traces require a configured
+collector. Local/CI validation is not evidence of live cloud readiness.

@@ -119,6 +119,8 @@ type QueryConfig struct {
 
 // DatabaseConfig configures Postgres.
 type DatabaseConfig struct {
+	// Instance is the optional Cloud SQL project:region:instance connection name.
+	Instance string
 	// DSN is the connection string.
 	DSN string
 	// MaxConns caps the pool. Size it against the database's own connection
@@ -174,6 +176,9 @@ type AggregatorConfig struct {
 
 // PubSubConfig configures the Pub/Sub transport.
 type PubSubConfig struct {
+	// Retention bounds the supported source and dead-letter replay horizons.
+	Retention           time.Duration
+	DeadLetterRetention time.Duration
 	// Enabled selects the durable transport over the in-memory sink. Defaults
 	// to false only on the local tier with no emulator configured.
 	Enabled bool
@@ -294,6 +299,8 @@ type ShutdownConfig struct {
 // with neither a database nor credentials should be told both at once, not one
 // per redeploy.
 type Requirements struct {
+	// Aggregator enables windowing and delivery retention validation.
+	Aggregator bool
 	// Ingest requires durable retry storage on deployed tiers.
 	Ingest bool
 	// Auth means the process serves an authenticated API, so credentials are
@@ -382,6 +389,8 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			IdempotencyTTL:           l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 		},
 		PubSub: PubSubConfig{
+			Retention:           l.duration("PUBSUB_RETENTION", 24*time.Hour),
+			DeadLetterRetention: l.duration("PUBSUB_DLQ_RETENTION", 7*24*time.Hour),
 			// Anything past the local tier publishes for real. An emulator
 			// host is taken as an explicit request for the durable path, since
 			// nobody points at an emulator expecting the in-memory sink.
@@ -407,12 +416,13 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			BreakerCooldown:         l.duration("PUBSUB_BREAKER_COOLDOWN", 10*time.Second),
 		},
 		Database: DatabaseConfig{
+			Instance:        l.str("CLOUD_SQL_INSTANCE", ""),
 			DSN:             l.str("DATABASE_URL", ""),
 			MaxConns:        l.int32("DATABASE_MAX_CONNS", 10),
 			MinConns:        l.int32("DATABASE_MIN_CONNS", 2),
 			MaxConnLifetime: l.duration("DATABASE_MAX_CONN_LIFETIME", time.Hour),
 			ConnectTimeout:  l.duration("DATABASE_CONNECT_TIMEOUT", 10*time.Second),
-			Migrate:         l.boolean("DATABASE_MIGRATE", true),
+			Migrate:         l.boolean("DATABASE_MIGRATE", !env.IsProduction()),
 		},
 		Aggregator: AggregatorConfig{
 			WindowSize:             l.duration("AGGREGATOR_WINDOW_SIZE", time.Minute),
@@ -423,7 +433,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			MaxOutstandingMessages: l.integer("AGGREGATOR_MAX_OUTSTANDING_MESSAGES", 1000),
 			Concurrency:            l.integer("AGGREGATOR_CONCURRENCY", 2),
 			RollupRetention:        l.duration("ROLLUP_RETENTION", 30*24*time.Hour),
-			LedgerRetention:        l.duration("LEDGER_RETENTION", 24*time.Hour),
+			LedgerRetention:        l.duration("LEDGER_RETENTION", 32*24*time.Hour),
 			PruneInterval:          l.duration("PRUNE_INTERVAL", time.Hour),
 		},
 		Query: QueryConfig{
@@ -565,6 +575,9 @@ func (c Config) validateDatabase(l *loader) {
 		}
 		return
 	}
+	if c.Database.Migrate && c.Environment.IsProduction() {
+		l.reject("DATABASE_MIGRATE", "runtime migrations are disabled on staging and prod; use the migration job")
+	}
 	if c.Database.MaxConns <= 0 {
 		l.reject("DATABASE_MAX_CONNS", "must be greater than zero")
 	}
@@ -574,7 +587,7 @@ func (c Config) validateDatabase(l *loader) {
 }
 
 func (c Config) validateAggregator(l *loader) {
-	if !l.requirements.Database {
+	if !l.requirements.Aggregator {
 		// Only the aggregator uses these; validating them everywhere would
 		// reject an ingest API over settings it never reads.
 		return
@@ -607,6 +620,9 @@ func (c Config) validateAggregator(l *loader) {
 		l.reject("LEDGER_RETENTION",
 			"must be at least AGGREGATOR_WINDOW_SIZE, or a redelivery could be counted twice")
 	}
+	if c.Environment.IsProduction() && c.Aggregator.LedgerRetention < c.PubSub.Retention+c.PubSub.DeadLetterRetention+c.Ingest.IdempotencyTTL+24*time.Hour {
+		l.reject("LEDGER_RETENTION", "must cover source retention, DLQ retention, retry TTL and a 24h safety margin")
+	}
 	if c.Aggregator.RollupRetention <= 0 {
 		l.reject("ROLLUP_RETENTION", "must be greater than zero")
 	}
@@ -632,6 +648,9 @@ func (c Config) validatePubSub(l *loader) {
 		return
 	}
 
+	if c.PubSub.EmulatorHost != "" && c.Environment.IsProduction() {
+		l.reject("PUBSUB_EMULATOR_HOST", "must be empty on staging and prod")
+	}
 	if c.PubSub.ProjectID == "" {
 		l.reject("GCP_PROJECT_ID", "is required when PUBSUB_ENABLED is true")
 	}
