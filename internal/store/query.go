@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"time"
+
+	"github.com/jon-jc/fluxgate/internal/aggregate"
 )
 
 // QueryFilter selects which rollups to read.
@@ -192,14 +193,14 @@ func (db *DB) Metrics(ctx context.Context, tenantID string, limit int) ([]Metric
 
 	rows, err := db.pool.Query(ctx, `
 		SELECT metric,
-		       min(kind)              AS kind,
+		       kind,
 		       count(DISTINCT label_hash) AS series_count,
 		       min(window_start)      AS oldest,
 		       max(window_start)      AS newest
 		  FROM rollups
 		 WHERE tenant_id = $1
-		 GROUP BY metric
-		 ORDER BY metric
+		 GROUP BY metric, kind
+		 ORDER BY metric, kind
 		 LIMIT $2`, tenantID, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list metrics: %w", err)
@@ -224,33 +225,4 @@ func (db *DB) Metrics(ctx context.Context, tenantID string, limit int) ([]Metric
 
 // SeriesFingerprint renders a label set as a stable string, used as a map key
 // when grouping rollups into series.
-func SeriesFingerprint(labels map[string]string) string {
-	if len(labels) == 0 {
-		return "{}"
-	}
-
-	keys := make([]string, 0, len(labels))
-	for k := range labels {
-		keys = append(keys, k)
-	}
-	// Sorted, because Go randomises map iteration and an unstable key would
-	// split one series across several groups.
-	for i := 1; i < len(keys); i++ {
-		for j := i; j > 0 && keys[j] < keys[j-1]; j-- {
-			keys[j], keys[j-1] = keys[j-1], keys[j]
-		}
-	}
-
-	var b strings.Builder
-	b.WriteByte('{')
-	for i, k := range keys {
-		if i > 0 {
-			b.WriteByte(',')
-		}
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(labels[k])
-	}
-	b.WriteByte('}')
-	return b.String()
-}
+func SeriesFingerprint(labels map[string]string) string { return aggregate.HashLabels(labels) }

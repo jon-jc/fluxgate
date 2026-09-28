@@ -226,7 +226,9 @@ func runAll(ctx context.Context, logger *slog.Logger, components ...named) error
 	// leaves a subscriber accumulating data nobody will write.
 	var firstErr error
 	for range components {
-		if err := <-errs; err != nil && firstErr == nil {
+		err := <-errs
+		cancel()
+		if err != nil && firstErr == nil {
 			firstErr = err
 			logger.Error("component failed; shutting down", slog.Any("error", err))
 			cancel()

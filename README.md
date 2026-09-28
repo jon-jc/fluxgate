@@ -260,7 +260,7 @@ detect it. Three things together make accumulation exactly-once:
 2. **Rollups and a delivery ledger commit in one transaction.** There is no
    interval where the data is stored but the batch is not recorded, or the
    reverse.
-3. **The ledger is keyed on (batch, window), not on the batch.** A batch that
+3. **The ledger is keyed on (tenant, batch, window).** A batch that
    straddles a boundary feeds two windows that flush at different times. Keyed
    on the batch alone, one whose first window committed and whose second failed
    would be recorded as fully processed -- and the retry that should have
@@ -279,18 +279,23 @@ one arriving *after a restart* is not in memory. A third state exists for a
 redelivery that lands *during* a write -- the outcome is not knowable yet, so
 the message is handed back rather than guessed at.
 
+Database transactions claim every contribution before updating any rollup.
+An overlapping claim rolls back the entire flush; redelivery excludes the
+contributions that another replica committed. This closes the race between the
+initial ledger lookup and a concurrent writer. The subscriber waits for settlement
+inside its Receive callback so the Pub/Sub client retains flow control and leases.
+
 ### Watermarks and late data
 
-Windows close on event time, not wall-clock time. A watermark trails the highest
-observed timestamp by the lateness allowance, and a window is emitted once the
-watermark passes its end. That is what makes replay meaningful: feeding a day of
-history through the aggregator produces exactly the rollups it produced live,
-because nothing depends on when the process happened to run.
+Watermarks determine when buffered windows are written. They do not reject
+already accepted telemetry: late batches and retries create additive corrections,
+even when a newer window has committed. This keeps backfill and recovery safe
+across replicas with different watermarks. The ingestion API bounds timestamp
+age; the durable ledger suppresses duplicate contributions.
 
-Collecting a window does not close it. The engine hands the rollups over, but
-only marks the window flushed when the caller confirms the write -- because a
-window whose write failed has to be rebuildable from a redelivery, and it cannot
-be if the engine has already decided that anything arriving for it is late.
+Admission is atomic for each batch. If the series capacity is exhausted, the
+whole batch is returned for redelivery instead of acknowledging a partial
+aggregate. Monitor the dead-letter subscription during sustained overload.
 
 Event-time watermarks have one structural weakness: they only advance when data
 arrives, so a producer that stops sending strands its final window one
@@ -306,7 +311,9 @@ series a fixed-layout bucket vector. The upsert merges additively, so a window
 written in two pieces -- by two replicas, or by one across a restart -- totals
 the same as if it had been written once. That is sound only because every
 statistic is associative, which is also why `last` is resolved by event time
-rather than by whichever write arrived second.
+rather than by whichever write arrived second. Equal timestamps choose the
+larger value, giving a deterministic tie break in memory and SQL. Different
+metric kinds remain separate series, even with identical names and labels.
 
 Histogram buckets are exponential with a fixed layout, so absolute error grows
 with the value: a 1ms measurement is resolved far more finely than a 10s one,
@@ -578,7 +585,7 @@ its state.
 
 ### Without Docker
 
-Requires Go 1.25 or newer. Runs against the in-memory sink with authentication
+Requires Go 1.27 or newer. Runs against the in-memory sink with authentication
 off:
 
 ```bash

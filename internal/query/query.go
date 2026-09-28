@@ -290,6 +290,7 @@ type Point struct {
 
 // Series is one label combination's values over the queried range.
 type Series struct {
+	Kind   string            `json:"kind"`
 	Labels map[string]string `json:"labels"`
 	Points []Point           `json:"points"`
 }
@@ -325,6 +326,7 @@ func Build(req Request, rollups []store.StoredRollup, limits Limits) Result {
 	}
 
 	type group struct {
+		kind   string
 		labels map[string]string
 		points []Point
 	}
@@ -338,7 +340,11 @@ func Build(req Request, rollups []store.StoredRollup, limits Limits) Result {
 
 	for i := range rollups {
 		r := &rollups[i]
-		result.Kind = r.Kind
+		if result.Kind == "" {
+			result.Kind = r.Kind
+		} else if result.Kind != r.Kind {
+			result.Kind = "mixed"
+		}
 
 		value, ok := extract(r, req.Aggregation)
 		if !ok {
@@ -357,14 +363,14 @@ func Build(req Request, rollups []store.StoredRollup, limits Limits) Result {
 			break
 		}
 
-		key := store.SeriesFingerprint(r.Labels)
+		key := r.Kind + ":" + store.SeriesFingerprint(r.Labels)
 		g, exists := groups[key]
 		if !exists {
 			if len(groups) >= req.MaxSeries {
 				result.Truncated = true
 				continue
 			}
-			g = &group{labels: orEmptyLabels(r.Labels)}
+			g = &group{kind: r.Kind, labels: orEmptyLabels(r.Labels)}
 			groups[key] = g
 			order = append(order, key)
 		}
@@ -388,7 +394,7 @@ func Build(req Request, rollups []store.StoredRollup, limits Limits) Result {
 		sort.Slice(g.points, func(i, j int) bool {
 			return g.points[i].Timestamp.Before(g.points[j].Timestamp)
 		})
-		result.Series = append(result.Series, Series{Labels: g.labels, Points: g.points})
+		result.Series = append(result.Series, Series{Kind: g.kind, Labels: g.labels, Points: g.points})
 	}
 
 	return result

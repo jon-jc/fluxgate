@@ -283,7 +283,7 @@ func TestLedgerCommitsWithTheRollups(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	seen, err := db.SeenContributions(ctx, "batch-ledger", []time.Time{base})
+	seen, err := db.SeenContributions(ctx, tenant, "batch-ledger", []time.Time{base})
 	if err != nil {
 		t.Fatalf("SeenContributions: %v", err)
 	}
@@ -305,7 +305,7 @@ func TestLedgerIsKeyedPerWindow(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	seen, err := db.SeenContributions(ctx, "straddle",
+	seen, err := db.SeenContributions(ctx, tenant, "straddle",
 		[]time.Time{base, base.Add(time.Minute)})
 	if err != nil {
 		t.Fatalf("SeenContributions: %v", err)
@@ -336,12 +336,12 @@ func TestLedgerInsertIsIdempotent(t *testing.T) {
 }
 
 func TestSeenContributionsWithNoInput(t *testing.T) {
-	db, _ := openDB(t)
+	db, tenant := openDB(t)
 	ctx := context.Background()
 
 	for name, run := range map[string]func() (map[string]bool, error){
-		"no batch":   func() (map[string]bool, error) { return db.SeenContributions(ctx, "", []time.Time{base}) },
-		"no windows": func() (map[string]bool, error) { return db.SeenContributions(ctx, "b", nil) },
+		"no batch":   func() (map[string]bool, error) { return db.SeenContributions(ctx, tenant, "", []time.Time{base}) },
+		"no windows": func() (map[string]bool, error) { return db.SeenContributions(ctx, tenant, "b", nil) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			seen, err := run()
@@ -486,7 +486,7 @@ func TestPruneProcessedBatches(t *testing.T) {
 		t.Fatalf("PruneProcessedBatches: %v", err)
 	}
 
-	seen, err := db.SeenContributions(ctx, "fresh-entry", []time.Time{base})
+	seen, err := db.SeenContributions(ctx, tenant, "fresh-entry", []time.Time{base})
 	if err != nil {
 		t.Fatalf("SeenContributions: %v", err)
 	}

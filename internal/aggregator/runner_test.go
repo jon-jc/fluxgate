@@ -66,13 +66,13 @@ func (s *fakeStore) Flush(_ context.Context, rollups []aggregate.Rollup, contrib
 	return nil
 }
 
-func (s *fakeStore) SeenContributions(_ context.Context, batchID string, windows []time.Time) (map[string]bool, error) {
+func (s *fakeStore) SeenContributions(_ context.Context, tenantID, batchID string, windows []time.Time) (map[string]bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	seen := make(map[string]bool, len(windows))
 	for _, w := range windows {
-		key := store.Contribution{BatchID: batchID, WindowStart: w}.Key()
+		key := store.Contribution{TenantID: tenantID, BatchID: batchID, WindowStart: w}.Key()
 		if _, ok := s.committed[key]; ok {
 			seen[key] = true
 		}
@@ -442,7 +442,7 @@ func TestLedgerFailureHandsTheMessageBack(t *testing.T) {
 
 type failingLedger struct{ *fakeStore }
 
-func (f *failingLedger) SeenContributions(context.Context, string, []time.Time) (map[string]bool, error) {
+func (f *failingLedger) SeenContributions(context.Context, string, string, []time.Time) (map[string]bool, error) {
 	return nil, errors.New("database unreachable")
 }
 
@@ -488,33 +488,27 @@ func TestEmptyBatchIsAcknowledged(t *testing.T) {
 	}
 }
 
-func TestLatePointsAreAcknowledgedNotStalled(t *testing.T) {
+func TestLateAcceptedPointsCorrectPreviouslyFlushedWindow(t *testing.T) {
 	fake := newFakeStore()
 	r := newRunner(t, fake)
 	ctx := context.Background()
-
 	if err := r.Handle(ctx, deliveryFor("b1", point("cpu.util", 1, 0))); err != nil {
-		t.Fatalf("Handle: %v", err)
+		t.Fatal(err)
 	}
-	if err := r.Handle(ctx, deliveryFor("b2", point("cpu.util", 1, 5*time.Minute))); err != nil {
-		t.Fatalf("Handle: %v", err)
+	if err := r.FlushAll(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if err := r.Flush(ctx); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-
-	before := r.InflightMessages()
-
-	// A straggler for a window that has already been written. It can never
-	// become durable, so holding its message would stall the subscription.
 	if err := r.Handle(ctx, deliveryFor("late", point("cpu.util", 999, 10*time.Second))); err != nil {
-		t.Fatalf("Handle: %v", err)
+		t.Fatal(err)
 	}
-	if got := r.InflightMessages(); got != before {
-		t.Errorf("inflight went from %d to %d; the late message was tracked", before, got)
+	if r.InflightMessages() != 1 {
+		t.Fatal("late contribution was dropped before durability")
 	}
-	if got := fake.total("cpu.util", base); got != 1 {
-		t.Errorf("stored sum = %v, want 1; the late point changed a written rollup", got)
+	if err := r.FlushAll(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.total("cpu.util", base); got != 1000 {
+		t.Fatalf("sum = %v, want 1000", got)
 	}
 }
 
@@ -551,6 +545,9 @@ func TestConcurrentHandlingIsSafe(t *testing.T) {
 
 	if err := r.FlushAll(ctx); err != nil {
 		t.Fatalf("FlushAll: %v", err)
+	}
+	if got := fake.total("concurrent.metric", base); got != 200 {
+		t.Fatalf("sum = %v, want all 200 accepted points", got)
 	}
 }
 

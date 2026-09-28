@@ -510,3 +510,52 @@ func TestNewClientRequiresAProject(t *testing.T) {
 		t.Error("the error message is empty")
 	}
 }
+
+func TestManualAckKeepsReceiveFlowControl(t *testing.T) {
+	h := newHarness(t)
+	p := h.publisher(t)
+	for _, id := range []string{"held-1", "held-2"} {
+		if err := p.Publish(context.Background(), batch(id, 1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	received := make(chan pubsubx.Delivery, 2)
+	sub, err := pubsubx.NewSubscriber(h.client, func(_ context.Context, d pubsubx.Delivery) error {
+		received <- d
+		return nil
+	}, pubsubx.SubscriberOptions{Subscription: h.sub, ManualAck: true, MaxOutstandingMessages: 1, NumGoroutines: 1, Logger: discardLogger()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(ctx) }()
+	var first pubsubx.Delivery
+	select {
+	case first = <-received:
+	case <-ctx.Done():
+		t.Fatal("first delivery never arrived")
+	}
+	select {
+	case <-received:
+		t.Error("flow control released before the first delivery settled")
+	case <-time.After(300 * time.Millisecond):
+	}
+	first.Ack()
+	select {
+	case second := <-received:
+		second.Ack()
+	case <-ctx.Done():
+		t.Error("acknowledgement did not release flow control")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("subscriber did not stop")
+	}
+}

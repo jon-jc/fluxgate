@@ -32,7 +32,7 @@ type Store interface {
 	Flush(ctx context.Context, rollups []aggregate.Rollup, contributions []store.Contribution) error
 	// SeenContributions reports which (batch, window) pairs are already
 	// committed.
-	SeenContributions(ctx context.Context, batchID string, windows []time.Time) (map[string]bool, error)
+	SeenContributions(ctx context.Context, tenantID, batchID string, windows []time.Time) (map[string]bool, error)
 }
 
 // Options configures a Runner.
@@ -68,6 +68,10 @@ func (o *Options) applyDefaults() {
 // crash between accepting a point and writing its window silently loses the
 // point, with the broker believing it delivered successfully.
 type Runner struct {
+	// Admission and collection must move the engine and its ledger together.
+	admission     sync.Mutex
+	flushMu       sync.Mutex
+	closing       bool // protected by admission
 	engine        *aggregate.Engine
 	store         Store
 	flushInterval time.Duration
@@ -145,6 +149,14 @@ func New(opts Options) (*Runner, error) {
 // have been committed. Returning an error hands the message back for
 // redelivery in the usual way.
 func (r *Runner) Handle(ctx context.Context, d pubsubx.Delivery) error {
+	r.admission.Lock()
+	defer r.admission.Unlock()
+	if r.closing {
+		return errors.New("aggregator is draining")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	batch := d.Envelope.Batch()
 	log := observability.LoggerFromContext(ctx)
 
@@ -157,7 +169,7 @@ func (r *Runner) Handle(ctx context.Context, d pubsubx.Delivery) error {
 		return nil
 	}
 
-	committed, err := r.store.SeenContributions(ctx, batch.ID, windows)
+	committed, err := r.store.SeenContributions(ctx, batch.TenantID, batch.ID, windows)
 	if err != nil {
 		// Without knowing what is already committed, accumulating would risk
 		// double-counting. Hand the message back and try again.
@@ -171,7 +183,7 @@ func (r *Runner) Handle(ctx context.Context, d pubsubx.Delivery) error {
 		// message goes back and returns once the flush has resolved.
 		return ErrFlushInProgress
 	}
-	if len(skip) == len(windows) {
+	if len(committed) == len(windows) {
 		// Every window this batch feeds is already accounted for. This is a
 		// duplicate delivery, which is expected rather than exceptional.
 		r.recordDuplicate()
@@ -181,27 +193,22 @@ func (r *Runner) Handle(ctx context.Context, d pubsubx.Delivery) error {
 	}
 
 	filtered := filterBatch(batch, skip, r.engine.WindowSize())
+	result, err := r.engine.IngestDurable(filtered)
+	if err != nil {
+		return err
+	}
 	if len(filtered.Points) == 0 {
 		r.recordDuplicate()
-		d.Ack()
-		return nil
 	}
-
-	result := r.engine.Ingest(filtered)
-	if len(result.Windows) == 0 {
-		// Everything was late or shed. There is no window to wait on, and
-		// nothing durable will ever be written for it.
-		if result.Late > 0 || result.Shed > 0 {
-			log.Warn("batch produced no rollups",
-				slog.String("batch_id", batch.ID),
-				slog.Int("late", result.Late),
-				slog.Int("shed", result.Shed))
+	// A duplicate held only in memory still needs to wait for the original
+	// write. Acknowledging it now would acknowledge the broker's message too.
+	awaiting := make([]aggregate.Window, 0, len(windows))
+	for _, start := range windows {
+		if !committed[(store.Contribution{TenantID: batch.TenantID, BatchID: batch.ID, WindowStart: start}).Key()] {
+			awaiting = append(awaiting, aggregate.Window{Start: start, End: start.Add(r.engine.WindowSize())})
 		}
-		d.Ack()
-		return nil
 	}
-
-	r.track(d, batch, result.Windows)
+	r.track(d, batch, awaiting)
 
 	log.Debug("batch accumulated",
 		slog.String("batch_id", batch.ID),
@@ -248,7 +255,7 @@ func (r *Runner) skipSet(
 
 	skip := make(map[int64]struct{}, len(windows))
 	for _, start := range windows {
-		key := store.Contribution{BatchID: batch.ID, WindowStart: start}.Key()
+		key := store.Contribution{TenantID: batch.TenantID, BatchID: batch.ID, WindowStart: start}.Key()
 
 		// Committed covers a redelivery after a restart.
 		if committed[key] {
@@ -342,6 +349,9 @@ func (r *Runner) FlushAll(ctx context.Context) error {
 }
 
 func (r *Runner) flush(ctx context.Context, all bool) error {
+	r.flushMu.Lock()
+	defer r.flushMu.Unlock()
+	r.admission.Lock()
 	var (
 		rollups []aggregate.Rollup
 		windows []aggregate.Window
@@ -357,10 +367,12 @@ func (r *Runner) flush(ctx context.Context, all bool) error {
 		rollups, windows = r.engine.Collect()
 	}
 	if len(windows) == 0 {
+		r.admission.Unlock()
 		return nil
 	}
 
 	contributions, messages := r.detach(windows)
+	r.admission.Unlock()
 	// Whatever happens next, these contributions stop being in-flight.
 	defer r.releaseFlushing(contributions)
 
@@ -512,6 +524,9 @@ func (r *Runner) Run(ctx context.Context) error {
 // cancellation would abort the very write that keeps the last window from being
 // lost.
 func (r *Runner) drain(ctx context.Context) error {
+	r.admission.Lock()
+	r.closing = true
+	r.admission.Unlock()
 	drainCtx, cancel := context.WithTimeout(
 		context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()

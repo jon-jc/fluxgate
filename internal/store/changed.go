@@ -27,6 +27,7 @@ type Cursor struct {
 	// Metric, LabelHash and WindowStart disambiguate rows sharing Since. They
 	// are empty on a fresh cursor, which reads as "everything at or after
 	// Since".
+	Kind        string
 	Metric      string
 	LabelHash   string
 	WindowStart time.Time
@@ -40,6 +41,7 @@ type Cursor struct {
 func (c Cursor) After(r StoredRollup, updatedAt time.Time) Cursor {
 	return Cursor{
 		Since:       updatedAt,
+		Kind:        r.Kind,
 		Metric:      r.Metric,
 		LabelHash:   r.LabelHash,
 		WindowStart: r.WindowStart,
@@ -73,10 +75,10 @@ func (db *DB) Changed(
 	// expressed so the index can serve it.
 	var position string
 	if cursor.primed {
-		args = append(args, cursor.Metric, cursor.LabelHash, cursor.WindowStart)
+		args = append(args, cursor.Metric, cursor.Kind, cursor.LabelHash, cursor.WindowStart)
 		position = fmt.Sprintf(
-			` AND (updated_at, metric, label_hash, window_start) > ($2, $%d, $%d, $%d)`,
-			len(args)-2, len(args)-1, len(args))
+			` AND (updated_at, metric, kind, label_hash, window_start) > ($2, $%d, $%d, $%d, $%d)`,
+			len(args)-3, len(args)-2, len(args)-1, len(args))
 	} else {
 		position = " AND updated_at > $2"
 	}
@@ -95,7 +97,7 @@ func (db *DB) Changed(
 		       count, sum, min, max, last, last_event_at, buckets, updated_at
 		  FROM rollups
 		 WHERE tenant_id = $1` + position + metricClause + `
-		 ORDER BY updated_at, metric, label_hash, window_start
+		 ORDER BY updated_at, metric, kind, label_hash, window_start
 		 LIMIT $` + fmt.Sprint(len(args))
 
 	rows, err := db.pool.Query(ctx, sql, args...)

@@ -4,7 +4,7 @@
 #   docker build -f build/docker/Dockerfile --build-arg SERVICE=ingest-api .
 
 # ---- build ------------------------------------------------------------------
-FROM golang:1.25-alpine AS build
+FROM golang:1.27-alpine AS build
 
 ARG SERVICE
 ARG VERSION=dev

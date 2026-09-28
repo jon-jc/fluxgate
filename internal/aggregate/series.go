@@ -151,7 +151,7 @@ func (a *Accumulator) Observe(value float64, timestampUnixNano int64) {
 	// Ordering by event time rather than arrival keeps Last stable across
 	// redelivery: the same window replayed in a different order must produce
 	// the same answer.
-	if a.Count == 1 || timestampUnixNano >= a.LastTimestampUnixNano {
+	if a.Count == 1 || (timestampUnixNano > a.LastTimestampUnixNano || (timestampUnixNano == a.LastTimestampUnixNano && value > a.Last)) {
 		a.Last = value
 		a.LastTimestampUnixNano = timestampUnixNano
 	}
@@ -211,7 +211,7 @@ func (a *Accumulator) Merge(other *Accumulator) {
 	a.Count += other.Count
 	a.Sum += other.Sum
 
-	if other.LastTimestampUnixNano >= a.LastTimestampUnixNano {
+	if other.LastTimestampUnixNano > a.LastTimestampUnixNano || (other.LastTimestampUnixNano == a.LastTimestampUnixNano && other.Last > a.Last) {
 		a.Last = other.Last
 		a.LastTimestampUnixNano = other.LastTimestampUnixNano
 	}
