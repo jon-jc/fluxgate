@@ -8,6 +8,7 @@ database is downloaded on each run (Trivy reuses a fresh cache when available).
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -31,6 +32,9 @@ def main():
     cache = args.cache_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     cache.mkdir(parents=True, exist_ok=True)
+    # With capabilities dropped, root cannot write a Linux runner's UID-owned
+    # bind mounts. Match the caller there; Windows Desktop maps these to UID 0.
+    user = f"{os.getuid()}:{os.getgid()}" if os.name == "posix" else "0:0"
     findings = []
     for service in SERVICES:
         image = f"{args.image_prefix}/{service}:{args.tag}"
@@ -41,8 +45,9 @@ def main():
             archive = Path(temp).resolve()
             run("docker", "save", "--output", str(archive / "image.tar"), image)
             command = ["docker", "run", "--rm", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                       "--user", user, "-e", "HOME=/tmp",
                        "-v", f"{archive}:/input:ro", "-v", f"{output}:/reports",
-                       "-v", f"{cache}:/root/.cache/trivy", SCANNER, "image",
+                       "-v", f"{cache}:/cache", SCANNER, "image", "--cache-dir", "/cache",
                        "--input", "/input/image.tar", "--scanners", "vuln", "--timeout", "10m", "--quiet"]
             report = output / f"{service}-vulnerabilities.json"
             run(*command, "--format", "json", "--output", f"/reports/{report.name}")
