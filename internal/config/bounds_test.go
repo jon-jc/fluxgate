@@ -9,6 +9,7 @@ func TestRejectUnsafeRuntimeBounds(t *testing.T) {
 	for key, value := range map[string]string{
 		"HTTP_HANDLER_TIMEOUT": "0s", "HTTP_READ_HEADER_TIMEOUT": "0s",
 		"HTTP_READ_TIMEOUT": "0s", "HTTP_IDLE_TIMEOUT": "0s",
+		"HTTP_MAX_CONCURRENT":        "0",
 		"QUERY_STREAM_POLL_INTERVAL": "0s", "QUERY_STREAM_HEARTBEAT": "0s",
 		"QUERY_STREAM_MAX_CONCURRENT": "0", "QUERY_DEFAULT_RANGE": "0s",
 		"AGGREGATOR_CONCURRENCY": "0", "AGGREGATOR_IDLE_TIMEOUT": "0s",

@@ -252,6 +252,8 @@ type IngestConfig struct {
 
 // HTTPConfig configures the public HTTP listener.
 type HTTPConfig struct {
+	// MaxConcurrent bounds active non-stream data handlers before allocation.
+	MaxConcurrent int
 	// Addr is the TCP address to listen on, e.g. ":8080".
 	Addr string
 	// ReadHeaderTimeout bounds the time spent reading request headers and is
@@ -363,6 +365,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			IdleTimeout:        l.duration("HTTP_IDLE_TIMEOUT", 120*time.Second),
 			HandlerTimeout:     l.duration("HTTP_HANDLER_TIMEOUT", 10*time.Second),
 			MaxRequestBytes:    l.bytes("HTTP_MAX_REQUEST_BYTES", 4<<20),
+			MaxConcurrent:      l.integer("HTTP_MAX_CONCURRENT", 4),
 			TrustedProxyHeader: l.boolean("HTTP_TRUST_PROXY_HEADER", false),
 		},
 		Log: LogConfig{
@@ -489,6 +492,9 @@ func (c Config) validate(l *loader) {
 	}
 	if c.HTTP.MaxRequestBytes <= 0 {
 		l.reject("HTTP_MAX_REQUEST_BYTES", "must be greater than zero")
+	}
+	if c.HTTP.MaxConcurrent <= 0 {
+		l.reject("HTTP_MAX_CONCURRENT", "must be greater than zero")
 	}
 	// A handler that outlives the write timeout can never deliver its 503, so
 	// the client sees a truncated connection instead of a clean error.

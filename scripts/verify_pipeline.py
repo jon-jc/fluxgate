@@ -134,7 +134,7 @@ def main():
                         PUBSUB_EMULATOR_HOST=broker + ":8085", DATABASE_MIGRATE="false",
                         DATABASE_URL=f"postgres://fluxgate_{role}:local-test-password@{postgres}/fluxgate?sslmode=disable",
                         SHUTDOWN_GRACE_PERIOD="0s", SHUTDOWN_DRAIN_TIMEOUT="3s",
-                        HTTP_HANDLER_TIMEOUT="3s", HTTP_WRITE_TIMEOUT="5s", PUBSUB_PUBLISH_TIMEOUT="2s")
+                        HTTP_MAX_CONCURRENT="8", HTTP_HANDLER_TIMEOUT="3s", HTTP_WRITE_TIMEOUT="5s", PUBSUB_PUBLISH_TIMEOUT="2s")
 
         aggregator_env = runtime_env("aggregator")
         aggregator_env.update(AGGREGATOR_WINDOW_SIZE="5s", AGGREGATOR_ALLOWED_LATENESS="1s",

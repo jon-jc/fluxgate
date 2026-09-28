@@ -76,6 +76,7 @@ func (db *DB) Query(ctx context.Context, f QueryFilter) ([]StoredRollup, error) 
 	defer rows.Close()
 
 	var out []StoredRollup
+	var usedBytes int
 	for rows.Next() {
 		var (
 			r         StoredRollup
@@ -87,6 +88,10 @@ func (db *DB) Query(ctx context.Context, f QueryFilter) ([]StoredRollup, error) 
 			&r.Count, &r.Sum, &r.Min, &r.Max, &r.Last, &r.LastEventAt, &r.Buckets,
 		); err != nil {
 			return nil, fmt.Errorf("query rollups: scan: %w", err)
+		}
+		usedBytes += readRowBytes(r, rawLabels)
+		if usedBytes > maxQueryBytes {
+			return nil, ErrReadBudget
 		}
 		if len(rawLabels) > 0 {
 			if err := json.Unmarshal(rawLabels, &r.Labels); err != nil {

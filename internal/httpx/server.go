@@ -52,6 +52,7 @@ func NewServer(opts ServerOptions) *Server {
 		ReadTimeout:       opts.HTTP.ReadTimeout,
 		WriteTimeout:      opts.HTTP.WriteTimeout,
 		IdleTimeout:       opts.HTTP.IdleTimeout,
+		MaxHeaderBytes:    32 << 10,
 		// Route net/http's own errors (TLS handshake failures, malformed
 		// requests) into structured logging instead of letting them escape to
 		// stderr in a format nothing can parse.

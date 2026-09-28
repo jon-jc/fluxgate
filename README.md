@@ -846,3 +846,12 @@ writes on an existing large table, so use the planned migration maintenance wind
 Rate limits and stream limits apply per instance. Scaling replicas multiplies
 the available allowance; use a shared gateway quota if a tenant-wide hard cap is
 required.
+
+Data routes admit at most `HTTP_MAX_CONCURRENT` active non-stream requests per
+instance (default 4). Excess work receives 503 with `Retry-After`; health probes
+remain available. Query materialization has an 8 MiB conservative allocation
+budget in addition to row limits. Oversized results receive 422 with instructions
+to narrow the range or labels. Live-tail pages use a 256 KiB budget and resume
+from the last returned row. These budgets account for decoded data, not process
+RSS; measure container memory before increasing concurrency. HTTP headers are
+limited with a 32 KiB server setting.

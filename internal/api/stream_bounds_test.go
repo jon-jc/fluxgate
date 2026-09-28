@@ -80,3 +80,12 @@ func TestQueryReportsDatabaseFetchTruncation(t *testing.T) {
 		t.Fatal("query did not fetch the overflow sentinel")
 	}
 }
+
+func TestQueryBudgetGivesActionableClientError(t *testing.T) {
+	h := newQueryHarness(t)
+	h.reader.err = store.ErrReadBudget
+	response := h.get(t, "/v1/query?metric=cpu.util")
+	if response.Code != 422 || !strings.Contains(response.Body.String(), "Narrow the time range") {
+		t.Fatalf("budget response: %d %s", response.Code, response.Body.String())
+	}
+}

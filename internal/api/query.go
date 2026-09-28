@@ -124,6 +124,9 @@ func handleQuery(deps QueryDeps) httpx.Handler {
 			Limit:    deps.Limits.MaxPoints + 1,
 		})
 		if err != nil {
+			if errors.Is(err, store.ErrReadBudget) {
+				return httpx.Invalid("The query result is too large. Narrow the time range or add label filters.")
+			}
 			return httpx.Internal(fmt.Errorf("read rollups: %w", err))
 		}
 

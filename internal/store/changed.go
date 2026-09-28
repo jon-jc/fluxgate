@@ -96,6 +96,7 @@ func (db *DB) Changed(
 	defer rows.Close()
 
 	var out []StoredRollup
+	var usedBytes int
 	next := cursor
 
 	for rows.Next() {
@@ -112,6 +113,16 @@ func (db *DB) Changed(
 		); err != nil {
 			return nil, cursor, fmt.Errorf("query changes: scan: %w", err)
 		}
+		rowBytes := readRowBytes(r, rawLabels)
+		if rowBytes > maxChangeBytes {
+			return nil, cursor, ErrReadBudget
+		}
+		if usedBytes+rowBytes > maxChangeBytes {
+			// Keep the cursor on the last returned row. The next poll includes
+			// this row; a byte-limited page must never skip a change.
+			break
+		}
+		usedBytes += rowBytes
 		if len(rawLabels) > 0 {
 			if err := json.Unmarshal(rawLabels, &r.Labels); err != nil {
 				return nil, cursor, fmt.Errorf("query changes: decode labels: %w", err)
