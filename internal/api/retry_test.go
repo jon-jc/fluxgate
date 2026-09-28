@@ -57,10 +57,20 @@ func TestConcurrentRequestsShareReservedBatch(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rec := h.post(t, body, map[string]string{HeaderIdempotencyKey: "shared"})
-			if rec.Code != 202 {
-				t.Error(rec.Body)
+			for attempt := 0; attempt < 3; attempt++ {
+				rec := h.post(t, body, map[string]string{HeaderIdempotencyKey: "shared"})
+				if rec.Code == 503 && rec.Header().Get("Retry-After") == "1" {
+					// This burst deliberately exceeds the default admission cap.
+					// Retry the same payload/key as a real caller must.
+					time.Sleep(time.Second)
+					continue
+				}
+				if rec.Code != 202 {
+					t.Error(rec.Body)
+				}
+				return
 			}
+			t.Error("concurrent retry did not recover from admission pressure")
 		}()
 	}
 	wg.Wait()
