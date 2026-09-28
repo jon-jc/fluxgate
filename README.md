@@ -889,10 +889,12 @@ After building, run `python scripts/audit_images.py --output-dir <reports>
 --cache-dir <scanner-cache>` (on one line) to scan all four local validation
 images. Use `--image-prefix fluxgate --tag ci` for CI tags. The pinned Trivy
 scanner downloads its current vulnerability database, exports JSON reports and
-CycloneDX SBOMs, and fails on any known HIGH or CRITICAL finding, including those
+CycloneDX SBOMs, and fails on any known MEDIUM, HIGH or CRITICAL finding, including those
 without an available fix. CI preserves these reports for 30 days. Reachability
 analysis (`govulncheck`) also runs separately: an unused vulnerable component
 still blocks the packaged-image check. Scanner/database failures fail the job.
+Review remaining LOW/UNKNOWN entries with the release; the current
+[advisory notes](docs/security-scanning.md) describe the retained findings.
 
 Add `--load-batches 2000` to `scripts/verify_pipeline.py` for a one-million-point
 local acceptance run. Sixteen clients submit 500-point batches across two ingest

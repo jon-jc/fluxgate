@@ -55,12 +55,12 @@ def main():
             data = json.loads(report.read_text(encoding="utf-8"))
             for result in data.get("Results", []):
                 for vuln in result.get("Vulnerabilities", []):
-                    if vuln.get("Severity") in ("HIGH", "CRITICAL"):
+                    if vuln.get("Severity") in ("MEDIUM", "HIGH", "CRITICAL"):
                         findings.append(f"{service}: {vuln['VulnerabilityID']} {vuln['PkgName']} "
                                         f"{vuln['InstalledVersion']} ({vuln['Severity']})")
     if findings:
         raise SystemExit("Image audit failed:\n" + "\n".join(findings))
-    print("PASS: all four images contain no known HIGH or CRITICAL vulnerabilities.", flush=True)
+    print("PASS: all four images contain no known MEDIUM, HIGH or CRITICAL vulnerabilities.", flush=True)
 
 
 if __name__ == "__main__":
