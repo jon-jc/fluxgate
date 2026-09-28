@@ -6,6 +6,7 @@ ports and local test credentials. Removes only resources created by this run.
 """
 
 import argparse
+import base64
 from collections import Counter
 import concurrent.futures
 import datetime as dt
@@ -241,11 +242,11 @@ def main():
         broker = start("pubsub", "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators", port=8085,
                        extra=("gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085", "--project=fluxgate-test"))
 
-        def sql(statement):
+        def sql(statement, database="fluxgate"):
             # The image's temporary initialization server accepts Unix sockets
             # before the final TCP server is ready for the application.
             return command("docker", "exec", "-i", "-e", "PGPASSWORD=fluxgate", postgres,
-                           "psql", "-h", "127.0.0.1", "-U", "fluxgate", "-d", "fluxgate",
+                           "psql", "-h", "127.0.0.1", "-U", "fluxgate", "-d", database,
                            "-v", "ON_ERROR_STOP=1", "-tAc", statement)
 
         wait_for("PostgreSQL", lambda: sql("SELECT 1") == "1")
@@ -256,10 +257,10 @@ def main():
         command("docker", "run", "--rm", "--network", prefix, "-e", "DATABASE_URL=" + owner_dsn,
                 images["migrate"], "-grant-runtime-roles")
 
-        def runtime_env(role):
+        def runtime_env(role, database="fluxgate"):
             return dict(ENVIRONMENT="dev", API_KEYS=keys, GCP_PROJECT_ID="fluxgate-test",
                         PUBSUB_EMULATOR_HOST=broker + ":8085", DATABASE_MIGRATE="false",
-                        DATABASE_URL=f"postgres://fluxgate_{role}:local-test-password@{postgres}/fluxgate?sslmode=disable",
+                        DATABASE_URL=f"postgres://fluxgate_{role}:local-test-password@{postgres}/{database}?sslmode=disable",
                         SHUTDOWN_GRACE_PERIOD="0s", SHUTDOWN_DRAIN_TIMEOUT="3s",
                         HTTP_MAX_CONCURRENT="8", HTTP_HANDLER_TIMEOUT="3s", HTTP_WRITE_TIMEOUT="5s", PUBSUB_PUBLISH_TIMEOUT="2s")
 
@@ -351,6 +352,63 @@ def main():
             "SELECT 'expired','key-'||i,'fp',202,'{}'::bytea,'{}'::jsonb,now()-interval '1 hour' FROM generate_series(1,10050) i")
         wait_for("retention drains multiple chunks", lambda: sql("SELECT count(*) FROM ingest_requests WHERE tenant_id='expired'") == "0")
         print("PASS: database outage/recovery and retention under restricted runtime permissions", flush=True)
+
+        # Quiesce writers so exact table fingerprints can be compared across a
+        # logical backup. Cloud SQL PITR and infrastructure recovery remain
+        # separate staging exercises; this proves the application's restore path.
+        command("docker", "stop", "-t", "10", first, second, aggregator, reader)
+        tables = ("rollups", "processed_batches", "ingest_requests", "tenant_revisions", "schema_migrations")
+
+        def fingerprint(table, database="fluxgate"):
+            return sql("SELECT md5(COALESCE(string_agg(to_jsonb(t)::text,'' "
+                       f"ORDER BY to_jsonb(t)::text),'')) FROM {table} t", database)
+
+        snapshots = {table: fingerprint(table) for table in tables}
+        restore_started = time.monotonic()
+        command("docker", "exec", "-e", "PGPASSWORD=fluxgate", postgres,
+                "pg_dump", "-h", "127.0.0.1", "-U", "fluxgate", "-d", "fluxgate",
+                "--format=custom", "--file=/tmp/fluxgate-backup.dump")
+        sql("CREATE DATABASE fluxgate_restored")
+        command("docker", "exec", "-e", "PGPASSWORD=fluxgate", postgres,
+                "pg_restore", "-h", "127.0.0.1", "-U", "fluxgate", "-d", "fluxgate_restored",
+                "--no-owner", "--no-acl", "--exit-on-error", "--single-transaction", "/tmp/fluxgate-backup.dump")
+        for table in tables:
+            require(fingerprint(table, "fluxgate_restored") == snapshots[table], f"restore changed {table}")
+        restore_dsn = f"postgres://fluxgate:fluxgate@{postgres}/fluxgate_restored?sslmode=disable"
+        command("docker", "run", "--rm", "--network", prefix, "-e", "DATABASE_URL=" + restore_dsn,
+                images["migrate"], "-grant-runtime-roles")
+        restored_query = start("restored-query", images["query-api"], runtime_env("query", "fluxgate_restored"), port=8080)
+        restored_ingest = start("restored-ingest", images["ingest-api"], runtime_env("ingest", "fluxgate_restored"), port=8080)
+        restored_agg_env = dict(aggregator_env, LOG_LEVEL="debug",
+                               DATABASE_URL=runtime_env("aggregator", "fluxgate_restored")["DATABASE_URL"])
+        restored_aggregator = start("restored-aggregator", images["aggregator"], restored_agg_env, port=8080)
+        for name in (restored_query, restored_ingest, restored_aggregator):
+            ready(name)
+        restored_url = base_url(restored_ingest) + "/v1/ingest"
+        query_url = base_url(restored_query) + "/v1/query?from=-1h&agg=sum&metric="
+        require(total("verify.load") == 41 and total("verify.load", "b") == 0, "restored query/isolation failed")
+        replay = request(restored_url, body, idem="load-0")
+        require(replay[0] == 202 and replay[1]["batch_id"] == batch_ids[0], "restore lost retry identity")
+        require(request(restored_url, different, idem="load-0")[0] == 409, "restore lost payload conflict protection")
+
+        # Republish a known original delivery directly to the local emulator.
+        # Seeing its specific duplicate log proves the restored ledger, not just
+        # the HTTP replay cache, suppressed it before checking the total again.
+        envelope = dict(schema_version="1", batch_id=batch_ids[0], tenant_id="tenant-a",
+                        received_at=old, points=body["points"])
+        publish = {"messages": [{"data": base64.b64encode(json.dumps(envelope).encode()).decode(),
+                                 "attributes": {"schema_version": "1", "tenant_id": "tenant-a",
+                                                "batch_id": batch_ids[0]}}]}
+        broker_url = base_url(broker, 8085) + "/v1/projects/fluxgate-test/topics/telemetry-raw:publish"
+        require(request(broker_url, publish)[0] == 200, "restored replay publication failed")
+        wait_for("restored ledger suppresses broker redelivery",
+                 lambda: any("skipping duplicate batch" in line and batch_ids[0] in line
+                             for line in command("docker", "logs", restored_aggregator, check=False).splitlines()))
+        require(total("verify.load") == 41, "restored ledger double-counted broker replay")
+        require(request(restored_url, body, idem="post-restore")[0] == 202, "restored pipeline rejected fresh write")
+        wait_for("fresh write through restored pipeline", lambda: total("verify.load") == 42)
+        print(f"PASS: backup/restore, exact table fingerprints, restricted roles, retry identities, "
+              f"broker duplicate suppression and fresh writes ({time.monotonic() - restore_started:.2f}s)", flush=True)
         print("Pipeline verification passed. No GCP resources were used.", flush=True)
     except BaseException:
         for name in containers:

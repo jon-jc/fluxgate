@@ -905,3 +905,10 @@ latency including retry delays. This is a reproducible correctness check under
 local resource limits, not a cloud throughput or latency guarantee. The fixture
 uses 600 series, eight admitted requests per API replica and fixed timestamps;
 validate your own cardinality, query mix and traffic duration in staging.
+
+The packaged check finishes by stopping writers, restoring a logical backup into
+a separate local database, comparing application-table fingerprints, and running
+the restored services with restricted users. It verifies preserved HTTP retries,
+payload conflicts, broker duplicate suppression and fresh writes. The deployment
+guide explains the separate acknowledgment/replay and client cutover requirements
+for recovering an older production database.
