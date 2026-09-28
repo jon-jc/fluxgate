@@ -20,14 +20,15 @@ slow telemetry ingestion, and an ingest spike should not make dashboards
 unreadable — which is exactly what shared instances and a shared connection pool
 would produce.
 
-The isolation is also structural rather than merely intended. The ingest service
-holds no database credentials at all, and the query service holds no Pub/Sub
-permissions. A compromise of one does not reach what the other can touch, and
-that is enforced by IAM rather than by discipline.
+The isolation is also structural. The ingest service has database grants limited
+to retry reservations so retries retain their identity across replicas and
+restarts. It cannot read rollups. The query service has read-only access to
+rollups and stream revisions and holds no Pub/Sub permissions. IAM and database
+grants enforce these boundaries.
 
-Schema ownership follows the same line: the aggregator runs migrations, the
-query API explicitly does not. A read replica rolling out first cannot apply a
-change the writer is not yet running.
+A separate migration job owns the schema and provisions runtime grants before
+deployed services start. Runtime services cannot migrate on staging or production.
+Local development can apply migrations automatically with an owner credential.
 
 **What it costs.** Three deployments instead of one. Shared code has to live in
 internal packages behind real interfaces rather than being reached for directly

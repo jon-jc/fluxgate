@@ -244,39 +244,51 @@ func (db *DB) SeenContributions(ctx context.Context, tenantID, batchID string, w
 // Keeping it beyond that grows a table forever to guard against a duplicate
 // that can no longer arrive.
 func (db *DB) PruneProcessedBatches(ctx context.Context, olderThan time.Duration) (int64, error) {
-	tag, err := db.pool.Exec(ctx,
-		"DELETE FROM processed_batches WHERE processed_at < now() - $1 * interval '1 second'",
-		olderThan.Seconds())
-	if err != nil {
-		return 0, fmt.Errorf("prune processed batches: %w", err)
+	if olderThan <= 0 {
+		return 0, errors.New("ledger retention must be positive")
 	}
-	return tag.RowsAffected(), nil
+	return db.pruneChunks(ctx, `DELETE FROM processed_batches WHERE ctid IN (
+		SELECT ctid FROM processed_batches WHERE processed_at < now() - $1 * interval '1 second'
+		ORDER BY processed_at LIMIT 10000 FOR UPDATE SKIP LOCKED)`, olderThan.Seconds())
 }
 
 // PruneIngestRequests reclaims expired retry payloads in bounded transactions.
 func (db *DB) PruneIngestRequests(ctx context.Context) (int64, error) {
-	tag, err := db.pool.Exec(ctx, `WITH expired AS (
+	return db.pruneChunks(ctx, `WITH expired AS (
 	 SELECT tenant_id, idempotency_key FROM ingest_requests
 	 WHERE expires_at < now() ORDER BY expires_at LIMIT 10000
 	 FOR UPDATE SKIP LOCKED
 	) DELETE FROM ingest_requests r USING expired e
 	 WHERE r.tenant_id=e.tenant_id AND r.idempotency_key=e.idempotency_key`)
-	if err != nil {
-		return 0, fmt.Errorf("prune retry requests: %w", err)
-	}
-	return tag.RowsAffected(), nil
 }
 
 // PruneRollups deletes rollups whose window ended before the retention
 // horizon.
 func (db *DB) PruneRollups(ctx context.Context, olderThan time.Duration) (int64, error) {
-	tag, err := db.pool.Exec(ctx,
-		"DELETE FROM rollups WHERE window_end < now() - $1 * interval '1 second'",
-		olderThan.Seconds())
-	if err != nil {
-		return 0, fmt.Errorf("prune rollups: %w", err)
+	if olderThan <= 0 {
+		return 0, errors.New("rollup retention must be positive")
 	}
-	return tag.RowsAffected(), nil
+	return db.pruneChunks(ctx, `DELETE FROM rollups WHERE ctid IN (
+		SELECT ctid FROM rollups WHERE window_end < now() - $1 * interval '1 second'
+		ORDER BY window_end LIMIT 10000 FOR UPDATE SKIP LOCKED)`, olderThan.Seconds())
+}
+
+// Continue across chunks rather than limiting cleanup to 10,000 rows per hour.
+// Short transactions and SKIP LOCKED let replicas prune without blocking writes.
+func (db *DB) pruneChunks(ctx context.Context, statement string, args ...any) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	var total int64
+	for {
+		tag, err := db.pool.Exec(ctx, statement, args...)
+		if err != nil {
+			return total, fmt.Errorf("retention chunk after %d rows: %w", total, err)
+		}
+		total += tag.RowsAffected()
+		if tag.RowsAffected() < 10000 {
+			return total, nil
+		}
+	}
 }
 
 // StoredRollup is a rollup read back from the database.

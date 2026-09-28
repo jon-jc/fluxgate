@@ -252,6 +252,8 @@ jobs:
           file: build/docker/Dockerfile
           build-args: |
             SERVICE=ingest-api
+            COMMIT=${{ github.sha }}
+            VERSION=${{ github.sha }}
           push: false
           load: true
           tags: fluxgate/ingest-api:ci
@@ -265,6 +267,8 @@ jobs:
           file: build/docker/Dockerfile
           build-args: |
             SERVICE=aggregator
+            COMMIT=${{ github.sha }}
+            VERSION=${{ github.sha }}
           push: false
           load: true
           tags: fluxgate/aggregator:ci
@@ -278,6 +282,8 @@ jobs:
           file: build/docker/Dockerfile
           build-args: |
             SERVICE=query-api
+            COMMIT=${{ github.sha }}
+            VERSION=${{ github.sha }}
           push: false
           load: true
           tags: fluxgate/query-api:ci
@@ -291,6 +297,8 @@ jobs:
           file: build/docker/Dockerfile
           build-args: |
             SERVICE=migrate
+            COMMIT=${{ github.sha }}
+            VERSION=${{ github.sha }}
           push: false
           load: true
           tags: fluxgate/migrate:ci
@@ -549,6 +557,9 @@ jobs:
                  exit 1; }
 
           echo "confirmed: metrics exposed with bounded route labels"
+
+      - name: Verify replica retries, crash recovery and restricted roles
+        run: python3 scripts/verify_pipeline.py --skip-build --image-prefix fluxgate --tag ci
 
       - name: Container logs on failure
         if: failure()

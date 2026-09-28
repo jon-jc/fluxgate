@@ -80,6 +80,13 @@ func (s *Store) Complete(ctx context.Context, tenantID, key, batchID string) err
 		return ErrExpired
 	}
 	rec.Published = true
+	rec.Batch.Points = nil
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	s.bytes += len(data) - s.sizes[k]
+	s.sizes[k] = len(data)
 	s.records[k] = rec
 	return nil
 }
