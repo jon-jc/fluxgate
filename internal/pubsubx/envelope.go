@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jon-jc/fluxgate/internal/telemetry"
 )
@@ -123,12 +124,20 @@ func (e Envelope) Attributes(requestID string, publishedAt time.Time) map[string
 
 // Encode serialises an envelope for transport.
 func (e Envelope) Encode() ([]byte, error) {
+	if err := e.validate(); err != nil {
+		return nil, err
+	}
 	data, err := json.Marshal(e)
 	if err != nil {
 		return nil, fmt.Errorf("encode envelope %s: %w", e.BatchID, err)
 	}
+	if len(data) > maxEnvelopeBytes {
+		return nil, fmt.Errorf("envelope exceeds %d bytes", maxEnvelopeBytes)
+	}
 	return data, nil
 }
+
+const maxEnvelopeBytes = 10_000_000
 
 // DecodeEnvelope parses a message body.
 //
@@ -137,21 +146,53 @@ func (e Envelope) Encode() ([]byte, error) {
 // same failure forever. Marking it as such is what routes it to the
 // dead-letter queue instead of into an infinite retry loop.
 func DecodeEnvelope(data []byte) (Envelope, error) {
+	if len(data) > maxEnvelopeBytes || !utf8.Valid(data) {
+		return Envelope{}, Permanent(fmt.Errorf("envelope must be UTF-8 and at most %d bytes", maxEnvelopeBytes))
+	}
 	var e Envelope
 	if err := json.Unmarshal(data, &e); err != nil {
 		return Envelope{}, Permanent(fmt.Errorf("decode envelope: %w", err))
 	}
-
-	if e.SchemaVersion != SchemaVersion {
-		return Envelope{}, Permanent(fmt.Errorf(
-			"unsupported schema version %q (this build understands %q)",
-			e.SchemaVersion, SchemaVersion))
+	// Zero is valid, so distinguish it from an absent/null value on the wire.
+	var required struct {
+		Points []struct {
+			Value *float64 `json:"value"`
+		} `json:"points"`
 	}
-	if e.BatchID == "" {
-		return Envelope{}, Permanent(fmt.Errorf("envelope is missing batch_id"))
+	if err := json.Unmarshal(data, &required); err != nil {
+		return Envelope{}, Permanent(err)
 	}
-	if e.TenantID == "" {
-		return Envelope{}, Permanent(fmt.Errorf("envelope is missing tenant_id"))
+	for i, p := range required.Points {
+		if p.Value == nil {
+			return Envelope{}, Permanent(fmt.Errorf("point %d is missing value", i))
+		}
+	}
+	if err := e.validate(); err != nil {
+		return Envelope{}, Permanent(err)
 	}
 	return e, nil
+}
+
+func (e Envelope) validate() error {
+	if e.SchemaVersion != SchemaVersion {
+		return fmt.Errorf(
+			"unsupported schema version %q (this build understands %q)",
+			e.SchemaVersion, SchemaVersion)
+	}
+	if !telemetry.ValidIdentity(e.BatchID) || !telemetry.ValidIdentity(e.TenantID) {
+		return fmt.Errorf("envelope requires valid batch_id and tenant_id")
+	}
+	if e.ReceivedAt.IsZero() || !time.Unix(0, e.ReceivedAt.UnixNano()).Equal(e.ReceivedAt) {
+		return fmt.Errorf("envelope requires a supported received_at timestamp")
+	}
+	v := telemetry.NewValidator()
+	if len(e.Points) == 0 || len(e.Points) > v.Limits.MaxPointsPerBatch {
+		return fmt.Errorf("envelope must contain 1 to %d points", v.Limits.MaxPointsPerBatch)
+	}
+	for i, p := range e.Batch().Points {
+		if violations := v.ValidateStoredPoint(i, p); len(violations) > 0 {
+			return fmt.Errorf("invalid envelope field %s: %s", violations[0].Field, violations[0].Message)
+		}
+	}
+	return nil
 }

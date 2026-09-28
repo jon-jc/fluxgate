@@ -605,13 +605,16 @@ components:
           type: string
           enum: [gauge, counter, histogram]
           description: |
-            `gauge` moves in any direction, `counter` is a monotonic total and
+            `gauge` moves in any direction, `counter` is a nonnegative increment (not a cumulative total) and
             must not be negative, `histogram` is an observation to be bucketed.
         value:
           type: number
           format: double
+          minimum: -1.0e100
+          maximum: 1.0e100
           description: |
-            Must be finite. NaN and the infinities are rejected: a single one
+            Required, finite, and at most 1e100 in absolute value. Null is rejected.
+            NaN and the infinities are rejected: a single one
             poisons every aggregate it reaches, with nothing left to identify
             which point caused it.
           example: 12.5

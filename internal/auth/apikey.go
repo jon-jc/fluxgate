@@ -12,8 +12,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/jon-jc/fluxgate/internal/telemetry"
 )
 
 // KeyPrefix marks a Fluxgate credential. A distinctive prefix lets secret
@@ -101,11 +105,17 @@ func (s *StaticStore) TenantIDs() []string {
 // Every record is validated up front so a malformed credential file fails the
 // deployment rather than silently locking every caller out at runtime.
 func ParseKeys(doc []byte) (*StaticStore, error) {
+	if len(doc) > 4<<20 || !utf8.Valid(doc) {
+		return nil, fmt.Errorf("API key document must be UTF-8 and at most 4 MiB")
+	}
 	var records []Key
 	dec := json.NewDecoder(strings.NewReader(string(doc)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&records); err != nil {
 		return nil, fmt.Errorf("parse API key document: %w", err)
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("API key document must contain exactly one JSON array")
 	}
 
 	keys := make(map[string]Key, len(records))
@@ -133,6 +143,9 @@ func ParseKeys(doc []byte) (*StaticStore, error) {
 			// The credential format joins its parts with underscores, so an
 			// underscore in the ID would make the split ambiguous.
 			return nil, fmt.Errorf("key %q: key_id must not contain whitespace or '_'", k.ID)
+		}
+		if !telemetry.ValidIdentity(k.TenantID) || !validKeyID(k.ID) {
+			return nil, fmt.Errorf("key %d: invalid or oversized tenant_id/key_id", i)
 		}
 
 		digest, err := hex.DecodeString(k.SecretSHA256)
@@ -163,6 +176,19 @@ func ParseKeys(doc []byte) (*StaticStore, error) {
 		return nil, fmt.Errorf("API key document contains no keys")
 	}
 	return &StaticStore{keys: keys}, nil
+}
+
+func validKeyID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for _, c := range id {
+		valid := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '.'
+		if !valid {
+			return false
+		}
+	}
+	return true
 }
 
 // HashSecret returns the hex-encoded SHA-256 digest of a plaintext secret, in

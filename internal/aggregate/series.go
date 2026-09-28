@@ -13,6 +13,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jon-jc/fluxgate/internal/telemetry"
 )
@@ -138,6 +139,9 @@ func NewAccumulator(kind telemetry.Kind) *Accumulator {
 
 // Observe folds one point into the aggregate.
 func (a *Accumulator) Observe(value float64, timestampUnixNano int64) {
+	// Match PostgreSQL microsecond precision so merging partial flushes and
+	// observing one complete window use the same deterministic last-value tie.
+	timestampUnixNano = time.Unix(0, timestampUnixNano).Truncate(time.Microsecond).UnixNano()
 	a.Count++
 	a.Sum += value
 
