@@ -188,8 +188,6 @@ func TestChangedTailsByWriteTime(t *testing.T) {
 	db, tenant := openDB(t)
 	ctx := context.Background()
 
-	before := time.Now().UTC().Add(-time.Second)
-
 	// A day-old window, written right now.
 	old := rollup(tenant, "late.metric", 0, telemetry.KindGauge, 7)
 	old.Window = aggregate.Window{
@@ -200,15 +198,15 @@ func TestChangedTailsByWriteTime(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	changed, cursor, err := db.Changed(ctx, tenant, "late.metric", store.Cursor{Since: before}, 100)
+	changed, cursor, err := db.Changed(ctx, tenant, "late.metric", store.Cursor{Revision: 0}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}
 	if len(changed) != 1 {
 		t.Fatalf("got %d changes, want 1 despite the window being a day old", len(changed))
 	}
-	if !cursor.Since.After(before) {
-		t.Errorf("cursor = %v, want it to advance past %v", cursor.Since, before)
+	if cursor.Revision <= 0 {
+		t.Errorf("cursor = %v, want a positive revision", cursor.Revision)
 	}
 
 	// The cursor must not re-deliver what it has already reported.
@@ -225,8 +223,6 @@ func TestChangedFiltersByMetric(t *testing.T) {
 	db, tenant := openDB(t)
 	ctx := context.Background()
 
-	before := time.Now().UTC().Add(-time.Second)
-
 	for _, metric := range []string{"wanted.metric", "other.metric"} {
 		if err := db.Flush(ctx,
 			[]aggregate.Rollup{rollup(tenant, metric, 0, telemetry.KindGauge, 1)},
@@ -235,7 +231,7 @@ func TestChangedFiltersByMetric(t *testing.T) {
 		}
 	}
 
-	changed, _, err := db.Changed(ctx, tenant, "wanted.metric", store.Cursor{Since: before}, 100)
+	changed, _, err := db.Changed(ctx, tenant, "wanted.metric", store.Cursor{Revision: 0}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}
@@ -247,7 +243,7 @@ func TestChangedFiltersByMetric(t *testing.T) {
 	}
 
 	// With no metric named, everything the tenant wrote is tailed.
-	all, _, err := db.Changed(ctx, tenant, "", store.Cursor{Since: before}, 100)
+	all, _, err := db.Changed(ctx, tenant, "", store.Cursor{Revision: 0}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}

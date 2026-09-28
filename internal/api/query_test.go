@@ -68,15 +68,15 @@ func (f *fakeReader) Changed(
 
 	next := cursor
 	for i := range out {
-		next = next.After(out[i], queryNow.Add(time.Second))
+		next = next.After(out[i], 1)
 	}
 	return out, next, nil
 }
 
-func (f *fakeReader) NewestWriteTime(context.Context, string) (time.Time, error) {
+func (f *fakeReader) NewestRevision(context.Context, string) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return queryNow, f.err
+	return 0, f.err
 }
 
 func (f *fakeReader) Metrics(context.Context, string, int) ([]store.MetricSummary, error) {

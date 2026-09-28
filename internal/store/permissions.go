@@ -54,8 +54,10 @@ func (db *DB) ProvisionRuntimeRoles(ctx context.Context) error {
 		GRANT SELECT, INSERT, UPDATE ON ingest_requests TO fluxgate_ingest;
 		GRANT SELECT, INSERT, UPDATE, DELETE ON rollups TO fluxgate_aggregator;
 		GRANT SELECT, INSERT, DELETE ON processed_batches TO fluxgate_aggregator;
+		GRANT SELECT, INSERT, UPDATE ON tenant_revisions TO fluxgate_aggregator;
 		GRANT SELECT, DELETE ON ingest_requests TO fluxgate_aggregator;
 		GRANT SELECT ON rollups TO fluxgate_query;
+		GRANT SELECT ON tenant_revisions TO fluxgate_query;
 	`)
 	if err != nil {
 		return fmt.Errorf("grant runtime permissions: %w", err)

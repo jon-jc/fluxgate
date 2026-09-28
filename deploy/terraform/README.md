@@ -82,7 +82,7 @@ TLS OTLP collector via `otlp_endpoint`; there is no implicit Cloud Run collector
 | --- | --- |
 | ingest | Read, insert and update retry reservations |
 | aggregator | Read/write rollups, claim delivery ledger entries, prune retained data |
-| query | Read rollups only |
+| query | Read rollups and committed tenant revisions |
 | migrate | Own schema and provision runtime grants |
 
 Tenant isolation remains enforced by API authorization and SQL filters; these
@@ -96,8 +96,8 @@ users, rerun provisioning, and verify permissions before enabling them again.
 ## Upgrades and rollback
 
 Take a verified backup before migrations. Run the new migration image using the
-same owner. **Migration 0003 requires stopping every old aggregator before it
-runs**: older writers do not understand the new delivery identity constraints.
+same owner. **Migrations 0003 and 0005 require stopping every old aggregator before they
+run**: older writers do not understand the new delivery identity constraints or stream revisions.
 Existing deployments must move/import the renamed Cloud Run resource addresses
 into `google_cloud_run_v2_service.service["ingest"|"aggregator"|"query"]` and review
 all state changes. Do not apply the bootstrap defaults to an existing live stack.

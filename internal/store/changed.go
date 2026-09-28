@@ -7,40 +7,29 @@ import (
 	"time"
 )
 
-// Cursor is a position in the stream of rollup writes.
-//
-// It is a keyset rather than a bare timestamp, and that is not a
-// micro-optimisation. A flush writes every rollup in one transaction, and
-// Postgres `now()` is transaction-scoped, so all of those rows carry a
-// byte-identical `updated_at`. Paging on time alone loses data the moment one
-// flush writes more rows than the page size: the page returns some of them, the
-// cursor advances to the shared timestamp, and the next poll's strict
-// inequality excludes the rest -- including rows that were never returned. They
-// never appear again, and nothing reports it.
-//
-// Carrying the rest of the ordering key makes the position exact, so a page
-// boundary can fall anywhere, including inside a group of rows written at the
-// same instant.
+// Cursor identifies a committed tenant revision and the last row within it.
+// Per-tenant revision locks make commit order independent of transaction start
+// time, wall-clock adjustments and ties in timestamp precision.
 type Cursor struct {
-	// Since is the write time of the last row delivered.
-	Since time.Time
-	// Metric, LabelHash and WindowStart disambiguate rows sharing Since. They
-	// are empty on a fresh cursor, which reads as "everything at or after
-	// Since".
+	// Revision is assigned under a tenant row lock held through commit.
+	Revision int64
+	// Metric, LabelHash and WindowStart disambiguate rows sharing Revision. They
+	// are empty on a fresh cursor, which reads as "everything strictly after
+	// Revision".
 	Kind        string
 	Metric      string
 	LabelHash   string
 	WindowStart time.Time
 
 	// primed reports whether the tie-breaking fields are meaningful. A fresh
-	// cursor is not primed, and uses a strict inequality on Since alone.
+	// cursor is not primed, and uses a strict inequality on Revision alone.
 	primed bool
 }
 
 // After returns a cursor positioned immediately after r.
-func (c Cursor) After(r StoredRollup, updatedAt time.Time) Cursor {
+func (c Cursor) After(r StoredRollup, revision int64) Cursor {
 	return Cursor{
-		Since:       updatedAt,
+		Revision:    revision,
 		Kind:        r.Kind,
 		Metric:      r.Metric,
 		LabelHash:   r.LabelHash,
@@ -57,7 +46,7 @@ func (c Cursor) After(r StoredRollup, updatedAt time.Time) Cursor {
 // the instance -- runtime topology management, for a feature whose usable
 // latency floor is a human looking at a screen.
 //
-// The cursor advances on write time, not event time: a late arrival updates a
+// The cursor advances on commit revision, not event time: a late arrival updates a
 // window that closed minutes ago, and a tail ordered by event time would never
 // show it.
 func (db *DB) Changed(
@@ -67,9 +56,9 @@ func (db *DB) Changed(
 		limit = 1000
 	}
 
-	args := []any{tenantID, cursor.Since}
+	args := []any{tenantID, cursor.Revision}
 
-	// A fresh cursor wants everything strictly after its timestamp. A primed
+	// A fresh cursor wants everything strictly after its revision. A primed
 	// one wants everything after a specific row, which is the row-wise
 	// comparison below: identical semantics to a compound "greater than",
 	// expressed so the index can serve it.
@@ -77,10 +66,10 @@ func (db *DB) Changed(
 	if cursor.primed {
 		args = append(args, cursor.Metric, cursor.Kind, cursor.LabelHash, cursor.WindowStart)
 		position = fmt.Sprintf(
-			` AND (updated_at, metric, kind, label_hash, window_start) > ($2, $%d, $%d, $%d, $%d)`,
+			` AND (revision, metric, kind, label_hash, window_start) > ($2, $%d, $%d, $%d, $%d)`,
 			len(args)-3, len(args)-2, len(args)-1, len(args))
 	} else {
-		position = " AND updated_at > $2"
+		position = " AND revision > $2"
 	}
 
 	var metricClause string
@@ -94,10 +83,10 @@ func (db *DB) Changed(
 	sql := `
 		SELECT tenant_id, metric, kind, label_hash, labels,
 		       window_start, window_end,
-		       count, sum, min, max, last, last_event_at, buckets, updated_at
+		       count, sum, min, max, last, last_event_at, buckets, revision
 		  FROM rollups
 		 WHERE tenant_id = $1` + position + metricClause + `
-		 ORDER BY updated_at, metric, kind, label_hash, window_start
+		 ORDER BY revision, metric, kind, label_hash, window_start
 		 LIMIT $` + fmt.Sprint(len(args))
 
 	rows, err := db.pool.Query(ctx, sql, args...)
@@ -113,13 +102,13 @@ func (db *DB) Changed(
 		var (
 			r         StoredRollup
 			rawLabels []byte
-			updatedAt time.Time
+			revision  int64
 		)
 		if err := rows.Scan(
 			&r.TenantID, &r.Metric, &r.Kind, &r.LabelHash, &rawLabels,
 			&r.WindowStart, &r.WindowEnd,
 			&r.Count, &r.Sum, &r.Min, &r.Max, &r.Last, &r.LastEventAt, &r.Buckets,
-			&updatedAt,
+			&revision,
 		); err != nil {
 			return nil, cursor, fmt.Errorf("query changes: scan: %w", err)
 		}
@@ -130,9 +119,9 @@ func (db *DB) Changed(
 		}
 
 		out = append(out, r)
-		// Advanced per row rather than to the page's maximum timestamp, so the
+		// Advanced per row rather than to the page's maximum revision, so the
 		// next page resumes exactly where this one stopped.
-		next = next.After(r, updatedAt)
+		next = next.After(r, revision)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, cursor, fmt.Errorf("query changes: %w", err)
@@ -141,25 +130,17 @@ func (db *DB) Changed(
 	return out, next, nil
 }
 
-// NewestWriteTime returns the most recent rollup write time for a tenant,
-// measured by the database's own clock.
-//
-// The live tail starts "from now". Taking that from the reading process's clock
-// would be wrong: rows are stamped by the database, and any skew between the
-// two either hides events (reader ahead) or replays history (reader behind) --
-// both silently. Asking the database removes the question.
-//
-// A tenant with no rollups yet gets the database's current time, which is the
-// same answer for a stream that is about to see its first row.
-func (db *DB) NewestWriteTime(ctx context.Context, tenantID string) (time.Time, error) {
-	var newest time.Time
+// NewestRevision seeds a new live tail at the latest committed tenant revision.
+// An in-flight flush is excluded; its higher revision appears on a later poll.
+func (db *DB) NewestRevision(ctx context.Context, tenantID string) (int64, error) {
+	var newest int64
 
 	err := db.pool.QueryRow(ctx, `
-		SELECT COALESCE(max(updated_at), now())
-		  FROM rollups
+		SELECT COALESCE(max(revision), 0)
+		  FROM tenant_revisions
 		 WHERE tenant_id = $1`, tenantID).Scan(&newest)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("newest write time: %w", err)
+		return 0, fmt.Errorf("newest revision: %w", err)
 	}
-	return newest.UTC(), nil
+	return newest, nil
 }

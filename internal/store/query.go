@@ -28,7 +28,7 @@ type QueryFilter struct {
 // maxQueryRows bounds any single read. A query spanning a year of one-minute
 // windows across a thousand series would otherwise try to materialise half a
 // billion rows into one HTTP response.
-const maxQueryRows = 50_000
+const maxQueryRows = 50_001 // includes one overflow sentinel for the HTTP result cap
 
 // Query reads rollups matching a filter, newest window first.
 //
@@ -66,7 +66,7 @@ func (db *DB) Query(ctx context.Context, f QueryFilter) ([]StoredRollup, error) 
 		   AND metric = $2
 		   AND window_start >= $3
 		   AND window_start < $4` + labelClause + `
-		 ORDER BY window_start DESC, label_hash
+		 ORDER BY window_start DESC, kind, label_hash
 		 LIMIT $` + fmt.Sprint(len(args))
 
 	rows, err := db.pool.Query(ctx, sql, args...)

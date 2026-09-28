@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/jon-jc/fluxgate/internal/aggregate"
 	"github.com/jon-jc/fluxgate/internal/store"
@@ -28,8 +27,6 @@ func TestChangedDoesNotDropRowsSharingATimestamp(t *testing.T) {
 	db, tenant := openDB(t)
 	ctx := context.Background()
 
-	before := time.Now().UTC().Add(-time.Second)
-
 	// One flush, one transaction, one `now()`: 20 rows that are
 	// indistinguishable by timestamp.
 	const rows = 20
@@ -47,7 +44,7 @@ func TestChangedDoesNotDropRowsSharingATimestamp(t *testing.T) {
 	const pageSize = 5
 
 	seen := make(map[string]bool, rows)
-	cursor := store.Cursor{Since: before}
+	cursor := store.Cursor{Revision: 0}
 
 	for page := range 10 {
 		changed, next, err := db.Changed(ctx, tenant, "shared.timestamp", cursor, pageSize)
@@ -79,15 +76,13 @@ func TestChangedCursorIsStableAcrossAnEmptyPoll(t *testing.T) {
 	db, tenant := openDB(t)
 	ctx := context.Background()
 
-	before := time.Now().UTC().Add(-time.Second)
-
 	if err := db.Flush(ctx,
 		[]aggregate.Rollup{rollup(tenant, "quiet.metric", 0, telemetry.KindGauge, 1)},
 		nil); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	changed, cursor, err := db.Changed(ctx, tenant, "quiet.metric", store.Cursor{Since: before}, 100)
+	changed, cursor, err := db.Changed(ctx, tenant, "quiet.metric", store.Cursor{Revision: 0}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}
@@ -116,8 +111,6 @@ func TestChangedSurfacesLaterWritesAtTheSameInstant(t *testing.T) {
 	db, tenant := openDB(t)
 	ctx := context.Background()
 
-	before := time.Now().UTC().Add(-time.Second)
-
 	// Two flushes in quick succession. Whether they share a timestamp depends
 	// on clock resolution, which is exactly why the tail must not depend on
 	// them differing.
@@ -131,7 +124,7 @@ func TestChangedSurfacesLaterWritesAtTheSameInstant(t *testing.T) {
 	}
 
 	seen := 0
-	cursor := store.Cursor{Since: before}
+	cursor := store.Cursor{Revision: 0}
 
 	for range 5 {
 		changed, next, err := db.Changed(ctx, tenant, "rapid.metric", cursor, 1)
@@ -150,20 +143,20 @@ func TestChangedSurfacesLaterWritesAtTheSameInstant(t *testing.T) {
 	}
 }
 
-// TestNewestWriteTimeSeedsTheTailFromTheDatabaseClock checks that a new
+// TestNewestRevisionSeedsTheTailFromTheDatabaseClock checks that a new
 // subscriber's starting position comes from the database rather than locally.
 //
 // The tail starts "from now". Taking that from the reading process's clock is
 // wrong: rows are stamped by the database, and any skew between the two either
 // hides events (app clock ahead) or replays history (app clock behind). Both
 // are silent.
-func TestNewestWriteTimeSeedsTheTailFromTheDatabaseClock(t *testing.T) {
+func TestNewestRevisionSeedsTheTailFromTheDatabaseClock(t *testing.T) {
 	db, tenant := openDB(t)
 	ctx := context.Background()
 
-	seed, err := db.NewestWriteTime(ctx, tenant)
+	seed, err := db.NewestRevision(ctx, tenant)
 	if err != nil {
-		t.Fatalf("NewestWriteTime: %v", err)
+		t.Fatalf("NewestRevision: %v", err)
 	}
 
 	if err = db.Flush(ctx,
@@ -172,7 +165,7 @@ func TestNewestWriteTimeSeedsTheTailFromTheDatabaseClock(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 
-	changed, _, err := db.Changed(ctx, tenant, "seeded.metric", store.Cursor{Since: seed}, 100)
+	changed, _, err := db.Changed(ctx, tenant, "seeded.metric", store.Cursor{Revision: seed}, 100)
 	if err != nil {
 		t.Fatalf("Changed: %v", err)
 	}

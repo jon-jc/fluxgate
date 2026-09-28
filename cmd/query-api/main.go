@@ -133,6 +133,9 @@ func run() error {
 				DefaultRange: cfg.Query.DefaultRange,
 			},
 			Stream: api.StreamOptions{
+				MaxConcurrent:     cfg.Query.StreamMaxConcurrent,
+				QueryTimeout:      cfg.HTTP.HandlerTimeout,
+				WriteTimeout:      cfg.HTTP.WriteTimeout,
 				PollInterval:      cfg.Query.StreamPollInterval,
 				HeartbeatInterval: cfg.Query.StreamHeartbeat,
 				MaxDuration:       cfg.Query.StreamMaxDuration,
