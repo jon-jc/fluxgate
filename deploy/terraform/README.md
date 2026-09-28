@@ -100,7 +100,8 @@ users, rerun provisioning, and verify permissions before enabling them again.
 Take a verified backup before migrations. Run the new migration image using the
 same owner. **Migrations 0003 and 0005 require stopping every old aggregator before they
 run**: older writers do not understand the new delivery identity constraints or stream revisions.
-Migration 0006 builds the retention index; plan a maintenance window because index
+Migration 0007 corrects an index-name collision in 0006 and builds the retention
+index on `window_end`; plan a maintenance window because index
 creation can block writes on large existing tables. Rerun the migration job's
 runtime-role provisioning with this release to grant the row-lock privileges used
 by cleanup. Verify that expired rows drain before resuming normal traffic.

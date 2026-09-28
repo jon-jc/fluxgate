@@ -142,6 +142,7 @@ func run() error {
 		WindowSize:      cfg.Aggregator.WindowSize,
 		AllowedLateness: cfg.Aggregator.AllowedLateness,
 		MaxSeries:       cfg.Aggregator.MaxSeries,
+		MaxBytes:        cfg.Aggregator.MaxBufferedBytes,
 		IdleTimeout:     cfg.Aggregator.IdleTimeout,
 	})
 
@@ -160,6 +161,7 @@ func run() error {
 	subscriber, err := pubsubx.NewSubscriber(client, runner.Handle, pubsubx.SubscriberOptions{
 		Subscription:           cfg.PubSub.AggregatorSubscription,
 		MaxOutstandingMessages: cfg.Aggregator.MaxOutstandingMessages,
+		MaxOutstandingBytes:    cfg.Aggregator.MaxOutstandingBytes,
 		NumGoroutines:          cfg.Aggregator.Concurrency,
 		// A message's lease has to survive until its window closes and flushes,
 		// which is bounded by the window size plus the lateness allowance. The
@@ -357,10 +359,12 @@ func report(
 			watermarkLag := time.Since(time.Unix(engineStats.WatermarkUnixSec, 0))
 			metrics.SetAggregationState(
 				engineStats.OpenWindows, engineStats.TrackedSeries, watermarkLag)
+			metrics.SetAggregationBytes(engineStats.BufferedBytes)
 
 			logger.Info("aggregator status",
 				slog.Int("open_windows", engineStats.OpenWindows),
 				slog.Int("tracked_series", engineStats.TrackedSeries),
+				slog.Int64("buffered_bytes", engineStats.BufferedBytes),
 				slog.Int("inflight_messages", runner.InflightMessages()),
 				slog.Time("watermark", time.Unix(engineStats.WatermarkUnixSec, 0).UTC()),
 				slog.Int64("points_accepted", engineStats.PointsAccepted),

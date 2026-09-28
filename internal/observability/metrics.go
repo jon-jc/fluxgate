@@ -41,6 +41,7 @@ type Metrics struct {
 	rollupsWritten  prometheus.Counter
 	openWindows     prometheus.Gauge
 	trackedSeries   prometheus.Gauge
+	bufferedBytes   prometheus.Gauge
 	watermarkLagSec prometheus.Gauge
 }
 
@@ -196,6 +197,10 @@ func NewMetrics(service string) *Metrics {
 			ConstLabels: labels,
 		}),
 
+		bufferedBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "fluxgate", Subsystem: "aggregate", Name: "buffered_bytes",
+			Help: "Estimated retained series bytes used by the admission budget.", ConstLabels: labels,
+		}),
 		watermarkLagSec: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "fluxgate",
 			Subsystem: "aggregate",
@@ -211,7 +216,7 @@ func NewMetrics(service string) *Metrics {
 		m.pointsAccepted, m.pointsRejected, m.batchSize,
 		m.publishTotal, m.publishDuration, m.breakerState,
 		m.messagesTotal, m.windowsFlushed, m.flushDuration,
-		m.rollupsWritten, m.openWindows, m.trackedSeries, m.watermarkLagSec,
+		m.rollupsWritten, m.openWindows, m.trackedSeries, m.bufferedBytes, m.watermarkLagSec,
 	)
 
 	return m
@@ -312,6 +317,13 @@ func (m *Metrics) SetAggregationState(openWindows, series int, watermarkLag time
 	m.openWindows.Set(float64(openWindows))
 	m.trackedSeries.Set(float64(series))
 	m.watermarkLagSec.Set(watermarkLag.Seconds())
+}
+
+// SetAggregationBytes reports admission accounting, not process RSS.
+func (m *Metrics) SetAggregationBytes(bytes int64) {
+	if m != nil {
+		m.bufferedBytes.Set(float64(bytes))
+	}
 }
 
 // statusClass buckets a status code as 2xx, 4xx and so on.
