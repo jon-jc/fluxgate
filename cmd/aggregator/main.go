@@ -302,6 +302,9 @@ func prune(ctx context.Context, db *store.DB, cfg config.Config, logger *slog.Lo
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if _, err := db.PruneIngestRequests(ctx); err != nil {
+				logger.Error("pruning retry requests failed", slog.Any("error", err))
+			}
 			ledger, err := db.PruneProcessedBatches(ctx, cfg.Aggregator.LedgerRetention)
 			if err != nil {
 				// Retention falling behind is a capacity problem, not a

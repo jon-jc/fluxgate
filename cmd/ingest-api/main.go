@@ -29,6 +29,7 @@ import (
 	"github.com/jon-jc/fluxgate/internal/pubsubx"
 	"github.com/jon-jc/fluxgate/internal/ratelimit"
 	"github.com/jon-jc/fluxgate/internal/resilience"
+	"github.com/jon-jc/fluxgate/internal/store"
 	"github.com/jon-jc/fluxgate/internal/telemetry"
 	"github.com/jon-jc/fluxgate/internal/version"
 )
@@ -66,7 +67,7 @@ func main() {
 const serviceName = "fluxgate-ingest-api"
 
 func run() error {
-	cfg, err := config.Load(serviceName, config.Requirements{Auth: true, PubSub: true})
+	cfg, err := config.Load(serviceName, config.Requirements{Auth: true, PubSub: true, Ingest: true})
 	if err != nil {
 		return err
 	}
@@ -118,6 +119,25 @@ func run() error {
 	// process.
 	defer closeSink()
 
+	var retries idempotency.Repository = idempotency.New(cfg.Ingest.IdempotencyTTL)
+	if cfg.Database.DSN != "" {
+		db, openErr := store.Open(ctx, store.Config{DSN: cfg.Database.DSN, MaxConns: cfg.Database.MaxConns, MinConns: cfg.Database.MinConns, MaxConnLifetime: cfg.Database.MaxConnLifetime, ConnectTimeout: cfg.Database.ConnectTimeout}, logger)
+		if openErr != nil {
+			return openErr
+		}
+		defer db.Close()
+		if cfg.Database.Migrate && !cfg.Environment.IsProduction() {
+			if migrateErr := db.Migrate(ctx); migrateErr != nil {
+				return migrateErr
+			}
+		}
+		persistent := idempotency.NewPostgres(db.Pool(), cfg.Ingest.IdempotencyTTL)
+		health.Register(persistent)
+		retries = persistent
+	} else {
+		logger.Warn("idempotency is local to this process; configure DATABASE_URL for shared retries")
+	}
+
 	handler := api.NewRouter(api.Deps{
 		Config:  cfg,
 		Logger:  logger,
@@ -142,7 +162,7 @@ func run() error {
 				Rate:  cfg.Ingest.RateLimitPointsPerSecond,
 				Burst: cfg.Ingest.RateLimitBurst,
 			}),
-			Idempotency:     idempotency.New(cfg.Ingest.IdempotencyTTL),
+			Idempotency:     retries,
 			MaxRequestBytes: cfg.HTTP.MaxRequestBytes,
 		},
 	})
@@ -189,16 +209,16 @@ func buildAuth(cfg config.Config, logger *slog.Logger) (auth.Options, error) {
 		return auth.Options{Disabled: true}, nil
 	}
 
-	store, err := auth.LoadStore(cfg.Auth.Keys, cfg.Auth.KeysFile)
+	keys, err := auth.LoadStore(cfg.Auth.Keys, cfg.Auth.KeysFile)
 	if err != nil {
 		return auth.Options{}, fmt.Errorf("load API keys: %w", err)
 	}
 
 	logger.Info("api keys loaded",
-		slog.Int("keys", store.Len()),
-		slog.Any("tenants", store.TenantIDs()))
+		slog.Int("keys", keys.Len()),
+		slog.Any("tenants", keys.TenantIDs()))
 
-	return auth.Options{Store: store}, nil
+	return auth.Options{Store: keys}, nil
 }
 
 // buildSink resolves where accepted batches go, returning a cleanup function.

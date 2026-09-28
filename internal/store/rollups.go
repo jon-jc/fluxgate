@@ -225,6 +225,20 @@ func (db *DB) PruneProcessedBatches(ctx context.Context, olderThan time.Duration
 	return tag.RowsAffected(), nil
 }
 
+// PruneIngestRequests reclaims expired retry payloads in bounded transactions.
+func (db *DB) PruneIngestRequests(ctx context.Context) (int64, error) {
+	tag, err := db.pool.Exec(ctx, `WITH expired AS (
+	 SELECT tenant_id, idempotency_key FROM ingest_requests
+	 WHERE expires_at < now() ORDER BY expires_at LIMIT 10000
+	 FOR UPDATE SKIP LOCKED
+	) DELETE FROM ingest_requests r USING expired e
+	 WHERE r.tenant_id=e.tenant_id AND r.idempotency_key=e.idempotency_key`)
+	if err != nil {
+		return 0, fmt.Errorf("prune retry requests: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // PruneRollups deletes rollups whose window ended before the retention
 // horizon.
 func (db *DB) PruneRollups(ctx context.Context, olderThan time.Duration) (int64, error) {

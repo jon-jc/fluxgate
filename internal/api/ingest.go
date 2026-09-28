@@ -81,7 +81,7 @@ type IngestDeps struct {
 	// Limiter meters points per second per tenant.
 	Limiter *ratelimit.Limiter
 	// Idempotency replays outcomes for repeated requests. Optional.
-	Idempotency *idempotency.Store
+	Idempotency idempotency.Repository
 	// MaxRequestBytes caps the request body.
 	MaxRequestBytes int64
 }
@@ -117,13 +117,13 @@ func handleIngest(deps IngestDeps) httpx.Handler {
 		}
 
 		fingerprint := idempotency.Fingerprint(body)
-		if replayed, err := deps.replay(w, r, principal.TenantID, idemKey, fingerprint); err != nil || replayed {
-			return err
+		if replayed, replayErr := deps.replay(w, r, principal.TenantID, idemKey, fingerprint); replayErr != nil || replayed {
+			return replayErr
 		}
 
 		var req ingestRequest
-		if err := httpx.UnmarshalJSON(body, &req); err != nil {
-			return err
+		if decodeErr := httpx.UnmarshalJSON(body, &req); decodeErr != nil {
+			return decodeErr
 		}
 
 		limits := deps.Validator.Limits
@@ -145,8 +145,8 @@ func handleIngest(deps IngestDeps) httpx.Handler {
 		// and the point count is only knowable once the body is parsed. The
 		// body size cap is what bounds the work an unmetered caller can force
 		// before reaching this line.
-		if err := deps.meter(w, principal, len(req.Points)); err != nil {
-			return err
+		if meterErr := deps.meter(w, principal, len(req.Points)); meterErr != nil {
+			return meterErr
 		}
 
 		// The arrival stamp comes from the validator's clock, not time.Now:
@@ -169,14 +169,6 @@ func handleIngest(deps IngestDeps) httpx.Handler {
 			Points:     accepted,
 		}
 
-		if err := deps.Sink.Publish(r.Context(), batch); err != nil {
-			// The batch was never durably accepted, so the client must retry.
-			// Saying so plainly is what keeps their data from being lost.
-			return httpx.Unavailable(
-				"The batch could not be accepted for delivery. Retry with the same Idempotency-Key.").
-				WithCause(fmt.Errorf("publish batch %s: %w", batch.ID, err))
-		}
-
 		resp := ingestResponse{
 			BatchID:         batch.ID,
 			Accepted:        len(accepted),
@@ -185,16 +177,19 @@ func handleIngest(deps IngestDeps) httpx.Handler {
 			ErrorsTruncated: len(fieldErrors) > maxReportedErrors,
 		}
 
-		observability.LoggerFromContext(r.Context()).Info("batch accepted",
-			slog.String("batch_id", batch.ID),
-			slog.Int("accepted", resp.Accepted),
-			slog.Int("rejected", resp.Rejected))
+		body, err = marshalResponse(resp)
+		if err != nil {
+			return httpx.Internal(err)
+		}
+		rec := idempotency.Record{Batch: batch, Status: http.StatusAccepted, Body: body, Fingerprint: fingerprint}
+		if deps.Idempotency != nil && idemKey != "" {
+			rec, err = deps.Idempotency.Reserve(r.Context(), principal.TenantID, idemKey, rec)
+			if err != nil {
+				return idempotencyError(err)
+			}
+		}
+		return deps.deliver(w, r, principal.TenantID, idemKey, rec, rec.Published)
 
-		deps.remember(r, principal.TenantID, idemKey, fingerprint, resp)
-
-		// 202 rather than 201: delivery is asynchronous, and no addressable
-		// resource exists yet at the moment this returns.
-		return httpx.WriteJSON(w, r, http.StatusAccepted, resp)
 	}
 }
 
@@ -269,55 +264,48 @@ func (deps IngestDeps) meter(w http.ResponseWriter, p auth.Principal, cost int) 
 
 // replay returns the stored outcome for a repeated request, if there is one.
 // It reports whether a response was written.
-func (deps IngestDeps) replay(
-	w http.ResponseWriter, r *http.Request, tenantID, key, fingerprint string,
-) (bool, error) {
+func (deps IngestDeps) replay(w http.ResponseWriter, r *http.Request, tenantID, key, fingerprint string) (bool, error) {
 	if deps.Idempotency == nil || key == "" {
 		return false, nil
 	}
-
-	rec, found, err := deps.Idempotency.Lookup(tenantID, key, fingerprint)
-	if errors.Is(err, idempotency.ErrPayloadMismatch) {
-		return false, httpx.Conflict(
-			"This Idempotency-Key was already used for a different payload. Use a new key for new data.").
-			WithCause(err)
+	rec, found, err := deps.Idempotency.Get(r.Context(), tenantID, key, fingerprint)
+	if err != nil {
+		return false, idempotencyError(err)
 	}
-	if err != nil || !found {
-		return false, err
+	if !found {
+		return false, nil
 	}
-
-	observability.LoggerFromContext(r.Context()).Info("replaying idempotent response",
-		slog.String("idempotency_key", key))
-
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set(HeaderIdempotencyReplayed, "true")
-	w.WriteHeader(rec.Status)
-	_, _ = w.Write(rec.Body)
-	return true, nil
+	return true, deps.deliver(w, r, tenantID, key, rec, true)
 }
 
-// remember stores the outcome so a retry of the same request replays it.
-func (deps IngestDeps) remember(
-	r *http.Request, tenantID, key, fingerprint string, resp ingestResponse,
-) {
-	if deps.Idempotency == nil || key == "" {
-		return
+func idempotencyError(err error) error {
+	if errors.Is(err, idempotency.ErrPayloadMismatch) {
+		return httpx.Conflict("This Idempotency-Key was already used for a different payload. Use a new key for new data.").WithCause(err)
 	}
+	return httpx.Unavailable("The retry record is unavailable. Retry with the same Idempotency-Key.").WithCause(err)
+}
 
-	body, err := marshalResponse(resp)
-	if err != nil {
-		// Losing the record only costs duplicate protection on a retry, which
-		// is not worth failing an otherwise successful request over.
-		observability.LoggerFromContext(r.Context()).Warn(
-			"could not store idempotency record", slog.Any("error", err))
-		return
+// deliver never assigns a new identity to an ambiguous publish. Every attempt
+// uses the batch durably reserved before the first publish, including timestamps.
+func (deps IngestDeps) deliver(w http.ResponseWriter, r *http.Request, tenantID, key string, rec idempotency.Record, replay bool) error {
+	if !rec.Published {
+		if err := deps.Sink.Publish(r.Context(), rec.Batch); err != nil {
+			return httpx.Unavailable("Delivery could not be confirmed. Retry with the same Idempotency-Key.").WithCause(err)
+		}
+		if deps.Idempotency != nil && key != "" {
+			if err := deps.Idempotency.Complete(r.Context(), tenantID, key, rec.Batch.ID); err != nil {
+				return idempotencyError(err)
+			}
+		}
 	}
-
-	deps.Idempotency.Save(tenantID, key, idempotency.Record{
-		Status:      http.StatusAccepted,
-		Body:        body,
-		Fingerprint: fingerprint,
-	})
+	observability.LoggerFromContext(r.Context()).Info("batch accepted", slog.String("batch_id", rec.Batch.ID), slog.Bool("replayed", replay))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if replay {
+		w.Header().Set(HeaderIdempotencyReplayed, "true")
+	}
+	w.WriteHeader(rec.Status)
+	_, err := w.Write(rec.Body)
+	return err
 }
 
 // idempotencyKey extracts and validates the client-supplied key.

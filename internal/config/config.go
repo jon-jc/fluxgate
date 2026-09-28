@@ -294,6 +294,8 @@ type ShutdownConfig struct {
 // with neither a database nor credentials should be told both at once, not one
 // per redeploy.
 type Requirements struct {
+	// Ingest requires durable retry storage on deployed tiers.
+	Ingest bool
 	// Auth means the process serves an authenticated API, so credentials are
 	// mandatory. A background consumer declares false: it has no callers to
 	// authenticate, and demanding an API key from it would be a boot failure
@@ -554,6 +556,9 @@ func (c Config) validateQuery(l *loader) {
 }
 
 func (c Config) validateDatabase(l *loader) {
+	if l.requirements.Ingest && c.Environment.IsProduction() && c.Database.DSN == "" {
+		l.reject("DATABASE_URL", "is required for shared durable idempotency on staging and prod")
+	}
 	if c.Database.DSN == "" {
 		if l.requirements.Database {
 			l.reject("DATABASE_URL", "is required by this service")
@@ -676,6 +681,9 @@ func (c Config) validateAuth(l *loader) {
 }
 
 func (c Config) validateIngest(l *loader) {
+	if l.requirements.Ingest && c.Ingest.IdempotencyTTL <= 0 {
+		l.reject("IDEMPOTENCY_TTL", "must be greater than zero")
+	}
 	if c.Ingest.MaxPointsPerBatch <= 0 {
 		l.reject("INGEST_MAX_POINTS_PER_BATCH", "must be greater than zero")
 	}
