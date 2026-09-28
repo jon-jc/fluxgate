@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jon-jc/fluxgate/internal/auth"
@@ -52,6 +53,7 @@ func (d QueryDeps) now() time.Time {
 type StreamOptions struct {
 	// Bound connection count, individual polls, and writes to slow clients.
 	MaxConcurrent int
+	MaxPerTenant  int
 	QueryTimeout  time.Duration
 	WriteTimeout  time.Duration
 	// PollInterval is how often the tail checks for newly written rollups.
@@ -68,6 +70,10 @@ func (o *StreamOptions) applyDefaults() {
 	if o.MaxConcurrent <= 0 {
 		o.MaxConcurrent = 100
 	}
+	if o.MaxPerTenant <= 0 {
+		o.MaxPerTenant = 8
+	}
+	o.MaxPerTenant = min(o.MaxPerTenant, o.MaxConcurrent)
 	if o.QueryTimeout <= 0 {
 		o.QueryTimeout = 5 * time.Second
 	}
@@ -226,6 +232,8 @@ func handleStream(deps QueryDeps) httpx.Handler {
 	opts := deps.Stream
 	opts.applyDefaults()
 	slots := make(chan struct{}, opts.MaxConcurrent)
+	var admission sync.Mutex
+	perTenant := make(map[string]int)
 
 	return func(w http.ResponseWriter, r *http.Request) error {
 		principal, ok := auth.PrincipalFromContext(r.Context())
@@ -249,10 +257,27 @@ func handleStream(deps QueryDeps) httpx.Handler {
 			}
 		}
 
+		admission.Lock()
+		if perTenant[principal.TenantID] >= opts.MaxPerTenant {
+			admission.Unlock()
+			w.Header().Set("Retry-After", "5")
+			return httpx.RateLimited("This tenant has too many live streams. Close a stream before retrying.")
+		}
 		select {
 		case slots <- struct{}{}:
-			defer func() { <-slots }()
+			perTenant[principal.TenantID]++
+			admission.Unlock()
+			defer func() {
+				admission.Lock()
+				defer admission.Unlock()
+				<-slots
+				perTenant[principal.TenantID]--
+				if perTenant[principal.TenantID] == 0 {
+					delete(perTenant, principal.TenantID)
+				}
+			}()
 		default:
+			admission.Unlock()
 			w.Header().Set("Retry-After", "5")
 			return httpx.Unavailable("The live stream is at capacity. Retry shortly.")
 		}

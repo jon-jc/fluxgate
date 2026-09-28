@@ -101,6 +101,11 @@ func InitTracing(ctx context.Context, cfg config.Config, tracing TracingConfig, 
 	}
 
 	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithRawSpanLimits(sdktrace.SpanLimits{
+			AttributeValueLengthLimit: 1024, AttributeCountLimit: 32,
+			EventCountLimit: 16, LinkCountLimit: 8,
+			AttributePerEventCountLimit: 16, AttributePerLinkCountLimit: 16,
+		}),
 		sdktrace.WithBatcher(exporter,
 			// Batching bounds the cost of export. A synchronous exporter would
 			// put the collector's latency on the request path, which is
@@ -108,6 +113,7 @@ func InitTracing(ctx context.Context, cfg config.Config, tracing TracingConfig, 
 			// it observes.
 			sdktrace.WithBatchTimeout(5*time.Second),
 			sdktrace.WithMaxExportBatchSize(512),
+			sdktrace.WithMaxQueueSize(1024),
 		),
 		sdktrace.WithResource(res),
 		// ParentBased keeps a trace intact across services: once the edge has

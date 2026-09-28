@@ -5,7 +5,9 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	"go.opentelemetry.io/otel/trace"
 
@@ -28,6 +30,8 @@ type RouteResolver interface {
 
 // TelemetryOptions tunes what the tracing and metrics middleware observe.
 type TelemetryOptions struct {
+	// TrustTraceParent is only for a gateway that authenticates trace context.
+	TrustTraceParent bool
 	// SkipRoutes are route patterns that produce no span and no metric.
 	//
 	// Probes and the scrape endpoint belong here. An orchestrator polls
@@ -46,8 +50,8 @@ func (o TelemetryOptions) skipSet() map[string]struct{} {
 	return skip
 }
 
-// Trace starts a server span for every request, continuing an upstream trace
-// when the caller supplied one.
+// Trace starts a server span for every request. Public parents are linked;
+// only explicitly trusted gateways may select the parent and sampling decision.
 //
 // It runs outside the metrics middleware so the span covers the whole
 // measured request, and inside RequestID so that a log line, a metric and a
@@ -56,11 +60,11 @@ func Trace(routes RouteResolver, opts TelemetryOptions) Middleware {
 	skip := opts.skipSet()
 
 	return func(next http.Handler) http.Handler {
-		return traceHandler(routes, skip, next)
+		return traceHandler(routes, skip, opts.TrustTraceParent, next)
 	}
 }
 
-func traceHandler(routes RouteResolver, skip map[string]struct{}, next http.Handler) http.Handler {
+func traceHandler(routes RouteResolver, skip map[string]struct{}, trustParent bool, next http.Handler) http.Handler {
 	tracer := observability.Tracer(tracerName)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -69,31 +73,41 @@ func traceHandler(routes RouteResolver, skip map[string]struct{}, next http.Hand
 			return
 		}
 
-		// Extract before starting: a caller that already has a trace should
-		// have this span attached to it rather than beginning a second,
-		// disconnected one.
-		ctx := observability.ExtractTrace(
-			r.Context(), observability.HeaderCarrier(r.Header))
+		// Public callers must not force sampling or propagate arbitrary baggage
+		// into broker messages. Link their trace for correlation, but make a
+		// fresh local sampling decision unless an authenticated gateway is trusted.
+		ctx := baggage.ContextWithoutBaggage(r.Context())
+		externalCtx := propagation.TraceContext{}.Extract(ctx, propagation.HeaderCarrier(r.Header))
+		parent := trace.SpanContextFromContext(externalCtx)
+		startOptions := []trace.SpanStartOption{trace.WithSpanKind(trace.SpanKindServer)}
+		if trustParent {
+			ctx = externalCtx
+		} else {
+			startOptions = append(startOptions, trace.WithNewRoot())
+			if parent.IsValid() {
+				startOptions = append(startOptions, trace.WithLinks(trace.Link{SpanContext: parent.WithTraceState(trace.TraceState{})}))
+			}
+		}
 
 		route := RoutePattern(routes, r)
+		method := observability.HTTPMethod(r.Method)
 
 		// Go 1.22 route patterns already begin with the method, so prefixing
 		// again would name every span "POST POST /v1/ingest". Only the
 		// unmatched label needs the verb attached.
 		spanName := route
 		if route == UnmatchedRoute {
-			spanName = r.Method + " " + route
+			spanName = method + " " + route
 		}
 
-		ctx, span := tracer.Start(ctx, spanName,
-			trace.WithSpanKind(trace.SpanKindServer),
-			trace.WithAttributes(
-				semconv.HTTPRequestMethodKey.String(r.Method),
-				semconv.HTTPRoute(route),
-				semconv.URLPath(r.URL.Path),
-				semconv.UserAgentOriginal(r.UserAgent()),
-				attribute.String("request.id", RequestIDFromContext(ctx)),
-			))
+		startOptions = append(startOptions, trace.WithAttributes(
+			semconv.HTTPRequestMethodKey.String(method),
+			semconv.HTTPRoute(route),
+			semconv.URLPath(r.URL.Path),
+			semconv.UserAgentOriginal(r.UserAgent()),
+			attribute.String("request.id", RequestIDFromContext(ctx)),
+		))
+		ctx, span := tracer.Start(ctx, spanName, startOptions...)
 		defer span.End()
 
 		// Bind the trace onto the logger so every record for this request can

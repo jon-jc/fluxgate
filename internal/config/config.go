@@ -101,6 +101,7 @@ type TelemetryConfig struct {
 type QueryConfig struct {
 	// StreamMaxConcurrent bounds pollers held by one process.
 	StreamMaxConcurrent int
+	StreamMaxPerTenant  int
 	// MaxRange is the longest time span one query may cover.
 	MaxRange time.Duration
 	// MaxSeries caps the distinct series in one response.
@@ -275,6 +276,7 @@ type HTTPConfig struct {
 	// TrustedProxyHeader, when true, allows client IPs to be read from
 	// X-Forwarded-For. Only enable behind a proxy that rewrites that header.
 	TrustedProxyHeader bool
+	TrustTraceParent   bool
 }
 
 // LogConfig configures structured logging.
@@ -369,6 +371,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			MaxRequestBytes:    l.bytes("HTTP_MAX_REQUEST_BYTES", 4<<20),
 			MaxConcurrent:      l.integer("HTTP_MAX_CONCURRENT", 4),
 			TrustedProxyHeader: l.boolean("HTTP_TRUST_PROXY_HEADER", false),
+			TrustTraceParent:   l.boolean("HTTP_TRUST_TRACE_PARENT", false),
 		},
 		Log: LogConfig{
 			Level:     strings.ToLower(l.str("LOG_LEVEL", "info")),
@@ -448,6 +451,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 		},
 		Query: QueryConfig{
 			StreamMaxConcurrent: l.integer("QUERY_STREAM_MAX_CONCURRENT", 100),
+			StreamMaxPerTenant:  l.integer("QUERY_STREAM_MAX_PER_TENANT", 8),
 			MaxRange:            l.duration("QUERY_MAX_RANGE", 31*24*time.Hour),
 			MaxSeries:           l.integer("QUERY_MAX_SERIES", 500),
 			MaxPoints:           l.integer("QUERY_MAX_POINTS", 50_000),
@@ -627,6 +631,9 @@ func (c Config) validateTelemetry(l *loader) {
 }
 
 func (c Config) validateQuery(l *loader) {
+	if c.Query.StreamMaxPerTenant <= 0 {
+		l.reject("QUERY_STREAM_MAX_PER_TENANT", "must be greater than zero")
+	}
 	if c.Query.MaxSeries <= 0 {
 		l.reject("QUERY_MAX_SERIES", "must be greater than zero")
 	}
