@@ -166,6 +166,7 @@ def main():
                         require(code == 200, name + " metrics failed")
                         wanted = ("process_resident_memory_bytes", "process_cpu_seconds_total",
                                   "fluxgate_aggregate_tracked_series", "fluxgate_aggregate_buffered_bytes",
+                                  "fluxgate_aggregate_pending_messages", "fluxgate_aggregate_pending_encoded_bytes",
                                   "fluxgate_aggregate_flush_duration_seconds_count", "fluxgate_aggregate_flush_duration_seconds_sum")
                         sample["services"][name] = {line.split()[0].split("{")[0]: float(line.split()[1])
                             for line in metrics.splitlines() if line.startswith(wanted)}

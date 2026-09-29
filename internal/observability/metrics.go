@@ -42,6 +42,8 @@ type Metrics struct {
 	openWindows     prometheus.Gauge
 	trackedSeries   prometheus.Gauge
 	bufferedBytes   prometheus.Gauge
+	pendingMessages prometheus.Gauge
+	pendingBytes    prometheus.Gauge
 	watermarkLagSec prometheus.Gauge
 }
 
@@ -201,6 +203,14 @@ func NewMetrics(service string) *Metrics {
 			Namespace: "fluxgate", Subsystem: "aggregate", Name: "buffered_bytes",
 			Help: "Estimated retained series bytes used by the admission budget.", ConstLabels: labels,
 		}),
+		pendingMessages: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "fluxgate", Subsystem: "aggregate", Name: "pending_messages",
+			Help: "Admitted deliveries awaiting durable settlement, including writes in progress.", ConstLabels: labels,
+		}),
+		pendingBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "fluxgate", Subsystem: "aggregate", Name: "pending_encoded_bytes",
+			Help: "Broker payload bytes awaiting durable settlement, including writes in progress.", ConstLabels: labels,
+		}),
 		watermarkLagSec: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "fluxgate",
 			Subsystem: "aggregate",
@@ -217,6 +227,7 @@ func NewMetrics(service string) *Metrics {
 		m.publishTotal, m.publishDuration, m.breakerState,
 		m.messagesTotal, m.windowsFlushed, m.flushDuration,
 		m.rollupsWritten, m.openWindows, m.trackedSeries, m.bufferedBytes, m.watermarkLagSec,
+		m.pendingMessages, m.pendingBytes,
 	)
 
 	return m
@@ -335,6 +346,14 @@ func (m *Metrics) SetAggregationState(openWindows, series int, watermarkLag time
 func (m *Metrics) SetAggregationBytes(bytes int64) {
 	if m != nil {
 		m.bufferedBytes.Set(float64(bytes))
+	}
+}
+
+// SetPendingDeliveries reports receive credits retained until durable settlement.
+func (m *Metrics) SetPendingDeliveries(messages int, bytes int64) {
+	if m != nil {
+		m.pendingMessages.Set(float64(messages))
+		m.pendingBytes.Set(float64(bytes))
 	}
 }
 

@@ -48,8 +48,8 @@ Both crash windows are correct:
 **What it costs.** A ledger table that grows with batch volume, pruned on a
 retention that must outlive the longest possible redelivery — configuration
 validation enforces the lower bound. A database round trip per message to check
-the ledger. Messages held unacknowledged for up to a window's duration, which
-means the acknowledgement lease has to be sized generously. And a third state,
+the ledger. Messages held unacknowledged until a durable checkpoint, which
+means the acknowledgement lease has to survive storage delays. And a third state,
 "flushing", for a redelivery that arrives mid-write: the outcome is not knowable
 yet, so the message is handed back rather than guessed at.
 
@@ -64,6 +64,22 @@ cannot detach a point from its delivery bookkeeping.
 **Late data.** A local watermark cannot establish completeness across replicas.
 Accepted late points and failed writes therefore remain eligible for additive
 corrections. Cardinality pressure rejects the entire batch for redelivery.
+
+**Receive flow control.** Waiting only for event-time closure can fill the
+subscriber's receive budget before the newer messages needed to close a window
+can arrive. The worker therefore checkpoints all buffered windows on the flush
+timer, at half the configured outstanding-message or encoded-byte limit, and
+after an engine-capacity rejection. Pressure signals coalesce into one queued
+checkpoint. Partial windows merge additively on later checkpoints, using the
+same transactional claims and revision ordering. Acknowledgments and receive
+credit release still follow commit; failed writes nack for safe reconstruction.
+The timer handles large messages that cannot fit even below a pressure threshold.
+
+Queries and SSE may expose partial windows sooner. Event-time boundaries and
+last-value ordering are unchanged; a visible window has never been proof that
+no later accepted correction can arrive. Decoded point payloads are discarded
+after admission instead of being retained beside their aggregates. Pending
+message and encoded-byte gauges include transactions still in progress.
 
 **Upgrade.** Migration 0003 adds the tenant to the ledger key and the metric kind
 to the rollup key. Drain old aggregators before applying it, then start only the

@@ -162,8 +162,10 @@ window is durable. Overlapping claims roll back the flush for redelivery.
 This guarantee lasts only as long as the delivery ledger is retained. Archive
 replay beyond that horizon needs the ledger preserved or rebuilt first.
 
-Workers use event-time watermarks with an idle timeout to close buffered windows.
-Late accepted data produces additive corrections, including after a window has
+Workers checkpoint buffered data every flush interval and earlier when admitted
+deliveries consume half the configured receive byte/message budget. This frees
+broker receive slots without waiting for newer events to close a window. Queries
+can therefore see partial windows. Late accepted data produces additive corrections, including after a window has
 already committed. Admission is atomic for each batch: capacity exhaustion
 returns the whole batch for redelivery. Sustained overload can reach the
 configured dead-letter policy and requires operator attention.

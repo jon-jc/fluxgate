@@ -32,6 +32,8 @@ type Delivery struct {
 	// MessageID is the broker's identifier, for correlating with Pub/Sub's own
 	// metrics and logs.
 	MessageID string
+	// EncodedBytes is the broker payload size used by receive flow control.
+	EncodedBytes int
 
 	// msg is retained so a handler running in manual-acknowledgement mode can
 	// settle the message later, once the work it triggered is durable.
@@ -256,6 +258,7 @@ func (s *Subscriber) dispatch(ctx context.Context, msg *pubsub.Message) {
 		PublishTime:     msg.PublishTime,
 		DeliveryAttempt: deliveryAttempt(msg),
 		MessageID:       msg.ID,
+		EncodedBytes:    len(msg.Data),
 		settlement:      &settlement{done: make(chan bool, 1)},
 	}
 

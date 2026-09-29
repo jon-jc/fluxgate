@@ -150,9 +150,14 @@ func run() error {
 		Engine:        engine,
 		Store:         db,
 		FlushInterval: cfg.Aggregator.FlushInterval,
-		DrainTimeout:  cfg.Shutdown.DrainTimeout,
-		Metrics:       metrics,
-		Logger:        logger,
+		// Leave headroom for callbacks already delivered by the broker. The
+		// periodic checkpoint also handles a large message blocked below these
+		// thresholds, without depending on event-time or idle advancement.
+		CheckpointMessages: max(1, cfg.Aggregator.MaxOutstandingMessages/2),
+		CheckpointBytes:    int64(max(1, cfg.Aggregator.MaxOutstandingBytes/2)),
+		DrainTimeout:       cfg.Shutdown.DrainTimeout,
+		Metrics:            metrics,
+		Logger:             logger,
 	})
 	if err != nil {
 		return err
@@ -342,8 +347,9 @@ func report(
 	ctx context.Context, engine *aggregate.Engine, runner *aggregator.Runner,
 	metrics *observability.Metrics, logger *slog.Logger,
 ) error {
-	ticker := time.NewTicker(time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
+	var ticks int
 
 	for {
 		select {
@@ -353,19 +359,23 @@ func report(
 			engineStats := engine.Stats()
 			runnerStats := runner.Stats()
 
-			// Watermark lag is the single most useful pipeline gauge: a
-			// steadily rising value means the aggregator is falling behind,
-			// long before any queue depth alarm would notice.
+			// Watermark lag describes event-time progress, not commit latency:
+			// checkpoints can make partial windows visible before closure.
 			watermarkLag := time.Since(time.Unix(engineStats.WatermarkUnixSec, 0))
 			metrics.SetAggregationState(
 				engineStats.OpenWindows, engineStats.TrackedSeries, watermarkLag)
 			metrics.SetAggregationBytes(engineStats.BufferedBytes)
+			ticks++
+			if ticks%12 != 0 {
+				continue
+			}
 
 			logger.Info("aggregator status",
 				slog.Int("open_windows", engineStats.OpenWindows),
 				slog.Int("tracked_series", engineStats.TrackedSeries),
 				slog.Int64("buffered_bytes", engineStats.BufferedBytes),
-				slog.Int("inflight_messages", runner.InflightMessages()),
+				slog.Int("inflight_messages", runnerStats.PendingMessages),
+				slog.Int64("pending_encoded_bytes", runnerStats.PendingBytes),
 				slog.Time("watermark", time.Unix(engineStats.WatermarkUnixSec, 0).UTC()),
 				slog.Int64("points_accepted", engineStats.PointsAccepted),
 				slog.Int64("points_late", engineStats.PointsLate),
