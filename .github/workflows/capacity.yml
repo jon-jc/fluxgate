@@ -23,6 +23,10 @@ on:
         description: Flush interval in seconds (60 second windows)
         default: '15'
         required: true
+      broker_memory_mib:
+        description: Pub/Sub emulator memory in MiB (Java heap is 75%)
+        default: '4096'
+        required: true
 
 permissions:
   contents: read
@@ -48,10 +52,12 @@ jobs:
           SERIES: ${{ inputs.series }}
           TENANTS: ${{ inputs.tenants }}
           FLUSH_SECONDS: ${{ inputs.flush_seconds }}
+          BROKER_MEMORY_MIB: ${{ inputs.broker_memory_mib }}
         run: >-
           python3 scripts/measure_capacity.py
           --points-per-second "$POINTS_PER_SECOND" --duration "$DURATION"
           --series "$SERIES" --tenants "$TENANTS" --flush-seconds "$FLUSH_SECONDS"
+          --broker-memory-mib "$BROKER_MEMORY_MIB"
           --drain-timeout 600 --output "${{ runner.temp }}/capacity.json"
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         if: always()

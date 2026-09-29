@@ -155,6 +155,7 @@ func run() error {
 		// thresholds, without depending on event-time or idle advancement.
 		CheckpointMessages: max(1, cfg.Aggregator.MaxOutstandingMessages/2),
 		CheckpointBytes:    int64(max(1, cfg.Aggregator.MaxOutstandingBytes/2)),
+		StorageTimeout:     cfg.Aggregator.StorageTimeout,
 		DrainTimeout:       cfg.Shutdown.DrainTimeout,
 		Metrics:            metrics,
 		Logger:             logger,

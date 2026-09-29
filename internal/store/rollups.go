@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 
 	"github.com/jon-jc/fluxgate/internal/aggregate"
 )
@@ -16,19 +16,28 @@ import (
 // ErrContributionConflict requires redelivery after an overlapping flush.
 var ErrContributionConflict = errors.New("contribution already committed; rebuild uncommitted windows")
 
-// upsertRollup merges one window's aggregate into the stored row.
+// mergeRollup merges one window's aggregate into the stored row.
 //
 // The merge is additive rather than replacing, so a window flushed in two
 // pieces -- by two replicas, or by one replica across a restart -- ends up with
 // the same totals as if it had been flushed once. That is only sound because
 // every statistic is associative, which is also why `last` is resolved by event
 // time rather than by which write arrived second.
-const upsertRollup = `
+const insertRollups = `
 INSERT INTO rollups (
 	tenant_id, metric, kind, label_hash,
 	window_start, window_end, labels,
 	count, sum, min, max, last, last_event_at, buckets, revision
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+) SELECT tenant_id, metric, kind, label_hash, window_start, window_end, labels,
+         count, sum, min, max, last, last_event_at, buckets, revision
+  FROM jsonb_to_recordset($1::jsonb) AS input (
+    tenant_id text, metric text, kind text, label_hash text,
+    window_start timestamptz, window_end timestamptz, labels jsonb,
+    count bigint, sum double precision, min double precision, max double precision,
+    last double precision, last_event_at timestamptz, buckets bigint[], revision bigint
+  ) ORDER BY tenant_id, metric, kind, label_hash, window_start `
+
+const mergeRollup = `
 ON CONFLICT (tenant_id, metric, kind, label_hash, window_start) DO UPDATE SET
 	count         = rollups.count + EXCLUDED.count,
 	sum           = rollups.sum + EXCLUDED.sum,
@@ -121,16 +130,20 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 	// flush, including non-overlapping entries; redelivery rebuilds those safely.
 	claims := append([]Contribution(nil), contributions...)
 	sort.Slice(claims, func(i, j int) bool { return claims[i].Key() < claims[j].Key() })
-	claimBatch := &pgx.Batch{}
-	for i, c := range claims {
-		claimBatch.Queue(`INSERT INTO processed_batches (tenant_id, batch_id, window_start)
-   VALUES ($1, $2, $3) ON CONFLICT (tenant_id, batch_id, window_start) DO NOTHING`,
-			c.TenantID, c.BatchID, c.WindowStart)
-		if claimBatch.Len() == flushBatchRows || i == len(claims)-1 {
-			if err := executeFlushBatch(ctx, tx, claimBatch, len(rollups) > 0); err != nil {
-				return fmt.Errorf("claim contributions: %w", err)
-			}
-			claimBatch = &pgx.Batch{}
+	for start := 0; start < len(claims); start += flushBatchRows {
+		chunk := claims[start:min(start+flushBatchRows, len(claims))]
+		args := make([]any, 0, len(chunk)*3)
+		for _, c := range chunk {
+			args = append(args, c.TenantID, c.BatchID, c.WindowStart)
+		}
+		statement := `INSERT INTO processed_batches (tenant_id, batch_id, window_start) VALUES ` +
+			valueTuples(len(chunk), 3) + ` ON CONFLICT (tenant_id, batch_id, window_start) DO NOTHING`
+		tag, claimErr := tx.Exec(ctx, statement, args...)
+		if claimErr != nil {
+			return fmt.Errorf("claim contributions: %w", claimErr)
+		}
+		if len(rollups) > 0 && tag.RowsAffected() != int64(len(chunk)) {
+			return fmt.Errorf("claim contributions: %w", ErrContributionConflict)
 		}
 	}
 	// Consistent row ordering prevents concurrent multi-series flush deadlocks.
@@ -152,43 +165,36 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 		return a.Window.Start.Before(b.Window.Start)
 	})
 
-	batch := &pgx.Batch{}
-
-	// Indexed rather than ranged by value: a Rollup is large enough that
-	// copying one per iteration is measurable on a wide flush.
-	for i := range rollups {
-		r := &rollups[i]
-
-		labels, err := json.Marshal(orEmpty(r.Labels))
-		if err != nil {
-			return fmt.Errorf("flush: encode labels for %s: %w", r.Key.Metric, err)
-		}
-
-		buckets, _ := r.Acc.Buckets() // nil for kinds without a histogram
-
-		batch.Queue(upsertRollup,
-			r.Key.TenantID,
-			r.Key.Metric,
-			string(r.Key.Kind),
-			r.Key.LabelHash,
-			r.Window.Start,
-			r.Window.End,
-			labels,
-			r.Acc.Count,
-			r.Acc.Sum,
-			r.Acc.MinValue(),
-			r.Acc.MaxValue(),
-			r.Acc.Last,
-			time.Unix(0, r.Acc.LastTimestampUnixNano).UTC(),
-			buckets,
-			revisions[r.Key.TenantID],
-		)
-		if batch.Len() == flushBatchRows || i == len(rollups)-1 {
-			if err := executeFlushBatch(ctx, tx, batch, false); err != nil {
-				return fmt.Errorf("write rollups: %w", err)
+	for start := 0; start < len(rollups); {
+		end := min(start+flushBatchRows, len(rollups))
+		// PostgreSQL forbids updating one key twice in a single INSERT. Engine
+		// collections contain unique keys, but retain additive behavior for a
+		// caller supplying duplicate rows by separating adjacent equal keys.
+		for i := start + 1; i < end; i++ {
+			if rollups[i].Key == rollups[i-1].Key && rollups[i].Window.Start.Equal(rollups[i-1].Window.Start) {
+				end = i
+				break
 			}
-			batch = &pgx.Batch{}
 		}
+		chunk := make([]flushRow, end-start)
+		for i := start; i < end; i++ {
+			r := &rollups[i]
+			buckets, _ := r.Acc.Buckets() // nil for kinds without a histogram
+			chunk[i-start] = flushRow{
+				TenantID: r.Key.TenantID, Metric: r.Key.Metric, Kind: string(r.Key.Kind), LabelHash: r.Key.LabelHash,
+				WindowStart: r.Window.Start, WindowEnd: r.Window.End, Labels: orEmpty(r.Labels),
+				Count: r.Acc.Count, Sum: r.Acc.Sum, Min: r.Acc.MinValue(), Max: r.Acc.MaxValue(), Last: r.Acc.Last,
+				LastEventAt: time.Unix(0, r.Acc.LastTimestampUnixNano).UTC(), Buckets: buckets, Revision: revisions[r.Key.TenantID],
+			}
+		}
+		encoded, encodeErr := json.Marshal(chunk)
+		if encodeErr != nil {
+			return fmt.Errorf("flush: encode rollups: %w", encodeErr)
+		}
+		if _, writeErr := tx.Exec(ctx, insertRollups+mergeRollup, encoded); writeErr != nil {
+			return fmt.Errorf("write rollups: %w", writeErr)
+		}
+		start = end
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -201,20 +207,49 @@ func (db *DB) Flush(ctx context.Context, rollups []aggregate.Rollup, contributio
 // and rollup. A later chunk failure must roll back all earlier chunks.
 const flushBatchRows = 256
 
-func executeFlushBatch(ctx context.Context, tx pgx.Tx, batch *pgx.Batch, requireInsert bool) error {
-	results := tx.SendBatch(ctx, batch)
-	for range batch.Len() {
-		tag, err := results.Exec()
-		if err != nil {
-			_ = results.Close()
-			return err
+// Typed JSON keeps one stable prepared statement instead of thousands of
+// per-row parameters. PostgreSQL converts count/buckets/revision directly to
+// bigint (never through float64); nil buckets become SQL NULL.
+type flushRow struct {
+	TenantID    string            `json:"tenant_id"`
+	Metric      string            `json:"metric"`
+	Kind        string            `json:"kind"`
+	LabelHash   string            `json:"label_hash"`
+	WindowStart time.Time         `json:"window_start"`
+	WindowEnd   time.Time         `json:"window_end"`
+	Labels      map[string]string `json:"labels"`
+	Count       int64             `json:"count"`
+	Sum         float64           `json:"sum"`
+	Min         float64           `json:"min"`
+	Max         float64           `json:"max"`
+	Last        float64           `json:"last"`
+	LastEventAt time.Time         `json:"last_event_at"`
+	Buckets     []int64           `json:"buckets"`
+	Revision    int64             `json:"revision"`
+}
+
+// Claim data remains parameterized with at most 256 rows and 768 parameters.
+func valueTuples(rows, columns int) string {
+	var out strings.Builder
+	out.Grow(rows * columns * 7)
+	parameter := 1
+	var digits [20]byte
+	for row := range rows {
+		if row > 0 {
+			out.WriteByte(',')
 		}
-		if requireInsert && tag.RowsAffected() != 1 {
-			_ = results.Close()
-			return ErrContributionConflict
+		out.WriteByte('(')
+		for col := range columns {
+			if col > 0 {
+				out.WriteByte(',')
+			}
+			out.WriteByte('$')
+			out.Write(strconv.AppendInt(digits[:0], int64(parameter), 10))
+			parameter++
 		}
+		out.WriteByte(')')
 	}
-	return results.Close()
+	return out.String()
 }
 
 // SeenContributions returns which of the given (batch, window) pairs have

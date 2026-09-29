@@ -56,6 +56,8 @@ def main():
     parser.add_argument("--window-seconds", type=int, default=60)
     parser.add_argument("--flush-seconds", type=int, default=15)
     parser.add_argument("--drain-timeout", type=int, default=180)
+    parser.add_argument("--broker-memory-mib", type=int, default=1024,
+                        help="emulator container memory; Java heap is explicitly 75%% (increase for longer runs)")
     parser.add_argument("--image-prefix", default="fluxgate-validation")
     parser.add_argument("--tag", default="local")
     parser.add_argument("--output", type=Path, required=True)
@@ -63,7 +65,7 @@ def main():
     for name, low, high in (("points_per_second", 100, 1000000), ("duration", 5, 600),
                             ("series", 1, 100000), ("tenants", 1, 32), ("batch_size", 1, 1000),
                             ("clients", 1, 128), ("window_seconds", 1, 60),
-                            ("flush_seconds", 1, 60), ("drain_timeout", 10, 600)):
+                            ("flush_seconds", 1, 60), ("drain_timeout", 10, 600), ("broker_memory_mib", 512, 8192)):
         if not low <= getattr(args, name) <= high:
             parser.error(f"--{name.replace('_', '-')} must be {low}..{high}")
     if args.flush_seconds > args.window_seconds:
@@ -118,7 +120,8 @@ def main():
         pg = start("postgres", "postgres:17-alpine", dict(POSTGRES_USER="fluxgate",
                    POSTGRES_PASSWORD="fluxgate", POSTGRES_DB="fluxgate"), port=None, memory="2g", cpus="2")
         broker = start("pubsub", "gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators",
-                       port=8085, memory="1g", cpus="2", extra=("gcloud", "beta", "emulators", "pubsub", "start",
+                       env={"JAVA_TOOL_OPTIONS": f"-Xms128m -Xmx{args.broker_memory_mib * 3 // 4}m"},
+                       port=8085, memory=f"{args.broker_memory_mib}m", cpus="2", extra=("gcloud", "beta", "emulators", "pubsub", "start",
                        "--host-port=0.0.0.0:8085", "--project=fluxgate-test"))
 
         def sql(statement):
@@ -150,7 +153,8 @@ def main():
         for name, base in bases.items():
             wait_for(name, lambda base=base: request(base + "/readyz")[0] == 200)
         report["resources"] = dict(api_cpu=1, api_memory_mib=512, aggregator_cpu=1, aggregator_memory_mib=1024,
-                                   postgres_cpu=2, postgres_memory_mib=2048, broker_cpu=2, broker_memory_mib=1024,
+                                   postgres_cpu=2, postgres_memory_mib=2048, broker_cpu=2,
+                                   broker_memory_mib=args.broker_memory_mib, broker_heap_mib=args.broker_memory_mib * 3 // 4,
                                    ingest_replicas=2, aggregator_replicas=1, query_replicas=1,
                                    http_max_concurrent=4, subscriber_bytes=16 * 1024**2,
                                    subscriber_messages=1000, tenant_rate_limit_per_replica=1000000)
@@ -299,6 +303,18 @@ def main():
         report["query_probes"] = probes
         report["sampled_peak_rss_mib"] = {name: round(max(s["services"].get(name, {}).get("process_resident_memory_bytes", 0)
             for s in samples) / 1024**2, 2) for name in ("ingest-a", "ingest-b", "aggregator", "query")} if samples else {}
+        report["container_states"] = {}
+        report["failure_logs"] = {}
+        for container in containers:
+            try:
+                info = json.loads(command("docker", "inspect", container))[0]
+                report["container_states"][container.removeprefix(prefix + "-")] = {
+                    key: info["State"].get(key) for key in ("Running", "OOMKilled", "ExitCode", "Error")}
+                if not report["passed"]:
+                    report["failure_logs"][container.removeprefix(prefix + "-")] = command(
+                        "docker", "logs", "--tail", "20", container, check=False)
+            except (ValueError, RuntimeError) as exc:
+                errors.append("diagnostics: " + str(exc))
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         for container in reversed(containers):

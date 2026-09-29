@@ -165,7 +165,8 @@ replay beyond that horizon needs the ledger preserved or rebuilt first.
 Workers checkpoint buffered data every flush interval and earlier when admitted
 deliveries consume half the configured receive byte/message budget. This frees
 broker receive slots without waiting for newer events to close a window. Queries
-can therefore see partial windows. Late accepted data produces additive corrections, including after a window has
+can therefore see partial windows. Late accepted data produces additive
+corrections, including after a window has
 already committed. Admission is atomic for each batch: capacity exhaustion
 returns the whole batch for redelivery. Sustained overload can reach the
 configured dead-letter policy and requires operator attention.
@@ -344,7 +345,9 @@ are not production credentials or deployment settings.
 
 Additional fixed bounds include an 8 MiB query materialization budget, 256 KiB
 live-update pages, a 32 KiB HTTP header setting, and at most 256 SQL statements
-per flush batch within one transaction. Memory budgets estimate admitted data;
+per bulk SQL write within one transaction. Ledger lookups and complete checkpoint
+transactions have a one-minute deadline (`AGGREGATOR_STORAGE_TIMEOUT`, configurable
+from one second to two minutes); timed-out work returns for redelivery. Memory budgets estimate admitted data;
 they are not RSS limits. Measure actual container memory before increasing them.
 
 ### Issuing an API key
