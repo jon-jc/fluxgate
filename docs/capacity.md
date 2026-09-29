@@ -25,6 +25,13 @@ Pub/Sub emulator. These are ceilings, not reserved cores: all containers and the
 load generator share the host. The report records its total CPU/memory and exact
 service image IDs.
 
+The emulator's Java heap is explicitly 75% of its container memory. For higher
+volumes, pass `--broker-memory-mib 4096` (3 GiB heap) and record that change in
+comparisons. An initial 900,000-point attempt with an implicit ~256 MiB Java heap
+failed from emulator heap exhaustion; that run is not evidence of Fluxgate's
+sustainable throughput. Failure reports retain dependency logs and container
+states to distinguish fixture failures from application bottlenecks.
+
 The default 60 second windows, 30 second lateness, 30 second idle timeout,
 15 second flush interval, four concurrent HTTP requests per replica, 16 MiB
 subscriber buffer and 1,000 outstanding-message limit remain in force. Tenant
@@ -38,6 +45,25 @@ time to release broker receive credits. Checkpoint writes still wait for durable
 commit. `fluxgate_aggregate_pending_messages` and
 `fluxgate_aggregate_pending_encoded_bytes` include writes in progress; compare
 these with broker backlog to distinguish a full receiver from a slow publisher.
+
+Storage checkpoints use bounded 256-row bulk writes and claims in **one**
+transaction, including the tenant revision lock. `AGGREGATOR_STORAGE_TIMEOUT`
+defaults to one minute (valid range 1s..2m); a blocked ledger lookup declines
+admission and a timed-out checkpoint rolls back and nacks for reconstruction.
+Changing it cannot make storage faster: repeated timeouts require reducing
+load, investigating locks, or increasing database capacity.
+
+For database-only comparisons against a disposable PostgreSQL instance:
+
+```sh
+TEST_DATABASE_URL='postgres://fluxgate:fluxgate@localhost:5442/fluxgate?sslmode=disable' \
+  go test ./internal/store -run '^$' -bench BenchmarkFlush -benchtime=3x -count=3
+```
+
+The benchmark includes transaction commit, delivery claims and real indexes,
+with both initial inserts and subsequent additive updates. It leaves isolated
+tenant data in the database. Use the complete pipeline test for correctness
+and the sustained capacity tool for end-to-end performance.
 
 The generator offers 500 point batches on a fixed schedule, with 16 clients
 and no unbounded waiting queue. Points use current event times, deterministic

@@ -50,6 +50,8 @@ type Options struct {
 	// Zero disables the corresponding trigger; the periodic checkpoint remains.
 	CheckpointMessages int
 	CheckpointBytes    int64
+	// StorageTimeout bounds each ledger lookup and complete flush transaction.
+	StorageTimeout time.Duration
 	// DrainTimeout bounds the final flush within the host shutdown budget.
 	DrainTimeout time.Duration
 	// Metrics records flush outcomes. Optional; a nil value disables
@@ -60,6 +62,9 @@ type Options struct {
 }
 
 func (o *Options) applyDefaults() {
+	if o.StorageTimeout <= 0 {
+		o.StorageTimeout = time.Minute
+	}
 	if o.DrainTimeout <= 0 {
 		o.DrainTimeout = 5 * time.Second
 	}
@@ -87,6 +92,7 @@ type Runner struct {
 	flushInterval      time.Duration
 	checkpointMessages int
 	checkpointBytes    int64
+	storageTimeout     time.Duration
 	checkpoint         chan struct{}
 	drainTimeout       time.Duration
 	metrics            *observability.Metrics
@@ -153,6 +159,7 @@ func New(opts Options) (*Runner, error) {
 		flushInterval:      opts.FlushInterval,
 		checkpointMessages: opts.CheckpointMessages,
 		checkpointBytes:    opts.CheckpointBytes,
+		storageTimeout:     opts.StorageTimeout,
 		checkpoint:         make(chan struct{}, 1),
 		drainTimeout:       opts.DrainTimeout,
 		metrics:            opts.Metrics,
@@ -191,7 +198,9 @@ func (r *Runner) Handle(ctx context.Context, d pubsubx.Delivery) error {
 		return nil
 	}
 
-	committed, err := r.store.SeenContributions(ctx, batch.TenantID, batch.ID, windows)
+	lookupCtx, cancelLookup := context.WithTimeout(ctx, r.storageTimeout)
+	committed, err := r.store.SeenContributions(lookupCtx, batch.TenantID, batch.ID, windows)
+	cancelLookup()
 	if err != nil {
 		// Without knowing what is already committed, accumulating would risk
 		// double-counting. Hand the message back and try again.
@@ -423,7 +432,9 @@ func (r *Runner) flush(ctx context.Context, all bool) error {
 
 	started := time.Now()
 
-	if err := r.store.Flush(ctx, rollups, contributions); err != nil {
+	writeCtx, cancelWrite := context.WithTimeout(ctx, r.storageTimeout)
+	defer cancelWrite()
+	if err := r.store.Flush(writeCtx, rollups, contributions); err != nil {
 		// The engine has already handed over these rollups, so this data now
 		// exists nowhere else. Handing the messages back is what recovers it:
 		// no ledger entry was written, so redelivery rebuilds exactly these

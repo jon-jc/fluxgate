@@ -151,9 +151,8 @@ type AggregatorConfig struct {
 	// this much event time.
 	WindowSize time.Duration
 	// AllowedLateness is how far the watermark trails the highest observed
-	// event time. It trades freshness for tolerance of out-of-order arrival:
-	// too small and legitimate stragglers are discarded, too large and every
-	// rollup is delayed by that much before anyone can read it.
+	// event time. Durable checkpoints can expose partial windows before closure;
+	// the delivery ledger, not this watermark, decides which retries to skip.
 	AllowedLateness time.Duration
 	// MaxSeries caps distinct series held across all open windows.
 	MaxSeries int
@@ -161,10 +160,10 @@ type AggregatorConfig struct {
 	// advances on processing time, so a stream that stops does not strand its
 	// last window unwritten.
 	IdleTimeout time.Duration
-	// FlushInterval is how often closed windows are drained even with no new
-	// data. Without it a producer that goes quiet leaves its last window
-	// unwritten and its messages unacknowledged.
+	// FlushInterval is how often buffered windows receive a durable checkpoint.
 	FlushInterval time.Duration
+	// StorageTimeout bounds ledger lookups and complete checkpoint transactions.
+	StorageTimeout time.Duration
 	// MaxOutstandingMessages caps unacknowledged messages held in memory.
 	MaxOutstandingMessages int
 	// Concurrency is how many streaming pull connections to open.
@@ -443,6 +442,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			MaxOutstandingBytes:    int(l.bytes("AGGREGATOR_MAX_OUTSTANDING_BYTES", 16<<20)),
 			IdleTimeout:            l.duration("AGGREGATOR_IDLE_TIMEOUT", 30*time.Second),
 			FlushInterval:          l.duration("AGGREGATOR_FLUSH_INTERVAL", 15*time.Second),
+			StorageTimeout:         l.duration("AGGREGATOR_STORAGE_TIMEOUT", time.Minute),
 			MaxOutstandingMessages: l.integer("AGGREGATOR_MAX_OUTSTANDING_MESSAGES", 1000),
 			Concurrency:            l.integer("AGGREGATOR_CONCURRENCY", 2),
 			RollupRetention:        l.duration("ROLLUP_RETENTION", 30*24*time.Hour),
@@ -715,6 +715,9 @@ func (c Config) validateAggregator(l *loader) {
 	}
 	if c.Aggregator.FlushInterval <= 0 {
 		l.reject("AGGREGATOR_FLUSH_INTERVAL", "must be greater than zero")
+	}
+	if c.Aggregator.StorageTimeout < time.Second || c.Aggregator.StorageTimeout > 2*time.Minute {
+		l.reject("AGGREGATOR_STORAGE_TIMEOUT", "must be between 1s and 2m")
 	}
 	// A flush interval longer than the window means a closed window waits for
 	// the timer rather than being written promptly, so every rollup is stale by

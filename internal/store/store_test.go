@@ -38,7 +38,7 @@ func discardLogger() *slog.Logger {
 //
 // Isolating by tenant rather than by database keeps the suite fast: every test
 // shares one migrated schema and still cannot see another test's rows.
-func openDB(t *testing.T) (db *store.DB, tenant string) {
+func openDB(t testing.TB) (db *store.DB, tenant string) {
 	t.Helper()
 
 	dsn := os.Getenv(dsnEnvVar)
