@@ -315,8 +315,14 @@ def main():
             verify_load(args.load_batches, ingest_urls, base_url(reader),
                         {name: base_url(name) for name in (first, second, aggregator, reader)}, request, inspect)
 
-        # A future window cannot flush before the process is killed. Confirm the
-        # message entered the engine, then kill it without a graceful final flush.
+        # Block rollup writes in the disposable database so a periodic/pressure
+        # checkpoint cannot win the race against the deliberate process kill.
+        command("docker", "exec", "-d", "-e", "PGPASSWORD=fluxgate", "-e", "PGAPPNAME=fluxgate-crash-gate",
+                postgres, "psql", "-h", "127.0.0.1", "-U", "fluxgate", "-d", "fluxgate", "-v", "ON_ERROR_STOP=1",
+                "-c", "BEGIN; LOCK TABLE rollups IN EXCLUSIVE MODE; SELECT pg_sleep(120); ROLLBACK;")
+        wait_for("crash fixture holds rollup write lock", lambda: sql("SELECT count(*) FROM pg_locks l "
+                 "JOIN pg_stat_activity a ON a.pid=l.pid WHERE a.application_name='fluxgate-crash-gate' "
+                 "AND l.relation='rollups'::regclass AND l.mode='ExclusiveLock' AND l.granted") == "1")
         metric_url = base_url(aggregator) + "/metrics"
         def consumed():
             metrics = request(metric_url, raw=True)[1]
@@ -329,6 +335,7 @@ def main():
         wait_for("aggregator accepted uncommitted message", lambda: consumed() > before)
         require(sql("SELECT count(*) FROM rollups WHERE metric='verify.crash'") == "0", "crash fixture flushed early")
         command("docker", "kill", "--signal=KILL", aggregator)
+        sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='fluxgate-crash-gate'")
         command("docker", "start", aggregator)
         ready(aggregator)
         marker = {"points": [dict(metric="verify.marker", kind="gauge", value=0,

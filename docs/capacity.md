@@ -32,6 +32,13 @@ rate limits are explicitly raised to 1,000,000 points/second so that a quota
 does not masquerade as processing capacity. A production quota must instead
 come from measured safe capacity and tenant policy.
 
+The worker checkpoints partial windows at each flush interval and under receive
+pressure (half the byte/message limit), so window size no longer sets a minimum
+time to release broker receive credits. Checkpoint writes still wait for durable
+commit. `fluxgate_aggregate_pending_messages` and
+`fluxgate_aggregate_pending_encoded_bytes` include writes in progress; compare
+these with broker backlog to distinguish a full receiver from a slow publisher.
+
 The generator offers 500 point batches on a fixed schedule, with 16 clients
 and no unbounded waiting queue. Points use current event times, deterministic
 values, 128 byte detail labels and independently cycling host series per tenant.

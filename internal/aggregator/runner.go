@@ -41,10 +41,15 @@ type Options struct {
 	Engine *aggregate.Engine
 	// Store persists the results.
 	Store Store
-	// FlushInterval is how often closed windows are drained even when no new
-	// data has arrived. Without it, a producer that goes quiet would leave its
-	// last window unwritten and its messages unacknowledged indefinitely.
+	// FlushInterval is the maximum timer interval between durable checkpoints,
+	// including partial windows. It is not a commit latency guarantee: storage
+	// execution and a queued checkpoint add to the time a delivery is held.
 	FlushInterval time.Duration
+	// CheckpointMessages and CheckpointBytes trigger an early durable checkpoint
+	// before receive flow control prevents newer events from reaching the engine.
+	// Zero disables the corresponding trigger; the periodic checkpoint remains.
+	CheckpointMessages int
+	CheckpointBytes    int64
 	// DrainTimeout bounds the final flush within the host shutdown budget.
 	DrainTimeout time.Duration
 	// Metrics records flush outcomes. Optional; a nil value disables
@@ -74,17 +79,22 @@ func (o *Options) applyDefaults() {
 // point, with the broker believing it delivered successfully.
 type Runner struct {
 	// Admission and collection must move the engine and its ledger together.
-	admission     sync.Mutex
-	flushMu       sync.Mutex
-	closing       bool // protected by admission
-	engine        *aggregate.Engine
-	store         Store
-	flushInterval time.Duration
-	drainTimeout  time.Duration
-	metrics       *observability.Metrics
-	log           *slog.Logger
+	admission          sync.Mutex
+	flushMu            sync.Mutex
+	closing            bool // protected by admission
+	engine             *aggregate.Engine
+	store              Store
+	flushInterval      time.Duration
+	checkpointMessages int
+	checkpointBytes    int64
+	checkpoint         chan struct{}
+	drainTimeout       time.Duration
+	metrics            *observability.Metrics
+	log                *slog.Logger
 
-	mu sync.Mutex
+	mu              sync.Mutex
+	pendingMessages int
+	pendingBytes    int64
 	// inflight tracks messages waiting on windows, keyed by window start.
 	inflight map[int64][]*pendingMessage
 	// contributions records which batches fed which window, so the flush can
@@ -123,6 +133,8 @@ type Stats struct {
 	RollupsWritten   int64
 	MessagesAcked    int64
 	MessagesNacked   int64
+	PendingMessages  int
+	PendingBytes     int64
 }
 
 // New returns a Runner.
@@ -136,16 +148,19 @@ func New(opts Options) (*Runner, error) {
 	opts.applyDefaults()
 
 	return &Runner{
-		engine:        opts.Engine,
-		store:         opts.Store,
-		flushInterval: opts.FlushInterval,
-		drainTimeout:  opts.DrainTimeout,
-		metrics:       opts.Metrics,
-		log:           opts.Logger,
-		inflight:      make(map[int64][]*pendingMessage),
-		contributions: make(map[int64]map[string]store.Contribution),
-		claimed:       make(map[string]struct{}),
-		flushing:      make(map[string]struct{}),
+		engine:             opts.Engine,
+		store:              opts.Store,
+		flushInterval:      opts.FlushInterval,
+		checkpointMessages: opts.CheckpointMessages,
+		checkpointBytes:    opts.CheckpointBytes,
+		checkpoint:         make(chan struct{}, 1),
+		drainTimeout:       opts.DrainTimeout,
+		metrics:            opts.Metrics,
+		log:                opts.Logger,
+		inflight:           make(map[int64][]*pendingMessage),
+		contributions:      make(map[int64]map[string]store.Contribution),
+		claimed:            make(map[string]struct{}),
+		flushing:           make(map[string]struct{}),
 	}, nil
 }
 
@@ -202,6 +217,9 @@ func (r *Runner) Handle(ctx context.Context, d pubsubx.Delivery) error {
 	filtered := filterBatch(batch, skip, r.engine.WindowSize())
 	result, err := r.engine.IngestDurable(filtered)
 	if err != nil {
+		if errors.Is(err, aggregate.ErrCapacity) {
+			r.requestCheckpoint()
+		}
 		return err
 	}
 	if len(filtered.Points) == 0 {
@@ -305,6 +323,10 @@ func (r *Runner) track(d pubsubx.Delivery, batch telemetry.Batch, windows []aggr
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Settlement only needs the broker handle. Do not retain a second decoded
+	// copy of all points/labels after the engine has folded them into rollups.
+	d.Envelope = pubsubx.Envelope{}
+	d.Attributes = nil
 	pending := &pendingMessage{
 		delivery: d,
 		awaiting: make(map[int64]struct{}, len(windows)),
@@ -329,6 +351,22 @@ func (r *Runner) track(d pubsubx.Delivery, batch telemetry.Batch, windows []aggr
 	}
 
 	r.stats.BatchesAccepted++
+	r.pendingMessages++
+	r.pendingBytes += int64(d.EncodedBytes)
+	r.metrics.SetPendingDeliveries(r.pendingMessages, r.pendingBytes)
+	if (r.checkpointMessages > 0 && r.pendingMessages >= r.checkpointMessages) ||
+		(r.checkpointBytes > 0 && r.pendingBytes >= r.checkpointBytes) {
+		r.requestCheckpoint()
+	}
+}
+
+// Coalesce pressure signals without blocking admission on storage. Only Run
+// performs the checkpoint, and flushMu serializes it with shutdown/manual flushes.
+func (r *Runner) requestCheckpoint() {
+	select {
+	case r.checkpoint <- struct{}{}:
+	default:
+	}
 }
 
 func (r *Runner) recordDuplicate() {
@@ -348,9 +386,9 @@ func (r *Runner) Flush(ctx context.Context) error {
 	return r.flush(ctx, false)
 }
 
-// FlushAll drains every window regardless of the watermark. It runs at
-// shutdown, where the alternative is discarding partial windows and forcing
-// their messages to be redelivered to another instance.
+// FlushAll checkpoints every window regardless of the watermark. Additive
+// upserts and atomic delivery claims let later batches extend the same window.
+// It releases receive credits even when no newer event can reach the engine.
 func (r *Runner) FlushAll(ctx context.Context) error {
 	return r.flush(ctx, true)
 }
@@ -486,9 +524,12 @@ func (r *Runner) ackAll(messages []*pendingMessage) {
 			continue
 		}
 		m.settled = true
+		r.pendingMessages--
+		r.pendingBytes -= int64(m.delivery.EncodedBytes)
 		m.delivery.Ack()
 		r.stats.MessagesAcked++
 	}
+	r.metrics.SetPendingDeliveries(r.pendingMessages, r.pendingBytes)
 }
 
 func (r *Runner) nackAll(messages []*pendingMessage) {
@@ -500,12 +541,17 @@ func (r *Runner) nackAll(messages []*pendingMessage) {
 			continue
 		}
 		m.settled = true
+		r.pendingMessages--
+		r.pendingBytes -= int64(m.delivery.EncodedBytes)
 		m.delivery.Nack()
 		r.stats.MessagesNacked++
 	}
+	r.metrics.SetPendingDeliveries(r.pendingMessages, r.pendingBytes)
 }
 
-// Run flushes on a timer until ctx is cancelled, then drains what is left.
+// Run checkpoints on a timer or receive pressure until ctx is cancelled.
+// Waiting for event-time closure can stall a full subscriber indefinitely:
+// newer events cannot arrive until an existing message is durably acknowledged.
 func (r *Runner) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.flushInterval)
 	defer ticker.Stop()
@@ -516,11 +562,12 @@ func (r *Runner) Run(ctx context.Context) error {
 			return r.drain(ctx)
 
 		case <-ticker.C:
-			if err := r.Flush(ctx); err != nil {
-				// A failed flush is not fatal: the messages have been handed
-				// back, and the next delivery rebuilds the window.
-				r.log.Error("flush failed", slog.Any("error", err))
-			}
+		case <-r.checkpoint:
+		}
+		if err := r.FlushAll(ctx); err != nil {
+			// A failed flush is not fatal: the messages have been handed
+			// back, and the next delivery rebuilds the window.
+			r.log.Error("flush failed", slog.Any("error", err))
 		}
 	}
 }
@@ -554,7 +601,10 @@ func (r *Runner) drain(ctx context.Context) error {
 func (r *Runner) Stats() Stats {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.stats
+	s := r.stats
+	s.PendingMessages = r.pendingMessages
+	s.PendingBytes = r.pendingBytes
+	return s
 }
 
 // InflightMessages reports how many messages are waiting on a window, for
