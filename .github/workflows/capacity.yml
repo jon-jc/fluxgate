@@ -1,0 +1,62 @@
+name: Capacity
+
+on:
+  workflow_dispatch:
+    inputs:
+      points_per_second:
+        description: Offered points per second
+        default: '3000'
+        required: true
+      duration:
+        description: Sustained load duration in seconds
+        default: '120'
+        required: true
+      series:
+        description: Active series per tenant
+        default: '10000'
+        required: true
+      tenants:
+        description: Number of tenants
+        default: '4'
+        required: true
+      flush_seconds:
+        description: Flush interval in seconds (60 second windows)
+        default: '15'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capacity-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  measure:
+    name: Sustained capacity measurement
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build and verify packaged services
+        run: python3 scripts/verify_pipeline.py
+      - name: Measure sustained load and drain
+        env:
+          POINTS_PER_SECOND: ${{ inputs.points_per_second }}
+          DURATION: ${{ inputs.duration }}
+          SERIES: ${{ inputs.series }}
+          TENANTS: ${{ inputs.tenants }}
+          FLUSH_SECONDS: ${{ inputs.flush_seconds }}
+        run: >-
+          python3 scripts/measure_capacity.py
+          --points-per-second "$POINTS_PER_SECOND" --duration "$DURATION"
+          --series "$SERIES" --tenants "$TENANTS" --flush-seconds "$FLUSH_SECONDS"
+          --drain-timeout 600 --output "${{ runner.temp }}/capacity.json"
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        if: always()
+        with:
+          name: capacity-evidence
+          path: ${{ runner.temp }}/capacity.json
+          if-no-files-found: warn
+          retention-days: 30

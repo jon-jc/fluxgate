@@ -42,3 +42,5 @@ Thumbs.db
 # Local tooling caches
 /.cache/
 /tmp/
+# Python verification helper caches
+__pycache__/
