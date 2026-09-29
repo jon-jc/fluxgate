@@ -291,6 +291,16 @@ durable visibility delay, backlog, memory and exact per-series/window totals.
 The on-demand [Capacity workflow](.github/workflows/capacity.yml) saves the JSON
 evidence; CI runs a smaller sustained correctness profile on every PR.
 
+The September 29 sustained tests exposed and fixed a receive-buffer stall. At
+3,000 points/s across 40,000 series, p95 durable visibility fell from 149.9s to
+13.9s. Bulk SQL then brought a 100,000-series run to 9,806 accepted points/s with
+6.47s p95 visibility. A two-worker run reconciled 1.721 million points, but its
+growing backlog showed that its 20,000 points/s offer exceeded sustainable
+capacity on the tested resources. See [measured profiles, missed submissions and
+resource limits](docs/capacity-results.md) before sizing a deployment.
+The 3,000 points/s, 100,000-series bulk baseline accepted every offered point
+without HTTP rejections; this is a 90-second local baseline, not a production SLO.
+
 ### CI and release scanning
 
 [CI](.github/workflows/ci.yml) runs race-enabled Go tests, PostgreSQL/Pub/Sub

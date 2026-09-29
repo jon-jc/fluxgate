@@ -19,6 +19,10 @@ on:
         description: Number of tenants
         default: '4'
         required: true
+      aggregators:
+        description: Aggregator replica count
+        default: '1'
+        required: true
       flush_seconds:
         description: Flush interval in seconds (60 second windows)
         default: '15'
@@ -51,12 +55,14 @@ jobs:
           DURATION: ${{ inputs.duration }}
           SERIES: ${{ inputs.series }}
           TENANTS: ${{ inputs.tenants }}
+          AGGREGATORS: ${{ inputs.aggregators }}
           FLUSH_SECONDS: ${{ inputs.flush_seconds }}
           BROKER_MEMORY_MIB: ${{ inputs.broker_memory_mib }}
         run: >-
           python3 scripts/measure_capacity.py
           --points-per-second "$POINTS_PER_SECOND" --duration "$DURATION"
           --series "$SERIES" --tenants "$TENANTS" --flush-seconds "$FLUSH_SECONDS"
+          --aggregators "$AGGREGATORS"
           --broker-memory-mib "$BROKER_MEMORY_MIB"
           --drain-timeout 600 --output "${{ runner.temp }}/capacity.json"
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5

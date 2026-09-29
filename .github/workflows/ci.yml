@@ -591,6 +591,7 @@ jobs:
         run: >-
           python3 scripts/measure_capacity.py --image-prefix fluxgate --tag ci
           --points-per-second 2000 --duration 45 --series 2500
+          --aggregators 2
           --output "${{ runner.temp }}/capacity.json"
 
       - name: Upload capacity evidence
