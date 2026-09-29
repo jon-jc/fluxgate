@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--duration", type=int, default=120, help="offered load duration, seconds")
     parser.add_argument("--series", type=int, default=10000, help="series per tenant")
     parser.add_argument("--tenants", type=int, default=4)
+    parser.add_argument("--aggregators", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--clients", type=int, default=16)
     parser.add_argument("--window-seconds", type=int, default=60)
@@ -63,7 +64,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     for name, low, high in (("points_per_second", 100, 1000000), ("duration", 5, 600),
-                            ("series", 1, 100000), ("tenants", 1, 32), ("batch_size", 1, 1000),
+                            ("series", 1, 100000), ("tenants", 1, 32), ("aggregators", 1, 4), ("batch_size", 1, 1000),
                             ("clients", 1, 128), ("window_seconds", 1, 60),
                             ("flush_seconds", 1, 60), ("drain_timeout", 10, 600), ("broker_memory_mib", 512, 8192)):
         if not low <= getattr(args, name) <= high:
@@ -77,9 +78,11 @@ def main():
     images = {name: f"{args.image_prefix}/{name}:{args.tag}"
               for name in ("ingest-api", "aggregator", "query-api", "migrate")}
     containers = []
+    services = {}
     stopped = threading.Event()
     lock = threading.Lock()
     accepted, first_visible, statuses, errors, probes, samples = {}, {}, Counter(), [], [], []
+    retry_reasons = Counter()
     secret = "disposable-capacity-secret"
     tokens = [f"fxg_t{i}_{secret}" for i in range(args.tenants)]
     keys = json.dumps([dict(key_id=f"t{i}", tenant_id=f"tenant-{i}",
@@ -147,6 +150,9 @@ def main():
                             AGGREGATOR_WINDOW_SIZE=f"{args.window_seconds}s",
                             AGGREGATOR_FLUSH_INTERVAL=f"{args.flush_seconds}s")
         services = {"aggregator": start("aggregator", images["aggregator"], aggregator_env, memory="1g")}
+        for index in range(1, args.aggregators):
+            name = f"aggregator-{index + 1}"
+            services[name] = start(name, images["aggregator"], aggregator_env, memory="1g")
         for name, role in (("ingest-a", "ingest"), ("ingest-b", "ingest"), ("query", "query")):
             services[name] = start(name, images["query-api" if role == "query" else "ingest-api"], env(role))
         bases = {name: url(container) for name, container in services.items()}
@@ -155,7 +161,7 @@ def main():
         report["resources"] = dict(api_cpu=1, api_memory_mib=512, aggregator_cpu=1, aggregator_memory_mib=1024,
                                    postgres_cpu=2, postgres_memory_mib=2048, broker_cpu=2,
                                    broker_memory_mib=args.broker_memory_mib, broker_heap_mib=args.broker_memory_mib * 3 // 4,
-                                   ingest_replicas=2, aggregator_replicas=1, query_replicas=1,
+                                   ingest_replicas=2, aggregator_replicas=args.aggregators, query_replicas=1,
                                    http_max_concurrent=4, subscriber_bytes=16 * 1024**2,
                                    subscriber_messages=1000, tenant_rate_limit_per_replica=1000000)
         began = time.monotonic()
@@ -176,6 +182,7 @@ def main():
                             for line in metrics.splitlines() if line.startswith(wanted)}
                     visible = sql("SELECT batch_id FROM processed_batches GROUP BY batch_id").splitlines()
                     now = time.monotonic()
+                    sample["elapsed_seconds"] = round(now - began, 3)
                     with lock:
                         for batch in visible:
                             first_visible.setdefault(batch, now)
@@ -200,10 +207,11 @@ def main():
             try:
                 tenant = index % args.tenants
                 timestamp = dt.datetime.now(dt.timezone.utc)
+                timestamp_text = timestamp.isoformat()
                 window = int(timestamp.timestamp()) // args.window_seconds * args.window_seconds
                 hosts = [(index // args.tenants * args.batch_size + j) % args.series for j in range(args.batch_size)]
                 points = [dict(metric="capacity.gauge", kind="gauge", value=host % 17 + 1,
-                               timestamp=timestamp.isoformat(),
+                               timestamp=timestamp_text,
                                labels=dict(host=str(host), shard=str(host // 100), detail="x" * 128)) for host in hosts]
                 body = json.dumps(dict(points=points), separators=(",", ":")).encode()
                 initial = time.monotonic()
@@ -223,6 +231,9 @@ def main():
                         break
                     require(code in (429, 503) and time.monotonic() - initial < 30,
                             f"unresolved HTTP outcome {code}: {payload}")
+                    problem = json.loads(payload)
+                    with lock:
+                        retry_reasons[str(code) + ": " + problem.get("detail", "unknown")[:200]] += 1
                     time.sleep(min(5, max(.1, float(headers.get("Retry-After", "1")))))
             except Exception as exc:
                 # Unknown HTTP outcomes cannot be silently excluded from exact totals.
@@ -232,6 +243,8 @@ def main():
 
         batches = args.points_per_second * args.duration // args.batch_size
         missed = 0
+        missed_lag = 0
+        missed_busy = 0
         with ThreadPoolExecutor(max_workers=args.clients) as pool:
             for index in range(batches):
                 due = began + index * args.batch_size / args.points_per_second
@@ -239,17 +252,25 @@ def main():
                 if delay > 0:
                     time.sleep(delay)
                 # No unbounded queue and no catch-up burst that hides generator lag.
-                if time.monotonic() - due > max(.1, args.batch_size / args.points_per_second) or not slots.acquire(blocking=False):
+                if time.monotonic() - due > max(.1, args.batch_size / args.points_per_second):
                     missed += 1
+                    missed_lag += 1
+                    continue
+                if not slots.acquire(blocking=False):
+                    missed += 1
+                    missed_busy += 1
                     continue
                 pool.submit(send, index)
         submit_seconds = time.monotonic() - began
         report["offered_points"] = batches * args.batch_size
         report["generator_missed_points"] = missed * args.batch_size
+        report["missed_points_by_reason"] = dict(generator_lag=missed_lag * args.batch_size,
+                                                 busy_clients=missed_busy * args.batch_size)
         report["accepted_points"] = len(accepted) * args.batch_size
         report["submit_seconds"] = round(submit_seconds, 3)
         report["accepted_points_per_second"] = round(len(accepted) * args.batch_size / max(args.duration, submit_seconds), 1)
         report["http_statuses"] = dict(statuses)
+        report["retry_reasons"] = dict(retry_reasons)
         report["accepted_attempt_p95_ms"] = percentile(attempts, .95)
         report["batch_accept_p95_ms"] = percentile([(row[3] - row[4]) * 1000 for row in accepted.values()], .95)
         print("Load submitted: " + json.dumps({k: report[k] for k in ("accepted_points", "generator_missed_points", "accepted_points_per_second")}), flush=True)
@@ -302,16 +323,16 @@ def main():
         report["samples"] = samples
         report["query_probes"] = probes
         report["sampled_peak_rss_mib"] = {name: round(max(s["services"].get(name, {}).get("process_resident_memory_bytes", 0)
-            for s in samples) / 1024**2, 2) for name in ("ingest-a", "ingest-b", "aggregator", "query")} if samples else {}
+            for s in samples) / 1024**2, 2) for name in services} if samples else {}
         report["container_states"] = {}
-        report["failure_logs"] = {}
+        report["diagnostic_logs"] = {}
         for container in containers:
             try:
                 info = json.loads(command("docker", "inspect", container))[0]
                 report["container_states"][container.removeprefix(prefix + "-")] = {
                     key: info["State"].get(key) for key in ("Running", "OOMKilled", "ExitCode", "Error")}
-                if not report["passed"]:
-                    report["failure_logs"][container.removeprefix(prefix + "-")] = command(
+                if not report["passed"] or statuses[503] > 0:
+                    report["diagnostic_logs"][container.removeprefix(prefix + "-")] = command(
                         "docker", "logs", "--tail", "20", container, check=False)
             except (ValueError, RuntimeError) as exc:
                 errors.append("diagnostics: " + str(exc))

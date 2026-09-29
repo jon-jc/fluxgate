@@ -1,5 +1,8 @@
 # Measuring capacity
 
+See [recorded measurements](capacity-results.md) for the observed improvement,
+tested profiles, resource limits and saturation evidence.
+
 Capacity is a measured workload envelope: point rate, active series, tenant
 distribution, payload size, visibility delay and resources. An HTTP 202 proves
 broker acceptance; it does not prove the database can keep up. Run the same
@@ -18,6 +21,8 @@ python scripts/measure_capacity.py --points-per-second 3000 --duration 120 \
 
 The **Capacity** GitHub Actions workflow runs the same procedure on demand and
 uploads the report. Every PR also runs a smaller sustained correctness profile.
+Use `--aggregators 2` to test shared-subscription scaling and concurrent database
+writers (1..4 replicas supported). CI uses two workers for its sustained profile.
 Runtime services use their restricted database roles, one CPU per instance,
 512 MiB per API and 1 GiB for the aggregator. Two ingest replicas share one
 aggregator, one query service, a 2 CPU/2 GiB PostgreSQL container and a 2 CPU/1 GiB
@@ -74,6 +79,8 @@ from expected totals. Missed scheduled work is reported separately. Client
 saturation therefore cannot silently lower the offered rate or create a catch-up
 burst. The accepted rate includes any time spent finishing requests after the
 offered-load period.
+Reports distinguish scheduling lag from exhausted client slots, and preserve
+retry reasons and recent dependency/service logs after 503 responses.
 
 Every two seconds, the observer checks service health and memory, reads committed
 batch identities and issues a bounded query while writes continue. It records
