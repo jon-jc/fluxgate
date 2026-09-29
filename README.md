@@ -281,6 +281,13 @@ replica; the default is four. These are local observations, not GCP capacity or
 latency guarantees. The final crypto dependency refresh was subsequently checked
 with the complete 100,000-point load and recovery run.
 
+For sustained traffic with current timestamps, multiple tenants, higher series
+counts and concurrent queries, use the [capacity measurement guide](docs/capacity.md).
+Its open-loop generator records offered versus accepted rate, missed work,
+durable visibility delay, backlog, memory and exact per-series/window totals.
+The on-demand [Capacity workflow](.github/workflows/capacity.yml) saves the JSON
+evidence; CI runs a smaller sustained correctness profile on every PR.
+
 ### CI and release scanning
 
 [CI](.github/workflows/ci.yml) runs race-enabled Go tests, PostgreSQL/Pub/Sub

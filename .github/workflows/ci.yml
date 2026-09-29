@@ -587,6 +587,21 @@ jobs:
       - name: Verify load, replica retries, crash recovery and restricted roles
         run: python3 scripts/verify_pipeline.py --skip-build --image-prefix fluxgate --tag ci --load-batches 200
 
+      - name: Reconcile sustained traffic across tenants and event windows
+        run: >-
+          python3 scripts/measure_capacity.py --image-prefix fluxgate --tag ci
+          --points-per-second 2000 --duration 45 --series 2500
+          --output "${{ runner.temp }}/capacity.json"
+
+      - name: Upload capacity evidence
+        if: always()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: capacity-evidence
+          path: ${{ runner.temp }}/capacity.json
+          if-no-files-found: warn
+          retention-days: 30
+
       - name: Container logs on failure
         if: failure()
         run: |
