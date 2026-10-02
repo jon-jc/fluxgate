@@ -79,3 +79,20 @@ run "configured_production" {
     error_message = "Runtime migration, collector, and replay-retention safeguards must hold."
   }
 }
+
+run "reject_wildcard_dashboard_origin" {
+  command = plan
+  variables { query_allowed_origins = ["https://*.example.com"] }
+  expect_failures = [var.query_allowed_origins]
+}
+
+run "reject_plaintext_dashboard_origin" {
+  command = plan
+  variables { query_allowed_origins = ["http://dashboard.example.com"] }
+  expect_failures = [var.query_allowed_origins]
+}
+
+run "accept_explicit_dashboard_origin" {
+  command = plan
+  variables { query_allowed_origins = ["https://fluxgate-docs.vercel.app"] }
+}

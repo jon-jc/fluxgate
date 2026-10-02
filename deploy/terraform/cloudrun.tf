@@ -79,7 +79,7 @@ resource "google_cloud_run_v2_service" "service" {
         for_each = merge(local.shared_env, {
           METRICS_ENABLED = each.key == "aggregator" ? "true" : "false"
           GOMEMLIMIT      = each.key == "aggregator" ? "700MiB" : "350MiB"
-        })
+        }, each.key == "query" ? { QUERY_ALLOWED_ORIGINS = join(",", var.query_allowed_origins) } : {})
         content {
           name  = env.key
           value = env.value

@@ -10,7 +10,7 @@
     "build": "node build.mjs && node test/build.test.mjs",
     "dev": "npm run build && node serve.mjs",
     "serve": "node serve.mjs",
-    "test": "node --test test/unit.test.mjs && npm run build",
+    "test": "node --test test/unit.test.mjs test/dashboard.test.mjs && npm run build",
     "test:browser": "playwright test"
   },
   "dependencies": {

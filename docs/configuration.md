@@ -177,6 +177,7 @@ not a replacement for application admission or the container hard limit.
 | Variable | Default | Meaning / constraint |
 | --- | --- | --- |
 | `QUERY_MAX_RANGE` | `744h` | Positive maximum resolved range |
+| `QUERY_ALLOWED_ORIGINS` | empty | Comma-separated allowlist of at most 16 exact browser origins; HTTPS on staging/prod; no wildcards, paths, or credentials. Same-origin dashboards need no CORS setting. See [dashboard connections](dashboard.md#connect-your-data). |
 | `QUERY_DEFAULT_RANGE` | `1h` | Positive default range, no greater than maximum |
 | `QUERY_MAX_SERIES` | `500` | Positive maximum returned kind/label series |
 | `QUERY_MAX_POINTS` | `50000` | 1–50,000 returned points across all series |

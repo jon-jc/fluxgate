@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -99,6 +100,9 @@ type TelemetryConfig struct {
 // across a thousand series is half a billion rows, and the client that asked
 // for it is usually a dashboard that will ask again in thirty seconds.
 type QueryConfig struct {
+	// AllowedOrigins permits explicit browser origins on read-only API routes.
+	// An empty list keeps the query API same-origin only.
+	AllowedOrigins []string
 	// StreamMaxConcurrent bounds pollers held by one process.
 	StreamMaxConcurrent int
 	StreamMaxPerTenant  int
@@ -454,6 +458,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			PruneInterval:          l.duration("PRUNE_INTERVAL", 5*time.Minute),
 		},
 		Query: QueryConfig{
+			AllowedOrigins:      parseOrigins(l.str("QUERY_ALLOWED_ORIGINS", "")),
 			StreamMaxConcurrent: l.integer("QUERY_STREAM_MAX_CONCURRENT", 100),
 			StreamMaxPerTenant:  l.integer("QUERY_STREAM_MAX_PER_TENANT", 8),
 			MaxRange:            l.duration("QUERY_MAX_RANGE", 31*24*time.Hour),
@@ -635,6 +640,19 @@ func (c Config) validateTelemetry(l *loader) {
 }
 
 func (c Config) validateQuery(l *loader) {
+	if len(c.Query.AllowedOrigins) > 16 {
+		l.reject("QUERY_ALLOWED_ORIGINS", "must contain at most 16 origins")
+	}
+	for _, origin := range c.Query.AllowedOrigins {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" || (u.Scheme != "https" && u.Scheme != "http") || strings.Contains(origin, "*") {
+			l.reject("QUERY_ALLOWED_ORIGINS", "must contain exact HTTP(S) origins without paths, credentials, or wildcards")
+			continue
+		}
+		if c.Environment.IsProduction() && u.Scheme != "https" {
+			l.reject("QUERY_ALLOWED_ORIGINS", "must use HTTPS on staging and prod")
+		}
+	}
 	if c.Query.StreamMaxPerTenant <= 0 {
 		l.reject("QUERY_STREAM_MAX_PER_TENANT", "must be greater than zero")
 	}
@@ -668,6 +686,16 @@ func (c Config) validateQuery(l *loader) {
 		l.reject("QUERY_STREAM_HEARTBEAT",
 			"must be shorter than QUERY_STREAM_MAX_DURATION, or it would never fire")
 	}
+}
+
+func parseOrigins(raw string) []string {
+	var origins []string
+	for _, value := range strings.Split(raw, ",") {
+		if origin := strings.TrimSuffix(strings.TrimSpace(value), "/"); origin != "" {
+			origins = append(origins, origin)
+		}
+	}
+	return origins
 }
 
 func (c Config) validateDatabase(l *loader) {

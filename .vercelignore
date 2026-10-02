@@ -8,6 +8,10 @@
 !docs/**
 !api
 !api/openapi.yaml
+!internal
+!internal/dashboard
+!internal/dashboard/web
+!internal/dashboard/web/*
 !deploy
 !deploy/terraform
 !deploy/terraform/README.md

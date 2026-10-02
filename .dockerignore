@@ -5,4 +5,5 @@
 !cmd/**/*.go
 !internal/**/*.go
 !internal/store/migrations/*.sql
+!internal/dashboard/web/*
 !build/docker/Dockerfile
