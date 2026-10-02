@@ -7,11 +7,13 @@ import tempfile
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+DASHBOARD_ASSETS = tuple("internal/dashboard/web/" + name for name in
+                         ("index.html", "app.js", "core.js", "demo.js", "dashboard.css", "favicon.svg"))
 
 
 def main():
     name = ".env.context-check-" + uuid.uuid4().hex
-    sentinels = [ROOT / name, ROOT / "internal" / name]
+    sentinels = [ROOT / name, ROOT / "internal" / name, ROOT / "internal/dashboard/web" / name]
     try:
         for path in sentinels:
             path.write_text("test sentinel, not a credential\n", encoding="utf-8")
@@ -22,7 +24,7 @@ def main():
                            cwd=ROOT, check=True, timeout=120)
             context = Path(temp) / "context"
             for required in ("go.mod", "go.sum", "cmd/ingest-api/main.go",
-                             "internal/store/migrations/0007_window_end_retention_index.sql"):
+                             "internal/store/migrations/0007_window_end_retention_index.sql", *DASHBOARD_ASSETS):
                 if not (context / required).is_file():
                     raise RuntimeError(f"build input missing: {required}")
             for path in context.rglob("*"):
@@ -32,6 +34,7 @@ def main():
                 allowed = rel in ("go.mod", "go.sum", "build/docker/Dockerfile")
                 allowed |= rel.startswith(("cmd/", "internal/")) and rel.endswith(".go")
                 allowed |= rel.startswith("internal/store/migrations/") and rel.endswith(".sql")
+                allowed |= rel in DASHBOARD_ASSETS
                 if not allowed:
                     raise RuntimeError(f"unexpected build input: {rel}")
     finally:

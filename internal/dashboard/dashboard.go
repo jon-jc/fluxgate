@@ -8,7 +8,7 @@ import (
 	"net/http"
 )
 
-//go:embed web/*
+//go:embed web/index.html web/app.js web/core.js web/demo.js web/dashboard.css web/favicon.svg
 var assets embed.FS
 
 // Handler serves only the embedded application. API credentials remain in the

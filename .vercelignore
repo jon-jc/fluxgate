@@ -11,7 +11,12 @@
 !internal
 !internal/dashboard
 !internal/dashboard/web
-!internal/dashboard/web/*
+!internal/dashboard/web/index.html
+!internal/dashboard/web/app.js
+!internal/dashboard/web/core.js
+!internal/dashboard/web/demo.js
+!internal/dashboard/web/dashboard.css
+!internal/dashboard/web/favicon.svg
 !deploy
 !deploy/terraform
 !deploy/terraform/README.md

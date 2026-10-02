@@ -629,11 +629,20 @@ for (const weight of [400, 500, 600, 700]) {
 const styleFile = `styles-${createHash("sha256").update(styles).digest("hex").slice(0, 12)}.css`;
 await writeFile(path.join(out, "assets", styleFile), styles);
 await cp(path.join(site, "public"), out, { recursive: true });
-await cp(
-  path.join(root, "internal/dashboard/web"),
-  path.join(out, "dashboard"),
-  { recursive: true },
-);
+await mkdir(path.join(out, "dashboard"), { recursive: true });
+for (const file of [
+  "index.html",
+  "app.js",
+  "core.js",
+  "demo.js",
+  "dashboard.css",
+  "favicon.svg",
+]) {
+  await cp(
+    path.join(root, "internal/dashboard/web", file),
+    path.join(out, "dashboard", file),
+  );
+}
 await cp(
   path.join(site, "node_modules/@fontsource/inter/LICENSE"),
   path.join(out, "inter-license.txt"),
