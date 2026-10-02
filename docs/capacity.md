@@ -115,6 +115,41 @@ running without OOMs or restarts. Timestamp tie behavior, histogram buckets,
 cross-replica retries and crash/outage recovery remain covered by the separate
 pipeline and Go tests.
 
+## Qualifying a measured profile
+
+Correct reconciliation is necessary but does not establish a usable operating
+rate. Apply an explicit workload and latency budget to a saved report:
+
+```sh
+python scripts/check_capacity.py /tmp/capacity.json \
+  --policy deploy/capacity/ci.json --output /tmp/qualification.json
+```
+
+The [CI policy](../deploy/capacity/ci.json) requires two aggregators, four tenants,
+10,000 active series and at least 45 seconds at an offered 2,000 points/s. It
+requires zero missed points, at least 1,900 accepted points/s, visibility p95 at
+most 45 seconds, query p95 at most one second, and drain at most 90 seconds.
+This is a regression budget for shared CI runners, **not a production SLO**.
+The regular CI pipeline enforces it and saves the per-limit results beside the
+raw evidence. The manual Capacity workflow optionally accepts a policy path.
+
+Create a named JSON policy with a `limits` object for the intended workload.
+Supported minimums are `min_offered_points_per_second`, `min_duration_seconds`,
+`min_active_series`, `min_tenants`, `min_aggregators` and
+`min_accepted_points_per_second`. Supported maximums are `max_missed_points`,
+`max_p95_visibility_seconds`, `max_query_p95_ms`, `max_drain_seconds` and
+`max_retryable_responses` (429 plus 503 responses, including successful retries).
+Set explicit workload minimums so a smaller or shorter run cannot qualify a
+larger release profile by accident.
+
+The checker exits 0 when all configured limits and correctness checks pass,
+1 when evidence fails qualification, and 2 for invalid inputs. Missing/invalid
+measurements, unresolved errors, inconsistent offered/accepted/missed counts,
+unknown policy fields and duplicate JSON keys cannot silently pass. Even an
+input error replaces the requested output artifact with a failed result.
+Qualification describes only that run and that policy; repeated soaks,
+representative workloads and the GCP release gates remain necessary.
+
 ## Interpreting results
 
 `passed` means the correctness and health checks passed. It does **not** mean

@@ -45,6 +45,9 @@ jobs:
             exit 1
           fi
 
+      - name: Verify capacity qualification failures and evidence validation
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Verify formatting
         run: |
           unformatted=$(gofmt -l .)
@@ -594,12 +597,20 @@ jobs:
           --aggregators 2
           --output "${{ runner.temp }}/capacity.json"
 
+      - name: Qualify sustained workload and latency budgets
+        run: >-
+          python3 scripts/check_capacity.py "${{ runner.temp }}/capacity.json"
+          --policy deploy/capacity/ci.json
+          --output "${{ runner.temp }}/capacity-qualification.json"
+
       - name: Upload capacity evidence
         if: always()
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: capacity-evidence
-          path: ${{ runner.temp }}/capacity.json
+          path: |
+            ${{ runner.temp }}/capacity.json
+            ${{ runner.temp }}/capacity-qualification.json
           if-no-files-found: warn
           retention-days: 30
 
