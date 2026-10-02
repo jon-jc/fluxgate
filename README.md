@@ -313,6 +313,19 @@ resource limits](docs/capacity-results.md) before sizing a deployment.
 The 3,000 points/s, 100,000-series bulk baseline accepted every offered point
 without HTTP rejections; this is a 90-second local baseline, not a production SLO.
 
+After concurrent ledger reads and independent tenant checkpoints, a hosted
+two-worker run accepted and reconciled **1.2 million points at an offered
+10,000 points/s for 120 seconds across 100,000 active series**, with no missed
+submissions or HTTP rejections. Achieved throughput was 9,998 points/s, visibility
+p95 was 9.1s and query p95 about 124ms. Hardware and run
+duration differ from the earlier local profiles; this is a measured workload,
+not a production rate guarantee. [Hosted evidence](https://github.com/jon-jc/fluxgate/actions/runs/37056416156).
+
+CI also applies an explicit [workload and latency budget](deploy/capacity/ci.json).
+Use [capacity qualification](docs/capacity.md#qualifying-a-measured-profile) to fail
+a release profile that reconciles its data but misses traffic or exceeds its
+visibility, query or drain limits. The checker works offline on saved evidence.
+
 ### CI and release scanning
 
 [CI](.github/workflows/ci.yml) runs race-enabled Go tests, PostgreSQL/Pub/Sub

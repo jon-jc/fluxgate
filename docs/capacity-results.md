@@ -1,7 +1,8 @@
 # Recorded capacity measurements
 
-Measured September 29, 2026. These are local Docker/Pub/Sub emulator results,
-not a GCP throughput certification or a production SLO. The workload and
+Measured September 29 and October 2, 2026. These are Docker/Pub/Sub emulator
+results from local and hosted CI machines, not a GCP throughput certification
+or a production SLO. The workload and
 measurement procedure are in the [capacity guide](capacity.md).
 
 ## What changed
@@ -13,6 +14,10 @@ measurement procedure are in the [capacity guide](capacity.md).
   checkpoint on a timer or receive pressure; acknowledgment still follows commit.
 - [PR #28](https://github.com/jon-jc/fluxgate/pull/28) replaced per-row execution
   with bounded bulk SQL, reduced allocations, and bounded storage operations.
+- [PR #30](https://github.com/jon-jc/fluxgate/pull/30) moved ledger reads outside
+  the admission lock, with stale-snapshot invalidation across checkpoint commits.
+- [PR #31](https://github.com/jon-jc/fluxgate/pull/31) made tenant checkpoints
+  independent, with bounded concurrency and one shared checkpoint deadline.
 
 ## Observed profiles
 
@@ -75,6 +80,43 @@ heap. The tool failed that run despite reconciling accepted work; unresolved
 publication errors cannot be silently excluded. Subsequent runs explicitly
 budgeted emulator heap and retained failure logs/container state in the JSON
 evidence. That fixture failure is distinct from application capacity.
+
+## Hosted tenant-checkpoint profiles (October 2)
+
+The [hosted 5,000/s run](https://github.com/jon-jc/fluxgate/actions/runs/37055705604)
+accepted and reconciled **600,000 points for 120 seconds across 100,000 active
+series**, with **zero missed submissions and zero HTTP rejections**. Durable
+visibility p95 was 14.026s, drain was 15.504s, and concurrent query p95 was
+59.826ms. Sampled aggregator RSS peaked at 106.33 and 104.61 MiB.
+
+This used two aggregators, four concurrent tenant transactions per aggregator,
+two ingest replicas, four tenants and one query service on an Ubuntu runner with
+four CPUs and approximately 15.6 GiB available to Docker. Application ceilings
+were one CPU each, 1 GiB per aggregator and 512 MiB per API. PostgreSQL had two
+CPUs/2 GiB; the emulator had two CPUs/3 GiB and a 2.25 GiB Java heap. The gauge
+workload, 500-point batches, 60-second windows and 15-second timer matched the
+earlier measurement method. Hosted hardware and run duration differ from the
+local results, so this is an independently measured profile, not a controlled
+before/after throughput multiplier.
+
+The subsequent [10,000/s run](https://github.com/jon-jc/fluxgate/actions/runs/37056416156)
+accepted all **1,200,000 offered points**, again with **zero missed submissions
+and zero HTTP rejections**, reconciling 294,500 series/window rows across 100,000
+active series. Achieved rate was 9,998.1 points/s (submission completion extended
+slightly past 120 seconds). Visibility p95 was 9.089s and maximum 15.411s; drain
+was 15.505s and query p95 124.145ms. Worker RSS peaks were 115.16 and 114.88 MiB.
+Its emulator limit was 4 GiB with a 3 GiB heap; the other settings were unchanged.
+Receive-pressure checkpoints can lower visibility delay at higher traffic, but
+one two-minute run is not a sustainable-throughput or latency guarantee.
+
+A new local 20,000/s comparison attempt failed when Windows reported exhausted
+paging memory and all test containers stopped. Its unresolved requests and
+missing drain invalidate it as a throughput comparison. Heavy validation then
+moved to the hosted runner; the failure is not counted as successful evidence.
+
+The [qualification checker](capacity.md#qualifying-a-measured-profile) applies
+explicit workload and latency limits to saved reports. Passing reconciliation
+alone cannot qualify a profile that violates those limits.
 
 ## Database benchmark
 

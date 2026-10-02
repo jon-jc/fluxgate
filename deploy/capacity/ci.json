@@ -1,0 +1,15 @@
+{
+  "name": "Two-worker emulator CI regression budget; not a production SLO",
+  "limits": {
+    "min_offered_points_per_second": 2000,
+    "min_duration_seconds": 45,
+    "min_active_series": 10000,
+    "min_tenants": 4,
+    "min_aggregators": 2,
+    "min_accepted_points_per_second": 1900,
+    "max_missed_points": 0,
+    "max_p95_visibility_seconds": 45,
+    "max_query_p95_ms": 1000,
+    "max_drain_seconds": 90
+  }
+}

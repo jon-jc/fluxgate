@@ -35,6 +35,10 @@ on:
         description: Pub/Sub emulator memory in MiB (Java heap is 75%)
         default: '4096'
         required: true
+      policy:
+        description: Optional qualification policy file in the repository
+        default: ''
+        required: false
 
 permissions:
   contents: read
@@ -71,10 +75,20 @@ jobs:
           --flush-concurrency "$FLUSH_CONCURRENCY"
           --broker-memory-mib "$BROKER_MEMORY_MIB"
           --drain-timeout 600 --output "${{ runner.temp }}/capacity.json"
+      - name: Qualify against an explicit policy
+        if: ${{ inputs.policy != '' }}
+        env:
+          CAPACITY_POLICY: ${{ inputs.policy }}
+        run: >-
+          python3 scripts/check_capacity.py "${{ runner.temp }}/capacity.json"
+          --policy "$CAPACITY_POLICY"
+          --output "${{ runner.temp }}/capacity-qualification.json"
       - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         if: always()
         with:
           name: capacity-evidence
-          path: ${{ runner.temp }}/capacity.json
+          path: |
+            ${{ runner.temp }}/capacity.json
+            ${{ runner.temp }}/capacity-qualification.json
           if-no-files-found: warn
           retention-days: 30
