@@ -1,5 +1,9 @@
 # Deploying Fluxgate
 
+[Documentation index](../../docs/README.md) ·
+[Release guide](../../docs/deployment.md) · [Input/output reference](../../docs/terraform-reference.md) ·
+[Recovery runbooks](../../docs/recovery.md)
+
 This directory prepares private Cloud SQL, Pub/Sub, four service identities,
 Secret Manager, Artifact Registry, alerts, a migration job and three Cloud Run
 services. It defaults to infrastructure only. Local validation never deploys.

@@ -1,7 +1,7 @@
 # Fluxgate developer workflow.
 #
-# Every target here is also what CI runs, so a green `make ci` locally means a
-# green pipeline -- there is no second, hidden set of commands to keep in sync.
+# Local shortcuts. The full GitHub workflow additionally checks packaged images,
+# security, integration, Terraform and capacity; see docs/development.md.
 
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
@@ -60,7 +60,7 @@ cover-html: cover ## Open the coverage report in a browser
 	@echo "wrote coverage.html"
 
 .PHONY: up
-up: ## Start the local stack (Pub/Sub emulator + ingest API)
+up: ## Start the complete local pipeline and observability stack
 	docker compose -f deploy/docker-compose.yml up -d --build
 	@echo ""
 	@echo "  ingest API:  http://localhost:8080"
@@ -119,7 +119,7 @@ vet: ## Run go vet
 	$(GO) vet ./...
 
 .PHONY: lint
-lint: ## Run golangci-lint (installs it on demand)
+lint: ## Run the installed golangci-lint binary
 	@command -v golangci-lint >/dev/null 2>&1 || { \
 		echo "golangci-lint not found; install from https://golangci-lint.run"; exit 1; }
 	golangci-lint run
@@ -134,7 +134,7 @@ tidy: ## Tidy and verify go.mod
 	$(GO) mod verify
 
 .PHONY: ci
-ci: tidy vet test ## Everything CI enforces, minus the linter binary
+ci: tidy vet test ## Run the local module, vet and Go test subset of CI
 
 .PHONY: clean
 clean: ## Remove build and coverage artifacts
