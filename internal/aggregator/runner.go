@@ -86,7 +86,8 @@ type Runner struct {
 	// Admission and collection must move the engine and its ledger together.
 	admission          sync.Mutex
 	flushMu            sync.Mutex
-	closing            bool // protected by admission
+	closing            bool   // protected by admission
+	ledgerEpoch        uint64 // protected by admission; advances when a flush resolves
 	engine             *aggregate.Engine
 	store              Store
 	flushInterval      time.Duration
@@ -178,34 +179,61 @@ func New(opts Options) (*Runner, error) {
 // have been committed. Returning an error hands the message back for
 // redelivery in the usual way.
 func (r *Runner) Handle(ctx context.Context, d pubsubx.Delivery) error {
-	r.admission.Lock()
-	defer r.admission.Unlock()
-	if r.closing {
-		return errors.New("aggregator is draining")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	batch := d.Envelope.Batch()
 	log := observability.LoggerFromContext(ctx)
 
 	// Work out which windows this batch touches before accumulating anything,
 	// so already-committed windows can be excluded rather than double-counted.
 	windows := r.windowsFor(batch)
-	if len(windows) == 0 {
-		// An empty batch has nothing to wait for.
-		d.Ack()
-		return nil
-	}
-
 	lookupCtx, cancelLookup := context.WithTimeout(ctx, r.storageTimeout)
-	committed, err := r.store.SeenContributions(lookupCtx, batch.TenantID, batch.ID, windows)
-	cancelLookup()
-	if err != nil {
-		// Without knowing what is already committed, accumulating would risk
-		// double-counting. Hand the message back and try again.
-		return fmt.Errorf("check delivery ledger for batch %s: %w", batch.ID, err)
+	defer cancelLookup()
+	var committed map[string]bool
+	for {
+		r.admission.Lock()
+		if r.closing {
+			r.admission.Unlock()
+			return errors.New("aggregator is draining")
+		}
+		if err := lookupCtx.Err(); err != nil {
+			r.admission.Unlock()
+			return err
+		}
+		if len(windows) == 0 {
+			d.Ack()
+			r.admission.Unlock()
+			return nil
+		}
+		epoch := r.ledgerEpoch
+		r.admission.Unlock()
+
+		// Database latency must not serialize all deliveries or prevent a
+		// checkpoint from collecting already admitted data. Broker receive
+		// limits and the database pool bound concurrent lookup work.
+		var err error
+		committed, err = r.store.SeenContributions(lookupCtx, batch.TenantID, batch.ID, windows)
+		if err != nil {
+			return fmt.Errorf("check delivery ledger for batch %s: %w", batch.ID, err)
+		}
+
+		r.admission.Lock()
+		if r.closing {
+			r.admission.Unlock()
+			return errors.New("aggregator is draining")
+		}
+		if err := lookupCtx.Err(); err != nil {
+			r.admission.Unlock()
+			return err
+		}
+		if epoch == r.ledgerEpoch {
+			break // retain admission through accumulation and tracking below
+		}
+		r.admission.Unlock()
+		// A flush may have committed after our database snapshot but before
+		// admission. Once its in-memory marks disappear, that stale snapshot
+		// could admit the same contribution again. Re-read within the original
+		// deadline; an active flush is still guarded by skipSet below.
 	}
+	defer r.admission.Unlock()
 
 	skip, inFlight := r.skipSet(batch, windows, committed)
 	if inFlight {
@@ -516,9 +544,12 @@ func (r *Runner) detach(windows []aggregate.Window) ([]store.Contribution, []*pe
 
 // releaseFlushing clears the in-flight marks once a write has resolved.
 func (r *Runner) releaseFlushing(contributions []store.Contribution) {
+	r.admission.Lock()
+	defer r.admission.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	r.ledgerEpoch++
 	for _, c := range contributions {
 		delete(r.flushing, c.Key())
 	}

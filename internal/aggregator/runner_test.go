@@ -116,7 +116,7 @@ func point(metric string, value float64, offset time.Duration) telemetry.Point {
 	}
 }
 
-func newRunner(t *testing.T, s Store) *Runner {
+func newRunner(t testing.TB, s Store) *Runner {
 	t.Helper()
 
 	r, err := New(Options{
