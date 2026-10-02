@@ -51,12 +51,28 @@ commit. `fluxgate_aggregate_pending_messages` and
 `fluxgate_aggregate_pending_encoded_bytes` include writes in progress; compare
 these with broker backlog to distinguish a full receiver from a slow publisher.
 
-Storage checkpoints use bounded 256-row bulk writes and claims in **one**
-transaction, including the tenant revision lock. `AGGREGATOR_STORAGE_TIMEOUT`
-defaults to one minute (valid range 1s..2m); a blocked ledger lookup declines
-admission and a timed-out checkpoint rolls back and nacks for reconstruction.
+Storage checkpoints use bounded 256-row bulk writes and claims in **one
+transaction per tenant**, including that tenant's revision lock. Up to four
+tenant transactions run concurrently per aggregator (`AGGREGATOR_FLUSH_CONCURRENCY`,
+range 1..16), within the existing database connection pool. A blocked tenant or
+claim conflict does not roll back other tenants. `AGGREGATOR_STORAGE_TIMEOUT`
+defaults to one minute (valid range 1s..2m), shared by the whole checkpoint,
+including queued tenant work. A blocked ledger lookup declines admission;
+failed tenant transactions roll back and nack only their deliveries.
 Changing it cannot make storage faster: repeated timeouts require reducing
 load, investigating locks, or increasing database capacity.
+
+Flush counts, duration and committed-window metrics describe tenant transactions.
+Several tenants committing the same time window count as separate checkpoints.
+Pending delivery gauges fall as each tenant commits, even while another is
+blocked. More concurrency does not increase the database's connection limit or
+remove serialization for one hot tenant; budget connections across all replicas
+and leave room for ledger reads. Existing images and the new worker can share
+the same schema and per-tenant revision protocol during a rolling upgrade.
+Isolation is bounded: blocked transactions consume worker slots, queued tenants
+can exhaust the shared deadline, and the next collection waits for the current
+checkpoint to resolve. Use the capacity tool's `--flush-concurrency` option to
+measure this tradeoff on the intended database tier.
 
 Ledger lookups do not hold the shared admission lock. Receive limits and the
 connection pool bound concurrent reads; the engine and delivery bookkeeping

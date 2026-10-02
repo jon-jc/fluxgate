@@ -162,7 +162,10 @@ type AggregatorConfig struct {
 	IdleTimeout time.Duration
 	// FlushInterval is how often buffered windows receive a durable checkpoint.
 	FlushInterval time.Duration
-	// StorageTimeout bounds ledger lookups and complete checkpoint transactions.
+	// FlushConcurrency bounds simultaneous tenant transactions per checkpoint.
+	FlushConcurrency int
+	// StorageTimeout bounds ledger lookups and the entire checkpoint, including
+	// tenant transactions queued behind the flush worker limit.
 	StorageTimeout time.Duration
 	// MaxOutstandingMessages caps unacknowledged messages held in memory.
 	MaxOutstandingMessages int
@@ -442,6 +445,7 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			MaxOutstandingBytes:    int(l.bytes("AGGREGATOR_MAX_OUTSTANDING_BYTES", 16<<20)),
 			IdleTimeout:            l.duration("AGGREGATOR_IDLE_TIMEOUT", 30*time.Second),
 			FlushInterval:          l.duration("AGGREGATOR_FLUSH_INTERVAL", 15*time.Second),
+			FlushConcurrency:       l.integer("AGGREGATOR_FLUSH_CONCURRENCY", 4),
 			StorageTimeout:         l.duration("AGGREGATOR_STORAGE_TIMEOUT", time.Minute),
 			MaxOutstandingMessages: l.integer("AGGREGATOR_MAX_OUTSTANDING_MESSAGES", 1000),
 			Concurrency:            l.integer("AGGREGATOR_CONCURRENCY", 2),
@@ -718,6 +722,9 @@ func (c Config) validateAggregator(l *loader) {
 	}
 	if c.Aggregator.StorageTimeout < time.Second || c.Aggregator.StorageTimeout > 2*time.Minute {
 		l.reject("AGGREGATOR_STORAGE_TIMEOUT", "must be between 1s and 2m")
+	}
+	if c.Aggregator.FlushConcurrency < 1 || c.Aggregator.FlushConcurrency > 16 {
+		l.reject("AGGREGATOR_FLUSH_CONCURRENCY", "must be between 1 and 16")
 	}
 	// A flush interval longer than the window means a closed window waits for
 	// the timer rather than being written promptly, so every rollup is stale by

@@ -162,7 +162,7 @@ func NewMetrics(service string) *Metrics {
 			Namespace:   "fluxgate",
 			Subsystem:   "aggregate",
 			Name:        "windows_flushed_total",
-			Help:        "Aggregation windows committed to storage.",
+			Help:        "Tenant aggregation windows committed to storage.",
 			ConstLabels: labels,
 		}),
 
@@ -170,7 +170,7 @@ func NewMetrics(service string) *Metrics {
 			Namespace:   "fluxgate",
 			Subsystem:   "aggregate",
 			Name:        "flush_duration_seconds",
-			Help:        "Time to commit a flush transaction.",
+			Help:        "Time to commit one tenant checkpoint transaction.",
 			ConstLabels: labels,
 			Buckets:     latencyBuckets,
 		}),

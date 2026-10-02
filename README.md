@@ -177,6 +177,12 @@ a checkpoint. If a checkpoint resolves during a lookup, the worker refreshes
 that snapshot before admission, within the original storage deadline. This keeps
 duplicate suppression intact across concurrent reads, commits and shutdown.
 
+Checkpoints use independent transactions per tenant, with up to four running at
+once per aggregator. A blocked tenant or conflicting delivery does not roll back
+another tenant's committed work. Each transaction retains atomic rollups, delivery
+claims and commit-ordered live-query revisions. All queued tenant work shares one
+checkpoint deadline; failed tenants return for redelivery independently.
+
 Each rollup is keyed by tenant, metric name, kind, labels, and window. Stored
 statistics are count, sum, min, max, and last, plus fixed exponential buckets for
 histograms. Last-value ordering uses event timestamps at PostgreSQL microsecond
@@ -355,14 +361,15 @@ are not production credentials or deployment settings.
 | `QUERY_STREAM_MAX_CONCURRENT` / `QUERY_STREAM_MAX_PER_TENANT` | 100 / 8 per instance; tenant exhaustion returns `429`, total exhaustion `503` |
 | `ROLLUP_RETENTION` / `LEDGER_RETENTION` | `720h` / `768h`; align the ledger with raw, dead-letter, and retry retention |
 | `PRUNE_INTERVAL` | `5m`; cleanup uses bounded chunks and per-table deadlines |
+| `AGGREGATOR_FLUSH_CONCURRENCY` | 4 tenant transactions per aggregator, configurable from 1 to 16; uses the existing database pool |
 | `HTTP_TRUST_PROXY_HEADER` / `HTTP_TRUST_TRACE_PARENT` | False; enable only behind a gateway that rewrites/authenticates the corresponding headers |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | A configured endpoint enables tracing; production requires a real TLS collector |
 | `TRACE_SAMPLE_RATIO` | 1 on local/dev; 0.05 on staging/prod |
 
 Additional fixed bounds include an 8 MiB query materialization budget, 256 KiB
-live-update pages, a 32 KiB HTTP header setting, and at most 256 SQL statements
-per bulk SQL write within one transaction. Ledger lookups and complete checkpoint
-transactions have a one-minute deadline (`AGGREGATOR_STORAGE_TIMEOUT`, configurable
+live-update pages, a 32 KiB HTTP header setting, and at most 256 rows
+per bulk SQL write within one tenant transaction. Ledger lookups and whole checkpoints,
+including queued tenant transactions, have a one-minute deadline (`AGGREGATOR_STORAGE_TIMEOUT`, configurable
 from one second to two minutes); timed-out work returns for redelivery. Memory budgets estimate admitted data;
 they are not RSS limits. Measure actual container memory before increasing them.
 

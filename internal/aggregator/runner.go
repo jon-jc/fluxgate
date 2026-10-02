@@ -50,7 +50,10 @@ type Options struct {
 	// Zero disables the corresponding trigger; the periodic checkpoint remains.
 	CheckpointMessages int
 	CheckpointBytes    int64
-	// StorageTimeout bounds each ledger lookup and complete flush transaction.
+	// FlushConcurrency bounds simultaneous tenant transactions per checkpoint.
+	FlushConcurrency int
+	// StorageTimeout bounds each ledger lookup and the entire checkpoint,
+	// including tenant transactions waiting for a flush worker.
 	StorageTimeout time.Duration
 	// DrainTimeout bounds the final flush within the host shutdown budget.
 	DrainTimeout time.Duration
@@ -62,6 +65,9 @@ type Options struct {
 }
 
 func (o *Options) applyDefaults() {
+	if o.FlushConcurrency == 0 {
+		o.FlushConcurrency = 4
+	}
 	if o.StorageTimeout <= 0 {
 		o.StorageTimeout = time.Minute
 	}
@@ -93,6 +99,7 @@ type Runner struct {
 	flushInterval      time.Duration
 	checkpointMessages int
 	checkpointBytes    int64
+	flushConcurrency   int
 	storageTimeout     time.Duration
 	checkpoint         chan struct{}
 	drainTimeout       time.Duration
@@ -121,6 +128,7 @@ type Runner struct {
 
 type pendingMessage struct {
 	delivery pubsubx.Delivery
+	tenantID string
 	// awaiting is the set of window starts this message is still waiting on.
 	// A batch that straddles a boundary must not be acknowledged when only one
 	// of its windows has been written, so settlement waits for the set to
@@ -131,7 +139,8 @@ type pendingMessage struct {
 	settled bool
 }
 
-// Stats is a snapshot of the runner's counters.
+// Stats is a snapshot of the runner's counters. Flush outcomes count tenant
+// transactions; a partially successful collection can increment both outcomes.
 type Stats struct {
 	BatchesAccepted  int64
 	BatchesDuplicate int64
@@ -151,6 +160,8 @@ func New(opts Options) (*Runner, error) {
 		return nil, errors.New("aggregator: engine is required")
 	case opts.Store == nil:
 		return nil, errors.New("aggregator: store is required")
+	case opts.FlushConcurrency < 0 || opts.FlushConcurrency > 16:
+		return nil, errors.New("aggregator: flush concurrency must be between 1 and 16")
 	}
 	opts.applyDefaults()
 
@@ -160,6 +171,7 @@ func New(opts Options) (*Runner, error) {
 		flushInterval:      opts.FlushInterval,
 		checkpointMessages: opts.CheckpointMessages,
 		checkpointBytes:    opts.CheckpointBytes,
+		flushConcurrency:   opts.FlushConcurrency,
 		storageTimeout:     opts.StorageTimeout,
 		checkpoint:         make(chan struct{}, 1),
 		drainTimeout:       opts.DrainTimeout,
@@ -366,6 +378,7 @@ func (r *Runner) track(d pubsubx.Delivery, batch telemetry.Batch, windows []aggr
 	d.Attributes = nil
 	pending := &pendingMessage{
 		delivery: d,
+		tenantID: batch.TenantID,
 		awaiting: make(map[int64]struct{}, len(windows)),
 	}
 
@@ -455,45 +468,10 @@ func (r *Runner) flush(ctx context.Context, all bool) error {
 
 	contributions, messages := r.detach(windows)
 	r.admission.Unlock()
-	// Whatever happens next, these contributions stop being in-flight.
-	defer r.releaseFlushing(contributions)
-
-	started := time.Now()
 
 	writeCtx, cancelWrite := context.WithTimeout(ctx, r.storageTimeout)
 	defer cancelWrite()
-	if err := r.store.Flush(writeCtx, rollups, contributions); err != nil {
-		// The engine has already handed over these rollups, so this data now
-		// exists nowhere else. Handing the messages back is what recovers it:
-		// no ledger entry was written, so redelivery rebuilds exactly these
-		// windows and nothing else.
-		r.nackAll(messages)
-
-		r.mu.Lock()
-		r.stats.FlushesFailed++
-		r.mu.Unlock()
-
-		return fmt.Errorf("flush %d windows: %w", len(windows), err)
-	}
-
-	// The engine is only told now: before the write is confirmed, a point for
-	// one of these windows is not late, it is the raw material for the retry.
-	r.engine.MarkFlushed(windows)
-	r.metrics.ObserveFlush(len(windows), len(rollups), time.Since(started))
-	r.ackAll(messages)
-
-	r.mu.Lock()
-	r.stats.FlushesSucceeded++
-	r.stats.RollupsWritten += int64(len(rollups))
-	r.mu.Unlock()
-
-	r.log.Info("flushed windows",
-		slog.Int("windows", len(windows)),
-		slog.Int("rollups", len(rollups)),
-		slog.Int("messages", len(messages)),
-		slog.String("oldest", windows[0].String()))
-
-	return nil
+	return r.flushTenants(writeCtx, rollups, contributions, messages)
 }
 
 // detach removes the bookkeeping for the given windows and returns it.
