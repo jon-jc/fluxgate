@@ -115,7 +115,8 @@ production RPO/RTO.
    acknowledged after the database recovery point. Subscription state does not
    roll back with SQL. Consult the operator procedure in the
    [Terraform recovery guide](../deploy/terraform/README.md#release-checks-requiring-a-real-staging-project)
-   for the Pub/Sub seek/replay considerations.
+   and Google's [Pub/Sub replay guide](https://docs.cloud.google.com/pubsub/docs/replay-overview)
+   for retention requirements and eventual seek consistency.
 3. Restore all five tables consistently and provision runtime grants. Reconcile
    the restored ledger horizon with the chosen replay interval before starting
    consumers. Publication time used for seek is different from metric event time.

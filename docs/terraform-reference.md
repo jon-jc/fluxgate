@@ -94,7 +94,7 @@ Some deployment settings are fixed in the module rather than exposed as inputs:
 | SQL disk | SSD; autoresize enabled up to `database_disk_gb * 4`; size changes after growth are ignored by lifecycle configuration |
 | Backups | Enabled, scheduled start `03:00`; 30 retained backups on staging/prod, 7 on dev |
 | PITR | Enabled on staging/prod; transaction-log retention configured as 7 days there, 1 day on dev |
-| SQL maintenance | Sunday, hour 04, stable update track; platform scheduling is UTC |
+| SQL maintenance | Sunday, hour 04, stable update track; [API maintenance times are UTC](https://docs.cloud.google.com/sql/docs/postgres/set-maintenance-window#rest-v1) |
 | SQL diagnostics | Query Insights enabled, client address recording off; queries over 1,000ms logged |
 | VPC subnet / connector range | `10.20.0.0/24` / `10.21.0.0/28`; check for conflicts when adapting networking |
 | VPC connector size | Minimum 2, maximum 3 instances |
