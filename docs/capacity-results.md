@@ -81,7 +81,7 @@ publication errors cannot be silently excluded. Subsequent runs explicitly
 budgeted emulator heap and retained failure logs/container state in the JSON
 evidence. That fixture failure is distinct from application capacity.
 
-## Hosted tenant-checkpoint profile (October 2)
+## Hosted tenant-checkpoint profiles (October 2)
 
 The [hosted 5,000/s run](https://github.com/jon-jc/fluxgate/actions/runs/37055705604)
 accepted and reconciled **600,000 points for 120 seconds across 100,000 active
@@ -98,6 +98,16 @@ workload, 500-point batches, 60-second windows and 15-second timer matched the
 earlier measurement method. Hosted hardware and run duration differ from the
 local results, so this is an independently measured profile, not a controlled
 before/after throughput multiplier.
+
+The subsequent [10,000/s run](https://github.com/jon-jc/fluxgate/actions/runs/37056416156)
+accepted all **1,200,000 offered points**, again with **zero missed submissions
+and zero HTTP rejections**, reconciling 294,500 series/window rows across 100,000
+active series. Achieved rate was 9,998.1 points/s (submission completion extended
+slightly past 120 seconds). Visibility p95 was 9.089s and maximum 15.411s; drain
+was 15.505s and query p95 124.145ms. Worker RSS peaks were 115.16 and 114.88 MiB.
+Its emulator limit was 4 GiB with a 3 GiB heap; the other settings were unchanged.
+Receive-pressure checkpoints can lower visibility delay at higher traffic, but
+one two-minute run is not a sustainable-throughput or latency guarantee.
 
 A new local 20,000/s comparison attempt failed when Windows reported exhausted
 paging memory and all test containers stopped. Its unresolved requests and
