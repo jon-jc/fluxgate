@@ -21,6 +21,10 @@ gates. See [production deployment](#production-deployment) before serving live t
 
 ## Documentation
 
+Read the **[hosted documentation](https://fluxgate-docs.vercel.app)** for searchable
+guides and the **[API reference](https://fluxgate-docs.vercel.app/api-reference/)**
+with endpoint examples, response schemas, and OpenAPI downloads.
+
 The [documentation hub](docs/README.md) contains the complete guides and references:
 
 | For | Read |

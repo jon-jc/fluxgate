@@ -44,3 +44,11 @@ Thumbs.db
 /tmp/
 # Python verification helper caches
 __pycache__/
+
+# Documentation site and local deployment metadata
+.vercel/
+site/node_modules/
+site/dist/
+site/test-results/
+site/playwright-report/
+site/.build-manifest.json

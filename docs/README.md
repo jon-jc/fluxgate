@@ -1,5 +1,8 @@
 # Fluxgate documentation
 
+**[Read the documentation website](https://fluxgate-docs.vercel.app)** ·
+**[Browse the API reference](https://fluxgate-docs.vercel.app/api-reference/)**
+
 Fluxgate accepts metric observations over HTTP, transports them through Google
 Cloud Pub/Sub, stores event-time aggregates in PostgreSQL, and serves them through
 REST and server-sent events. Ingest, aggregation, and query run independently.
@@ -21,6 +24,7 @@ Start with the guide for your task:
 | Build, test, or change the implementation | [Development guide](development.md) |
 | Understand design tradeoffs | [Architecture decision records](adr/README.md) |
 | Review image scan findings | [Security scanning assessment](security-scanning.md) |
+| Build or publish the documentation website | [Documentation site](../site/README.md) |
 
 ## Scope and readiness
 
