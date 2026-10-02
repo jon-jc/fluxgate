@@ -817,7 +817,8 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Per-dependency result; `ok` or the failure reason.
+            enum: [ok, unavailable]
+          description: Per-dependency result; details of failures are logged server-side, not exposed in this response.
 
     VersionInfo:
       type: object

@@ -22,6 +22,10 @@ that the broker subscription is receiving or that backlog is falling. Database
 connectivity does not prove every required table/write permission or a healthy
 query plan. Use functional probes and lag measurements alongside readiness.
 
+A failing dependency is reported as `unavailable` in the `checks` map; inspect
+server logs for the cause. Readiness responses deliberately omit internal error
+details.
+
 Do not restart every process just because a shared database is down. Liveness
 stays independent to avoid turning a dependency outage into restart churn. On
 shutdown, readiness fails before HTTP draining. Uncommitted worker deliveries

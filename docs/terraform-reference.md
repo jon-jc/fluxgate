@@ -31,7 +31,7 @@ lock file for reproducible initialization. Example values are in
 | `query_min_instances` | number | `0` | Query minimum; zero permits cold starts |
 | `query_max_instances` | number | `10` | Query scale ceiling |
 | `database_tier` | string | `db-custom-2-7680` | Cloud SQL machine type |
-| `database_disk_gb` | number | `50` | Initial data disk size; autoresize enabled |
+| `database_disk_gb` | number | `50` | Initial data disk size; autoresize ceiling is four times this value |
 | `database_availability_type` | string | `ZONAL` | `ZONAL` or `REGIONAL`; prod runtime requires regional |
 | `message_retention` | string | `86400s` | Source retention; whole seconds from `600s` through `2678400s` |
 | `max_delivery_attempts` | number | `20` | Dead-letter attempt setting, 5–100; not an exact application retry counter |
@@ -84,6 +84,28 @@ for exact expressions. Do not paste sensitive state or plan contents into public
 issues when diagnosing a deployment.
 
 ## Runtime overrides and customization
+
+Some deployment settings are fixed in the module rather than exposed as inputs:
+
+| Setting | Current configuration |
+| --- | --- |
+| Database engine | PostgreSQL 17 |
+| Database deletion protection | Enabled on every tier |
+| SQL disk | SSD; autoresize enabled up to `database_disk_gb * 4`; size changes after growth are ignored by lifecycle configuration |
+| Backups | Enabled, scheduled start `03:00`; 30 retained backups on staging/prod, 7 on dev |
+| PITR | Enabled on staging/prod; transaction-log retention configured as 7 days there, 1 day on dev |
+| SQL maintenance | Sunday, hour 04, stable update track; platform scheduling is UTC |
+| SQL diagnostics | Query Insights enabled, client address recording off; queries over 1,000ms logged |
+| VPC subnet / connector range | `10.20.0.0/24` / `10.21.0.0/28`; check for conflicts when adapting networking |
+| VPC connector size | Minimum 2, maximum 3 instances |
+| Worker subscription retry | Minimum 1s, maximum 60s backoff; no subscription expiry |
+| DLQ inspection | Seven-day retention, 60s ack deadline, no subscription expiry |
+| Acknowledged messages | Worker subscription does not retain them itself; raw topic retention supports deliberate replay |
+
+These are module declarations, not evidence that a backup can be restored or
+that the regional service accepted the settings. Verify actual resource state
+and recovery behavior in staging. Autoresize has a finite ceiling and does not
+shrink the disk; retention and disk monitoring remain necessary.
 
 The module sets a subset of runtime environment values in
 [cloudrun.tf](../deploy/terraform/cloudrun.tf). The
