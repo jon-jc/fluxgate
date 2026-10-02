@@ -1,0 +1,18 @@
+# Only documentation build inputs belong in this static deployment.
+*
+!vercel.json
+!README.md
+!site
+!site/**
+!docs
+!docs/**
+!api
+!api/openapi.yaml
+!deploy
+!deploy/terraform
+!deploy/terraform/README.md
+site/node_modules
+site/dist
+site/test-results
+site/playwright-report
+site/.build-manifest.json

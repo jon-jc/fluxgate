@@ -1,0 +1,29 @@
+{
+  "name": "fluxgate-documentation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "node build.mjs && node test/build.test.mjs",
+    "dev": "npm run build && node serve.mjs",
+    "serve": "node serve.mjs",
+    "test": "node --test test/unit.test.mjs && npm run build",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "@fontsource/inter": "5.3.0",
+    "esbuild": "0.28.2",
+    "marked": "18.0.14",
+    "mermaid": "12.1.0",
+    "shiki": "4.5.0",
+    "yaml": "2.9.1"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.63.0",
+    "cheerio": "1.2.0"
+  }
+}
