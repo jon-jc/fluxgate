@@ -95,6 +95,27 @@ above 2^53, histogram buckets and microsecond event timestamps.
 
 ## Reproduce and qualify a release
 
+### Admission latency isolation (October 2, 2026)
+
+The aggregator previously held its shared admission lock during each durable
+ledger lookup. Reads now run concurrently and refresh their snapshot if a local
+checkpoint resolves before admission. Regression tests cover delayed reads
+across commits, concurrent duplicate delivery, shutdown and deadline exhaustion.
+
+`BenchmarkLedgerAdmission` isolates this coordination overhead with a simulated
+2ms ledger latency, 32 concurrent one-point batches, exact total reconciliation
+and a checkpoint per operation. On the same Windows host, three runs of ten
+operations each had a median of **79.65ms before** and **2.75ms after**. This is
+about 29 times faster for that latency-bound microbenchmark; it does **not**
+multiply the measured end-to-end capacity above or model database saturation.
+
+```sh
+go test ./internal/aggregator -run '^$' -bench '^BenchmarkLedgerAdmission$' \
+  -benchtime=10x -count=3
+```
+
+### Full pipeline
+
 Build the images with `python scripts/verify_pipeline.py`, then:
 
 ```sh

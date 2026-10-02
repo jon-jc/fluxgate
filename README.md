@@ -171,6 +171,12 @@ already committed. Admission is atomic for each batch: capacity exhaustion
 returns the whole batch for redelivery. Sustained overload can reach the
 configured dead-letter policy and requires operator attention.
 
+Delivery-ledger reads run concurrently within the receive and database-pool
+limits. A slow lookup does not hold the shared admission lock or delay collecting
+a checkpoint. If a checkpoint resolves during a lookup, the worker refreshes
+that snapshot before admission, within the original storage deadline. This keeps
+duplicate suppression intact across concurrent reads, commits and shutdown.
+
 Each rollup is keyed by tenant, metric name, kind, labels, and window. Stored
 statistics are count, sum, min, max, and last, plus fixed exponential buckets for
 histograms. Last-value ordering uses event timestamps at PostgreSQL microsecond

@@ -58,6 +58,13 @@ admission and a timed-out checkpoint rolls back and nacks for reconstruction.
 Changing it cannot make storage faster: repeated timeouts require reducing
 load, investigating locks, or increasing database capacity.
 
+Ledger lookups do not hold the shared admission lock. Receive limits and the
+connection pool bound concurrent reads; the engine and delivery bookkeeping
+still change atomically. A checkpoint completing during a lookup invalidates
+that snapshot and causes a fresh read under the same timeout. This prevents a
+slow lookup from blocking checkpoint collection or unrelated deliveries without
+allowing a stale read to accumulate a committed contribution again.
+
 For database-only comparisons against a disposable PostgreSQL instance:
 
 ```sh
