@@ -52,6 +52,7 @@ def main():
     parser.add_argument("--series", type=int, default=10000, help="series per tenant")
     parser.add_argument("--tenants", type=int, default=4)
     parser.add_argument("--aggregators", type=int, default=1)
+    parser.add_argument("--flush-concurrency", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--clients", type=int, default=16)
     parser.add_argument("--window-seconds", type=int, default=60)
@@ -64,7 +65,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     for name, low, high in (("points_per_second", 100, 1000000), ("duration", 5, 600),
-                            ("series", 1, 100000), ("tenants", 1, 32), ("aggregators", 1, 4), ("batch_size", 1, 1000),
+                            ("series", 1, 100000), ("tenants", 1, 32), ("aggregators", 1, 4),
+                            ("flush_concurrency", 1, 16), ("batch_size", 1, 1000),
                             ("clients", 1, 128), ("window_seconds", 1, 60),
                             ("flush_seconds", 1, 60), ("drain_timeout", 10, 600), ("broker_memory_mib", 512, 8192)):
         if not low <= getattr(args, name) <= high:
@@ -148,6 +150,7 @@ def main():
 
         aggregator_env = env("aggregator") | dict(GOMEMLIMIT="700MiB",
                             AGGREGATOR_WINDOW_SIZE=f"{args.window_seconds}s",
+                            AGGREGATOR_FLUSH_CONCURRENCY=str(args.flush_concurrency),
                             AGGREGATOR_FLUSH_INTERVAL=f"{args.flush_seconds}s")
         services = {"aggregator": start("aggregator", images["aggregator"], aggregator_env, memory="1g")}
         for index in range(1, args.aggregators):
@@ -162,6 +165,7 @@ def main():
                                    postgres_cpu=2, postgres_memory_mib=2048, broker_cpu=2,
                                    broker_memory_mib=args.broker_memory_mib, broker_heap_mib=args.broker_memory_mib * 3 // 4,
                                    ingest_replicas=2, aggregator_replicas=args.aggregators, query_replicas=1,
+                                   tenant_flush_concurrency=args.flush_concurrency,
                                    http_max_concurrent=4, subscriber_bytes=16 * 1024**2,
                                    subscriber_messages=1000, tenant_rate_limit_per_replica=1000000)
         began = time.monotonic()

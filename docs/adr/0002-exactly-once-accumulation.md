@@ -54,9 +54,12 @@ means the acknowledgement lease has to survive storage delays. And a third state
 yet, so the message is handed back rather than guessed at.
 
 **Concurrent deliveries.** The broker can redeliver while the original consumer
-is still processing. Each flush inserts all delivery claims in its transaction
-before updating totals. An existing claim aborts the whole flush. The consumer
-nacks its deliveries, whose retries rebuild only the uncommitted contributions.
+is still processing. Each tenant checkpoint inserts all delivery claims in its
+transaction before updating totals. An existing claim aborts that tenant's
+transaction. The consumer nacks its deliveries, whose retries rebuild only the
+uncommitted contributions. Other tenants commit and settle independently through
+a bounded worker pool; one transaction never needs another tenant's revision
+lock. All queued tenant transactions share the checkpoint's storage deadline.
 A duplicate waiting in memory waits for durability; it cannot acknowledge the
 original broker message early. Admission and collection share a lock so a flush
 cannot detach a point from its delivery bookkeeping.
