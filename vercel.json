@@ -64,7 +64,7 @@
     }
   ],
   "redirects": [
-    { "source": "/docs", "destination": "/guides/", "permanent": true },
-    { "source": "/api", "destination": "/api-reference/", "permanent": true }
+    { "source": "/docs/", "destination": "/guides/", "permanent": true },
+    { "source": "/api/", "destination": "/api-reference/", "permanent": true }
   ]
 }

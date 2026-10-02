@@ -128,6 +128,14 @@ test("diagrams render, downloads are served, and unknown routes return 404", asy
   expect(contract.ok()).toBe(true);
   expect(Object.keys((await contract.json()).paths)).toHaveLength(8);
   expect((await request.get("/openapi.yaml")).ok()).toBe(true);
+  for (const [alias, destination] of [
+    ["/api/", "/api-reference/"],
+    ["/docs/", "/guides/"],
+  ]) {
+    const redirect = await request.get(alias, { maxRedirects: 0 });
+    expect(redirect.status()).toBe(308);
+    expect(redirect.headers().location).toBe(destination);
+  }
   const response = await page.goto("/this-page-does-not-exist/");
   expect(response.status()).toBe(404);
   await expect(page.getByRole("heading", { level: 1 })).toContainText(

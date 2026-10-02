@@ -28,6 +28,15 @@ const server = http.createServer(async (request, response) => {
     const pathname = decodeURIComponent(
       new URL(request.url, "http://localhost").pathname,
     );
+    const redirect = config.redirects.find((rule) => rule.source === pathname);
+    if (redirect) {
+      response.writeHead(308, { Location: redirect.destination }).end();
+      return;
+    }
+    if (!path.extname(pathname) && !pathname.endsWith("/")) {
+      response.writeHead(308, { Location: `${pathname}/` }).end();
+      return;
+    }
     const file = path.resolve(
       root,
       `.${pathname}`,
