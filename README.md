@@ -19,6 +19,19 @@ gates. See [production deployment](#production-deployment) before serving live t
 [Verification](#verification) · [Configuration](#configuration) ·
 [Production deployment](#production-deployment) · [Development](#development)
 
+## Documentation
+
+The [documentation hub](docs/README.md) contains the complete guides and references:
+
+| For | Read |
+| --- | --- |
+| First-time users | [Getting started](docs/getting-started.md) |
+| Client developers | [API, retries, queries, and live streams](docs/api.md) · [OpenAPI](api/openapi.yaml) |
+| System design | [Architecture and data guarantees](docs/architecture.md) · [Decisions](docs/adr/README.md) |
+| Operators | [Configuration](docs/configuration.md) · [Security and key rotation](docs/security.md) · [Operations](docs/operations.md) · [Recovery](docs/recovery.md) |
+| Release owners | [Deployment and acceptance](docs/deployment.md) · [Terraform reference](docs/terraform-reference.md) · [Capacity](docs/capacity.md) · [Measured results](docs/capacity-results.md) |
+| Contributors | [Development, command reference, and verification](docs/development.md) |
+
 ## Quick start
 
 Requires Docker with Compose. The stack includes the three services, PostgreSQL,
@@ -64,7 +77,8 @@ A successful response reports the batch identity and per-point outcome:
 {"batch_id":"<generated-id>","accepted":2,"rejected":0}
 ```
 
-After the local aggregation window closes, query the result:
+After a local checkpoint (normally within a few seconds), query the result.
+Windows can be visible before they close and receive later corrections:
 
 ```sh
 curl -sS -H 'Authorization: Bearer fxg_local_local-dev-secret' \
@@ -528,7 +542,7 @@ services, and deferred tenant alerting.
 | `scripts/` | Packaged load/recovery verification, build-context checks, and image audits |
 | `api/openapi.yaml` | Public API contract |
 | `build/docker/`, `deploy/` | Shared service image, local Compose stack, dashboards, and Terraform |
-| `docs/` | Decision records and release security assessments |
+| `docs/` | User/client/operator guides, configuration and deployment references, decision records, capacity evidence, and security assessments |
 
 ## License
 

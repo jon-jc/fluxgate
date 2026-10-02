@@ -109,6 +109,16 @@ Its emulator limit was 4 GiB with a 3 GiB heap; the other settings were unchange
 Receive-pressure checkpoints can lower visibility delay at higher traffic, but
 one two-minute run is not a sustainable-throughput or latency guarantee.
 
+The [ten-minute 3,000/s soak](https://github.com/jon-jc/fluxgate/actions/runs/37057328328)
+accepted and reconciled **1,800,000 points** across the same 100,000 active series,
+with **zero missed submissions and zero HTTP rejections**. Achieved rate was
+2,999.8 points/s, visibility p95 16.926s (maximum 20.861s), drain 4.505s, and query
+p95 223.784ms. It reconciled 1,011,500 series/window rows; worker RSS peaks were
+108.89 and 106.08 MiB. Resources matched the hosted 10,000/s profile, including
+the 4 GiB emulator. All three hosted profiles passed the repository's CI
+qualification policy. Ten minutes exercises more window turnover, but still
+does not validate a full retention cycle, real GCP behavior, or a production SLO.
+
 A new local 20,000/s comparison attempt failed when Windows reported exhausted
 paging memory and all test containers stopped. Its unresolved requests and
 missing drain invalidate it as a throughput comparison. Heavy validation then

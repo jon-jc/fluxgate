@@ -1,5 +1,7 @@
 # Architecture decision records
 
+[Documentation index](../README.md) · [Current architecture and guarantees](../architecture.md)
+
 Each record captures one decision that was genuinely contested — where a
 competent engineer could reasonably have chosen otherwise — along with what it
 cost and what would make us revisit it.

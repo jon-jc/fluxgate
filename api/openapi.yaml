@@ -35,6 +35,13 @@ info:
     replayed rather than the batch being counted twice. Reusing a key with a
     different body is a 409, because replaying the first response would
     silently discard the second batch.
+
+    Retry identity is scoped to the authenticated tenant and fingerprints the
+    exact body bytes, including JSON whitespace/order. Reservations expire
+    after a configured TTL (24 hours by default, measured from initial
+    reservation). Staging/prod uses shared PostgreSQL reservations. After
+    expiry, reusing a key can create a new batch. A 202 confirms publication,
+    not immediate query visibility. See docs/api.md for client integration.
   license:
     name: MIT
     url: https://github.com/jon-jc/fluxgate/blob/main/LICENSE
@@ -44,6 +51,8 @@ servers:
     description: Ingest API (local development)
   - url: http://localhost:8082
     description: Query API (local development)
+  - url: http://localhost:8081
+    description: Aggregator operations endpoints only (local development)
 
 security:
   - bearerAuth: []
@@ -58,6 +67,9 @@ tags:
 
 paths:
   /v1/ingest:
+    servers:
+      - url: http://localhost:8080
+        description: Local ingest API; replace with the deployed ingest URL.
     post:
       tags: [Ingestion]
       operationId: ingestPoints
@@ -77,7 +89,9 @@ paths:
           description: |
             An opaque, client-chosen identifier for this batch. Repeating a
             request with the same key and the same body replays the original
-            response instead of processing the batch again.
+            response instead of processing the batch again. The default
+            lifetime is 24 hours from initial reservation. Preserve exact body
+            bytes across ambiguous failures; a new key can duplicate a publish.
           schema:
             type: string
             maxLength: 255
@@ -184,20 +198,32 @@ paths:
         '504':
           description: The request exceeded its processing deadline.
           $ref: '#/components/responses/Problem'
+        '500':
+          description: An internal failure; preserve retry identity for ambiguous writes.
+          $ref: '#/components/responses/Problem'
 
   /v1/query:
+    servers:
+      - url: http://localhost:8082
+        description: Local query API; replace with the deployed query URL.
     get:
       tags: [Query]
       operationId: queryRollups
       summary: Read a metric as time series.
       description: |
-        Returns one series per distinct label combination, each with one point
+        Returns one series per kind and distinct label combination, each with one point
         per window. Points within a series are ordered oldest first, and series
         are ordered stably, so a client diffing two responses does not see them
         shuffle.
 
         Results are always scoped to the tenant owning the credential. There is
         no parameter for selecting a tenant, by design.
+
+        The range is half-open [from, to) on window starts. Matching rows return
+        whole committed window totals, including partial windows and later
+        corrections. This is not filtering individual raw observations. Default
+        limits are 744 hours, 500 series and 50,000 points. Series/point limits
+        return truncated=true; an 8 MiB materialized-read budget returns 422.
       parameters:
         - name: metric
           in: query
@@ -256,8 +282,13 @@ paths:
         '504':
           description: The query exceeded its processing deadline.
           $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
 
   /v1/metrics:
+    servers:
+      - url: http://localhost:8082
+        description: Local query API; replace with the deployed query URL.
     get:
       tags: [Query]
       operationId: listMetrics
@@ -267,9 +298,13 @@ paths:
         for it: a UI that has to guess renders an empty chart on its first
         attempt, which reads as "the system is broken" rather than "you asked
         about the wrong hour".
+
+        Entries group by metric and kind over retained data. There is no
+        pagination or truncation indicator for this bounded discovery list.
       parameters:
         - name: limit
           in: query
+          description: Defaults to 500 for absent, malformed or nonpositive input; capped at 1000.
           schema:
             type: integer
             default: 500
@@ -290,8 +325,15 @@ paths:
         '503':
           description: Capacity exhausted; respect Retry-After before retrying.
           $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
 
   /v1/labels:
+    servers:
+      - url: http://localhost:8082
+        description: Local query API; replace with the deployed query URL.
     get:
       tags: [Query]
       operationId: listLabels
@@ -310,6 +352,12 @@ paths:
           in: query
           schema:
             type: string
+        - name: limit
+          in: query
+          description: Defaults to 500 for absent, malformed or nonpositive input; keys cap at 500 and values at 1000. No pagination or truncation indicator.
+          schema:
+            type: integer
+            default: 500
       responses:
         '200':
           description: Label keys, or one label's values.
@@ -337,8 +385,15 @@ paths:
           $ref: '#/components/responses/Problem'
         '422':
           $ref: '#/components/responses/Problem'
+        '500':
+          $ref: '#/components/responses/Problem'
+        '504':
+          $ref: '#/components/responses/Problem'
 
   /v1/stream:
+    servers:
+      - url: http://localhost:8082
+        description: Local query API; replace with the deployed query URL.
     get:
       tags: [Query]
       operationId: streamRollups
@@ -366,6 +421,12 @@ paths:
 
         The cursor advances on committed revision, not event time, so a late
         arrival updating a window that closed minutes ago still appears.
+
+        Events contain replacement totals, not additive deltas, and have no id
+        field. Last-Event-ID is not supported for replay. There is no history
+        on connect. Default connections last at most 30 minutes, poll every
+        2 seconds and send heartbeats every 20 seconds. The retry preamble is
+        twice the poll interval. Histogram buckets/percentiles are not streamed.
       parameters:
         - name: metric
           in: query
@@ -380,7 +441,7 @@ paths:
               schema:
                 type: string
               example: |
-                retry: 2000
+                retry: 4000
 
                 event: rollup
                 data: {"kind":"histogram","metric":"live.demo","labels":{},"window_start":"2026-09-04T01:36:30Z","window_end":"2026-09-04T01:36:40Z","count":3,"sum":600,"min":100,"max":300,"last":300}
@@ -395,6 +456,12 @@ paths:
           description: Capacity exhausted; respect Retry-After before retrying.
           $ref: '#/components/responses/Problem'
         '422':
+          $ref: '#/components/responses/Problem'
+        '500':
+          description: Failure before the stream starts; after headers, failures may appear as a disconnect or logged failed poll.
+          $ref: '#/components/responses/Problem'
+        '504':
+          description: Initial database operation exceeded its deadline before stream headers.
           $ref: '#/components/responses/Problem'
 
   /healthz:
@@ -619,7 +686,7 @@ components:
           type: string
           maxLength: 200
           pattern: '^[a-zA-Z_][a-zA-Z0-9_.\-]*$'
-          description: Dotted metric name. Must start with a letter or underscore.
+          description: Dotted metric name. Must start with a letter or underscore; trailing dots and doubled dots are rejected.
           example: http.request.duration_ms
         kind:
           type: string
@@ -630,8 +697,8 @@ components:
         value:
           type: number
           format: double
-          minimum: -1.0e100
-          maximum: 1.0e100
+          minimum: -1.0e+100
+          maximum: 1.0e+100
           description: |
             Required, finite, and at most 1e100 in absolute value. Null is rejected.
             NaN and the infinities are rejected: a single one
@@ -639,15 +706,15 @@ components:
             which point caused it.
           example: 12.5
         timestamp:
-          type: string
+          type: [string, 'null']
           format: date-time
           description: |
-            RFC 3339. Defaults to the arrival time when omitted. May be up to
+            RFC 3339. Defaults to the arrival time when omitted or null. May be up to
             5 minutes in the future to tolerate client clock drift, and up to
-            7 days in the past — older data arrives after its aggregation
-            window has closed.
+            7 days in the past by default. Accepted late observations can correct
+            an older window; window closure is not a finality guarantee.
         labels:
-          type: object
+          type: [object, 'null']
           maxProperties: 20
           additionalProperties:
             type: string
@@ -660,6 +727,9 @@ components:
             tightest limit in the API: cardinality is multiplicative, and an
             unbounded label set is the fastest way to make a time-series store
             unqueryable. Keys beginning `__` are reserved by the platform.
+            Omitted or null means an empty label set. Values are limited to
+            256 UTF-8 bytes (in addition to the schema character ceiling) and
+            must not contain control characters.
 
     IngestResponse:
       type: object
@@ -684,7 +754,7 @@ components:
             $ref: '#/components/schemas/FieldError'
         errors_truncated:
           type: boolean
-          description: True when `errors` lists fewer entries than `rejected`.
+          description: True when more than 100 field violations occurred. One rejected point can have several violations, so errors length need not equal rejected.
 
     FieldError:
       type: object
@@ -747,7 +817,8 @@ components:
           type: object
           additionalProperties:
             type: string
-          description: Per-dependency result; `ok` or the failure reason.
+            enum: [ok, unavailable]
+          description: Per-dependency result; details of failures are logged server-side, not exposed in this response.
 
     VersionInfo:
       type: object
