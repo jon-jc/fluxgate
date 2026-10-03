@@ -122,6 +122,11 @@ test("demo exploration, exact filters, exports, saved views, and share links wor
   await page.goto(link);
   await expect(page.locator("#filter-chips")).toContainText("us-east1");
   await expect(page.locator("#chart-title")).toHaveText("queue.depth");
+  await page.locator("#add-filter").click();
+  await page.locator("#filter-key").fill("service");
+  await page.getByRole("button", { name: "Apply filter" }).click();
+  await expect(page.locator("#chart-empty")).toContainText("No observations");
+  await expect(page.locator("#filter-chips")).toContainText("service =");
   expect(errors).toEqual([]);
 });
 

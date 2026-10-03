@@ -118,10 +118,14 @@ export function queryParams({
 export function normalizeResult(data) {
   if (
     !data ||
+    typeof data.metric !== "string" ||
+    !data.metric ||
+    data.metric.length > 200 ||
     !Array.isArray(data.series) ||
     data.series.length > 500 ||
     !Number.isFinite(Date.parse(data.from)) ||
-    !Number.isFinite(Date.parse(data.to))
+    !Number.isFinite(Date.parse(data.to)) ||
+    Date.parse(data.from) >= Date.parse(data.to)
   )
     throw new Error("The query API returned an invalid result.");
   let count = 0;

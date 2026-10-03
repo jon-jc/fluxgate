@@ -101,6 +101,8 @@ test("results are bounded and CSV escapes spreadsheet formulas", () => {
   assert(output.includes('"-2"'));
   assert(!output.includes("'-2"));
   assert.equal(result.pointCount, 1);
+  assert.throws(() => normalizeResult({ ...result, metric: null }));
+  assert.throws(() => normalizeResult({ ...result, to: result.from }));
   assert.throws(() =>
     normalizeResult({
       ...result,

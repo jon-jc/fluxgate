@@ -1738,3 +1738,9 @@ dialog .field input {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+:root[data-theme="light"] .series-path,
+:root[data-theme="light"] #chart circle,
+:root[data-theme="light"] .swatch {
+  filter: brightness(0.65) saturate(1.2);
+}

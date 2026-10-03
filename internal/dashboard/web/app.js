@@ -362,6 +362,14 @@ async function loadCatalog() {
   }
 }
 function syncControls() {
+  state.events = state.events.filter(
+    (event) =>
+      event.metric === state.settings.metric &&
+      Object.entries(state.settings.filters).every(
+        ([key, value]) => event.labels[key] === value,
+      ),
+  );
+  renderActivity();
   $("#metric").value = state.settings.metric;
   $("#aggregation").value = state.settings.aggregation;
   $$("[data-range]").forEach((button) =>
