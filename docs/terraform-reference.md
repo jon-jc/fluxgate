@@ -30,6 +30,7 @@ lock file for reproducible initialization. Example values are in
 | `aggregator_instances` | number | `2` | Fixed consumer count; minimum and maximum are equal |
 | `query_min_instances` | number | `0` | Query minimum; zero permits cold starts |
 | `query_max_instances` | number | `10` | Query scale ceiling |
+| `query_allowed_origins` | list(string) | `[]` | Up to 16 exact HTTPS origins for the hosted dashboard; tenant keys still required |
 | `database_tier` | string | `db-custom-2-7680` | Cloud SQL machine type |
 | `database_disk_gb` | number | `50` | Initial data disk size; autoresize ceiling is four times this value |
 | `database_availability_type` | string | `ZONAL` | `ZONAL` or `REGIONAL`; prod runtime requires regional |

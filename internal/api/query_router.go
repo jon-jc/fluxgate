@@ -7,6 +7,7 @@ import (
 
 	"github.com/jon-jc/fluxgate/internal/auth"
 	"github.com/jon-jc/fluxgate/internal/config"
+	"github.com/jon-jc/fluxgate/internal/dashboard"
 	"github.com/jon-jc/fluxgate/internal/httpx"
 	"github.com/jon-jc/fluxgate/internal/observability"
 )
@@ -35,6 +36,7 @@ func NewQueryRouter(deps QueryRouterDeps) http.Handler {
 	mux.Handle("GET "+PathLiveness, deps.Health.LivenessHandler())
 	mux.Handle("GET "+PathReadiness, deps.Health.ReadinessHandler())
 	mux.Handle("GET /v1/version", httpx.Handler(handleVersion))
+	mux.Handle("GET /dashboard/", dashboard.Handler())
 
 	mountMetrics(mux, deps.Config, deps.Metrics)
 
@@ -65,6 +67,7 @@ func NewQueryRouter(deps QueryRouterDeps) http.Handler {
 			SlowRequestThreshold: 5 * time.Second,
 		}),
 		httpx.SecurityHeaders,
+		queryCORS(deps.Config.Query.AllowedOrigins),
 		auth.WWWAuthenticate,
 		httpx.MaxBytes(deps.Config.HTTP.MaxRequestBytes),
 	)

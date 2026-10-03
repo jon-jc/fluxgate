@@ -140,6 +140,7 @@ func newQueryHarness(t *testing.T, opts ...func(*api2Config)) *queryHarness {
 		Config: config.Config{
 			Service:     "fluxgate-query-test",
 			Environment: config.EnvLocal,
+			Query:       config.QueryConfig{AllowedOrigins: cfg.origins},
 			HTTP: config.HTTPConfig{
 				HandlerTimeout:  5 * time.Second,
 				MaxRequestBytes: 1 << 20,
@@ -160,8 +161,44 @@ func newQueryHarness(t *testing.T, opts ...func(*api2Config)) *queryHarness {
 }
 
 type api2Config struct {
-	limits query.Limits
-	stream StreamOptions
+	limits  query.Limits
+	stream  StreamOptions
+	origins []string
+}
+
+func TestDashboardAndCORSKeepTenantAuthentication(t *testing.T) {
+	const origin = "https://fluxgate-docs.vercel.app"
+	h := newQueryHarness(t, func(c *api2Config) { c.origins = []string{origin} })
+	for _, path := range []string{"/dashboard/", "/dashboard/app.js", "/dashboard/core.js"} {
+		rec := httptest.NewRecorder()
+		h.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, http.NoBody))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Security-Policy"), "script-src 'self'") {
+			t.Fatalf("dashboard %s: status=%d policy=%s", path, rec.Code, rec.Header().Get("Content-Security-Policy"))
+		}
+	}
+	for _, method := range []string{http.MethodOptions, http.MethodGet} {
+		req := httptest.NewRequest(method, "/v1/metrics", http.NoBody)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "GET")
+		req.Header.Set("Access-Control-Request-Headers", "authorization")
+		rec := httptest.NewRecorder()
+		h.router.ServeHTTP(rec, req)
+		want := http.StatusUnauthorized
+		if method == http.MethodOptions {
+			want = http.StatusNoContent
+		}
+		if rec.Code != want || rec.Header().Get("Access-Control-Allow-Origin") != origin {
+			t.Fatalf("%s: status=%d headers=%v", method, rec.Code, rec.Header())
+		}
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/query?metric=queue.depth&agg=last&tenant_id=other", http.NoBody)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	rec := httptest.NewRecorder()
+	h.router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || h.reader.filter().TenantID != testTenant {
+		t.Fatalf("cross-origin read lost tenant isolation: status=%d filter=%+v", rec.Code, h.reader.filter())
+	}
 }
 
 func withQueryLimits(l query.Limits) func(*api2Config) {

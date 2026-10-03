@@ -12,6 +12,7 @@ Start with the guide for your task:
 | Task | Guide |
 | --- | --- |
 | Run the full pipeline and send your first points | [Getting started](getting-started.md) |
+| Explore metrics and live rollups in a browser | [Metrics dashboard](dashboard.md) · [Open workspace](https://fluxgate-docs.vercel.app/dashboard/) |
 | Integrate a producer, query client, or live dashboard | [API and client integration](api.md) · [OpenAPI](../api/openapi.yaml) |
 | Understand windows, retries, duplicates, and storage | [Architecture and data guarantees](architecture.md) |
 | Set environment variables and resource bounds | [Configuration reference](configuration.md) |

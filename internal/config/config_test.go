@@ -41,6 +41,22 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestQueryOriginsAreExplicitAndSecure(t *testing.T) {
+	for _, value := range []string{"*", "null", "https://*.example.com", "https://docs.example.com/path", "https://u:p@docs.example.com", "https://docs.example.com?token=x", "http://docs.example.com"} {
+		_, err := load(env(map[string]string{"ENVIRONMENT": "prod", "QUERY_ALLOWED_ORIGINS": value}), "query", Requirements{})
+		if err == nil || !strings.Contains(err.Error(), "QUERY_ALLOWED_ORIGINS") {
+			t.Fatalf("accepted unsafe origin %q: %v", value, err)
+		}
+	}
+	cfg, err := load(env(map[string]string{"ENVIRONMENT": "prod", "QUERY_ALLOWED_ORIGINS": " https://docs.example.com/,https://app.example.com "}), "query", Requirements{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Query.AllowedOrigins) != 2 || cfg.Query.AllowedOrigins[0] != "https://docs.example.com" {
+		t.Fatalf("origins: %v", cfg.Query.AllowedOrigins)
+	}
+}
+
 func TestProductionInfrastructureSafeguards(t *testing.T) {
 	for _, tc := range []struct{ key, value string }{
 		{"PUBSUB_EMULATOR_HOST", "localhost:8681"},

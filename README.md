@@ -21,6 +21,11 @@ gates. See [production deployment](#production-deployment) before serving live t
 
 ## Documentation
 
+**[Open the metrics dashboard](https://fluxgate-docs.vercel.app/dashboard/)** to
+explore the synthetic demo or connect your query API. For the local stack, use
+`http://localhost:8082/dashboard/`. Read the [dashboard guide](docs/dashboard.md)
+for filters, live updates, saved views, exports, and secure connection setup.
+
 Read the **[hosted documentation](https://fluxgate-docs.vercel.app)** for searchable
 guides and the **[API reference](https://fluxgate-docs.vercel.app/api-reference/)**
 with endpoint examples, response schemas, and OpenAPI downloads.

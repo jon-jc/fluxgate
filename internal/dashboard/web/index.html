@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Metrics workspace · Fluxgate</title>
+    <meta
+      name="description"
+      content="Explore Fluxgate metrics, inspect time-series data, and follow live rollup updates."
+    />
+    <meta name="theme-color" content="#111216" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./dashboard.css" />
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to metrics</a>
+    <aside class="rail">
+      <a
+        class="brand"
+        href="https://fluxgate-docs.vercel.app/"
+        aria-label="Fluxgate documentation"
+        ><svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M4 6h24v5H10v5h15v5H10v5H4V6Z" fill="currentColor" /></svg
+        ><span>fluxgate<span class="brand-dot">.</span></span></a
+      >
+      <button class="workspace-switch" id="workspace-switch">
+        <span class="workspace-icon">F</span
+        ><span
+          ><strong id="workspace-name">Demo workspace</strong
+          ><small id="workspace-description">Synthetic telemetry</small></span
+        ><span aria-hidden="true">⌄</span>
+      </button>
+      <div class="nav-caption">WORKSPACE</div>
+      <nav aria-label="Dashboard">
+        <button data-view="overview" aria-current="page">
+          <span aria-hidden="true">▦</span> Overview
+        </button>
+        <button data-view="explore">
+          <span aria-hidden="true">⌁</span> Metric explorer
+        </button>
+        <button data-view="activity">
+          <span aria-hidden="true">≋</span> Live activity
+          <span class="nav-dot" aria-hidden="true"></span>
+        </button>
+        <button data-view="saved">
+          <span aria-hidden="true">▱</span> Saved views
+          <span class="count" id="saved-count">0</span>
+        </button>
+      </nav>
+      <div class="rail-bottom">
+        <a href="https://fluxgate-docs.vercel.app/guides/dashboard/"
+          >Dashboard guide <span aria-hidden="true">↗</span></a
+        ><a href="https://fluxgate-docs.vercel.app/api-reference/"
+          >API reference <span aria-hidden="true">↗</span></a
+        >
+        <div class="connection-summary">
+          <span class="dot demo-dot"></span
+          ><span id="connection-summary">Demo · no server connected</span>
+        </div>
+      </div>
+    </aside>
+    <div class="shell">
+      <header class="topbar">
+        <div class="crumb">
+          Workspace <span>/</span> <strong id="breadcrumb">Overview</strong>
+        </div>
+        <div class="top-actions">
+          <button
+            id="command-button"
+            class="search-shortcut"
+            aria-label="Search metrics"
+          >
+            <span aria-hidden="true">⌕</span> Find a metric
+            <kbd>⌘ K</kbd></button
+          ><button
+            id="theme"
+            class="icon-button"
+            aria-label="Toggle light and dark theme"
+          >
+            ◐</button
+          ><button id="connect" class="button connect-button">
+            <span aria-hidden="true">⊕</span> Connect API
+          </button>
+        </div>
+      </header>
+      <main id="main" tabindex="-1">
+        <div class="demo-banner" id="demo-banner">
+          <span class="demo-pill">DEMO</span
+          ><span
+            >You’re exploring synthetic telemetry. Connect your query API to see
+            your own data.</span
+          ><button id="demo-connect">
+            Connect your data <span aria-hidden="true">→</span>
+          </button>
+        </div>
+        <div class="page-heading">
+          <div>
+            <div class="eyebrow">OBSERVABILITY / METRICS</div>
+            <h1 id="page-title">A pulse on your system.</h1>
+            <p id="page-description">
+              Explore every signal. Follow every change.
+            </p>
+          </div>
+          <div class="page-actions">
+            <span class="refresh-status" id="refresh-status" role="status"
+              >Loading workspace…</span
+            ><button class="button" id="refresh">
+              <span aria-hidden="true">↻</span> Refresh
+            </button>
+          </div>
+        </div>
+        <div id="global-notice" class="notice" role="status" hidden></div>
+        <section id="overview-section" aria-label="Metric overview">
+          <div class="stat-grid" id="stat-grid"></div>
+        </section>
+        <section id="explorer-section" aria-labelledby="explorer-title">
+          <div class="section-top">
+            <div>
+              <span class="section-mark" aria-hidden="true"></span>
+              <h2 id="explorer-title">Metric explorer</h2>
+              <span class="subtle" id="series-summary"></span>
+            </div>
+            <div class="section-actions">
+              <button class="button quiet" id="save-view">☆ Save view</button
+              ><button class="button quiet" id="export">↓ Export CSV</button
+              ><button class="button quiet" id="share">
+                ↗ Copy view link
+              </button>
+            </div>
+          </div>
+          <div class="explorer panel">
+            <form id="query-form">
+              <div class="query-controls">
+                <label class="field metric-field"
+                  >Metric<select
+                    id="metric"
+                    required
+                    aria-label="Metric"
+                  ></select></label
+                ><label class="field agg-field"
+                  >Aggregation<select id="aggregation" aria-label="Aggregation">
+                    <option>sum</option>
+                    <option>count</option>
+                    <option>avg</option>
+                    <option>min</option>
+                    <option>max</option>
+                    <option>last</option>
+                    <option>p50</option>
+                    <option>p90</option>
+                    <option selected>p95</option>
+                    <option>p99</option>
+                  </select></label
+                >
+                <div class="range-control">
+                  <span class="field-label">Time range</span>
+                  <div class="segmented" role="group" aria-label="Time range">
+                    <button type="button" data-range="15m">15m</button
+                    ><button type="button" data-range="1h" aria-pressed="true">
+                      1h</button
+                    ><button type="button" data-range="6h">6h</button
+                    ><button type="button" data-range="24h">24h</button
+                    ><button type="button" data-range="custom">Custom</button>
+                  </div>
+                </div>
+                <button class="button primary run-query" type="submit">
+                  Run query <span aria-hidden="true">→</span>
+                </button>
+              </div>
+              <div id="custom-range" class="custom-range" hidden>
+                <label class="field"
+                  >From (your local time)<input
+                    id="from"
+                    type="datetime-local" /></label
+                ><label class="field"
+                  >To (your local time)<input id="to" type="datetime-local"
+                /></label>
+              </div>
+            </form>
+            <div class="filter-row">
+              <span class="filter-label">FILTERS</span>
+              <div class="filter-chips" id="filter-chips"></div>
+              <button id="add-filter" class="add-filter">
+                + Add label filter
+              </button>
+              <div class="live-control">
+                <span class="dot" id="live-dot"></span
+                ><span id="stream-status">Live paused</span
+                ><button
+                  id="live-toggle"
+                  role="switch"
+                  aria-checked="false"
+                  aria-label="Live updates"
+                >
+                  <span></span>
+                </button>
+              </div>
+            </div>
+            <div class="chart-heading">
+              <div>
+                <span class="kind-badge" id="metric-kind">histogram</span>
+                <h3 id="chart-title">http.request.duration_ms</h3>
+                <span class="subtle" id="chart-description"
+                  >Committed window values</span
+                >
+              </div>
+              <div class="chart-value">
+                <strong id="selected-value">—</strong
+                ><span id="selected-value-label"
+                  >Latest value · first visible series</span
+                >
+              </div>
+            </div>
+            <div
+              id="query-notice"
+              class="notice inline-notice"
+              role="status"
+              hidden
+            ></div>
+            <div class="chart-wrap" id="chart-wrap">
+              <svg
+                id="chart"
+                viewBox="0 0 1000 300"
+                role="img"
+                aria-label="Metric time series"
+              ></svg>
+              <div id="chart-tooltip" class="chart-tooltip" hidden></div>
+              <div id="chart-empty" class="chart-empty" hidden></div>
+            </div>
+            <div
+              class="legend"
+              id="legend"
+              aria-label="Visible chart series"
+            ></div>
+            <div class="chart-footer">
+              <span id="chart-footnote"
+                >Window totals can change as late observations arrive.</span
+              ><span id="query-duration"></span>
+            </div>
+          </div>
+          <div class="data-section">
+            <div class="section-top">
+              <h2>
+                Series &amp; observations
+                <span class="count" id="series-count">0</span>
+              </h2>
+              <div class="section-actions">
+                <label class="sr-only" for="series-search"
+                  >Filter returned series</label
+                ><input
+                  id="series-search"
+                  class="search-input"
+                  placeholder="Filter returned series…"
+                />
+                <div class="segmented" role="group" aria-label="Data display">
+                  <button id="show-series" aria-pressed="true">Series</button
+                  ><button id="show-points" aria-pressed="false">
+                    Data points
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div
+              class="panel table-scroll"
+              tabindex="0"
+              role="region"
+              aria-label="Query data"
+            >
+              <table>
+                <thead id="data-head"></thead>
+                <tbody id="data-body"></tbody>
+              </table>
+            </div>
+            <div class="table-footer">
+              <span id="table-summary"></span>
+              <div>
+                <button id="previous" class="button quiet">← Previous</button
+                ><button id="next" class="button quiet">Next →</button>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section id="catalog-section">
+          <div class="section-top">
+            <h2>
+              Metric catalog <span class="count" id="catalog-count">0</span>
+            </h2>
+            <span class="subtle">Available in this workspace</span>
+          </div>
+          <div id="catalog" class="catalog-grid"></div>
+          <p class="catalog-note" id="catalog-note">
+            Discovery reflects retained data, not process health.
+          </p>
+        </section>
+        <section id="activity-section" hidden>
+          <div class="panel activity-panel">
+            <div class="section-top">
+              <div>
+                <h2>Rollup activity</h2>
+                <span class="subtle">Latest 50 events · selected metric</span>
+              </div>
+              <div>
+                <span id="activity-status" class="subtle" role="status"
+                  >Live paused</span
+                ><button id="activity-toggle" class="button">Resume live</button
+                ><button id="activity-clear" class="button quiet">
+                  Clear feed
+                </button>
+              </div>
+            </div>
+            <p class="activity-note">
+              Live events replace window totals. Charts reconcile through REST
+              after updates and reconnects. No historical events are replayed.
+            </p>
+            <div id="activity-feed" class="activity-feed"></div>
+          </div>
+        </section>
+        <section id="saved-section" hidden>
+          <div class="section-top">
+            <h2>Your saved views</h2>
+            <span class="subtle"
+              >Stored on this browser · query settings only</span
+            >
+          </div>
+          <div id="saved-views" class="saved-grid"></div>
+        </section>
+        <footer>
+          <span
+            ><span class="footer-logo">F</span> Fluxgate metrics workspace</span
+          ><span id="footer-mode">Synthetic demo data</span
+          ><a href="https://github.com/jon-jc/fluxgate"
+            >Open source <span aria-hidden="true">↗</span></a
+          >
+        </footer>
+      </main>
+    </div>
+    <dialog id="connection-dialog" aria-labelledby="connection-title">
+      <form id="connection-form">
+        <div class="dialog-header">
+          <span class="eyebrow">YOUR DATA, YOUR WORKSPACE</span
+          ><button
+            type="button"
+            class="icon-button close-dialog"
+            aria-label="Close connection dialog"
+          >
+            ×
+          </button>
+        </div>
+        <h2 id="connection-title">Connect to Fluxgate</h2>
+        <p>
+          Connect directly to a query API using your tenant’s key. The key stays
+          in memory for this tab and is cleared on disconnect or reload.
+        </p>
+        <label class="field"
+          >Query API URL<input
+            id="api-url"
+            type="url"
+            placeholder="https://your-query-api.example.com"
+            required
+            autocomplete="off" /></label
+        ><label class="field"
+          >Tenant API key<input
+            id="api-key"
+            type="password"
+            placeholder="fxg_key-id_secret"
+            required
+            autocomplete="off"
+            spellcheck="false"
+        /></label>
+        <div class="connection-help">
+          Running locally? Open
+          <a href="http://localhost:8082/dashboard/"
+            >localhost:8082/dashboard/</a
+          >
+          to connect on the same origin. For a remote API, enable this site’s
+          origin in <code>QUERY_ALLOWED_ORIGINS</code>.
+          <a href="https://fluxgate-docs.vercel.app/guides/dashboard/"
+            >Connection guide ↗</a
+          >
+        </div>
+        <p id="connection-error" class="error-text" role="alert"></p>
+        <div class="dialog-actions">
+          <button id="use-demo" type="button" class="button">
+            Use demo / disconnect</button
+          ><button class="button primary" id="connection-submit" type="submit">
+            Connect workspace →
+          </button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="filter-dialog" aria-labelledby="filter-title">
+      <form id="filter-form">
+        <div class="dialog-header">
+          <span class="eyebrow">NARROW YOUR QUERY</span
+          ><button
+            type="button"
+            class="icon-button close-dialog"
+            aria-label="Close filter dialog"
+          >
+            ×
+          </button>
+        </div>
+        <h2 id="filter-title">Add a label filter</h2>
+        <p>
+          Filters match exact values. Multiple filters must all match a series.
+        </p>
+        <label class="field"
+          >Label key<input
+            id="filter-key"
+            list="label-keys"
+            required
+            maxlength="64"
+            placeholder="region" /></label
+        ><datalist id="label-keys"></datalist
+        ><label class="field"
+          >Value<input
+            id="filter-value"
+            list="label-values"
+            maxlength="256"
+            placeholder="us-central1" /></label
+        ><datalist id="label-values"></datalist>
+        <p id="filter-error" role="alert" class="error-text"></p>
+        <div class="dialog-actions">
+          <button type="submit" class="button primary">Apply filter →</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="save-dialog" aria-labelledby="save-title">
+      <form id="save-form">
+        <div class="dialog-header">
+          <span class="eyebrow">PICK UP WHERE YOU LEFT OFF</span
+          ><button
+            type="button"
+            class="icon-button close-dialog"
+            aria-label="Close save dialog"
+          >
+            ×
+          </button>
+        </div>
+        <h2 id="save-title">Save this view</h2>
+        <p>
+          Save the metric, aggregation, range, and filters. Credentials and
+          query results are never saved.
+        </p>
+        <label class="field"
+          >View name<input
+            id="view-name"
+            maxlength="80"
+            required
+            placeholder="Checkout latency by region"
+        /></label>
+        <div class="dialog-actions">
+          <button class="button primary" type="submit">Save view</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="command-dialog" aria-label="Find a metric">
+      <div class="command-top">
+        <label class="sr-only" for="command-search">Find a metric</label
+        ><input
+          id="command-search"
+          placeholder="Find a metric…"
+          autocomplete="off"
+        /><button
+          class="icon-button close-dialog"
+          aria-label="Close metric search"
+        >
+          ×
+        </button>
+      </div>
+      <div id="command-results"></div>
+      <div class="command-footer">Enter to explore · Esc to close</div>
+    </dialog>
+    <div id="toast" role="status" class="toast"></div>
+    <noscript
+      ><div class="noscript">
+        Enable JavaScript to use the dashboard, or read the
+        <a href="https://fluxgate-docs.vercel.app/">API documentation</a>.
+      </div></noscript
+    >
+  </body>
+</html>

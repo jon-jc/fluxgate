@@ -276,6 +276,10 @@ def main():
             ready(name)
         ingest_urls = [base_url(name) + "/v1/ingest" for name in (first, second)]
         query_url = base_url(reader) + "/v1/query?from=-1h&agg=sum&metric="
+        dashboard_code, dashboard_html, dashboard_headers = request(base_url(reader) + "/dashboard/", key=None, raw=True)
+        require(dashboard_code == 200 and 'id="query-form"' in dashboard_html, "query image is missing the embedded dashboard")
+        require("script-src 'self'" in dashboard_headers.get("Content-Security-Policy", ""), "dashboard security policy is missing")
+        require(request(base_url(reader) + "/dashboard/app.js", key=None, raw=True)[0] == 200, "embedded dashboard module is missing")
         require(request(query_url + "verify.load", key=None)[0] == 401, "unauthenticated query accepted")
         require(request(ingest_urls[0], {"points": []}, key=None)[0] == 401, "unauthenticated ingest accepted")
         old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=2)).isoformat()

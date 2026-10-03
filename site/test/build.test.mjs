@@ -78,7 +78,13 @@ for (const [route, { $ }] of documents) {
           `Broken anchor ${route}: ${href}`,
         );
     } else {
-      await readFile(path.join(out, target.pathname));
+      await readFile(
+        path.join(
+          out,
+          target.pathname,
+          target.pathname.endsWith("/") ? "index.html" : "",
+        ),
+      );
     }
     links++;
   }

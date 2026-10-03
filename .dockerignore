@@ -5,4 +5,10 @@
 !cmd/**/*.go
 !internal/**/*.go
 !internal/store/migrations/*.sql
+!internal/dashboard/web/index.html
+!internal/dashboard/web/app.js
+!internal/dashboard/web/core.js
+!internal/dashboard/web/demo.js
+!internal/dashboard/web/dashboard.css
+!internal/dashboard/web/favicon.svg
 !build/docker/Dockerfile

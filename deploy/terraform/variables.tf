@@ -114,6 +114,19 @@ variable "query_max_instances" {
   default     = 10
 }
 
+variable "query_allowed_origins" {
+  description = "Exact HTTPS dashboard origins permitted to read the query API. Empty disables cross-origin browser reads. Tenant authentication still applies."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = length(var.query_allowed_origins) <= 16 && alltrue([
+      for origin in var.query_allowed_origins : can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$", origin))
+    ])
+    error_message = "Use at most 16 exact HTTPS origins, without trailing slashes, paths, credentials, or wildcards."
+  }
+}
+
 # --- database ----------------------------------------------------------------
 
 variable "database_tier" {
