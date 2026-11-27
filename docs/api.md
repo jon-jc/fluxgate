@@ -225,7 +225,10 @@ uses `text/event-stream`, starts with `retry: 4000` at the default 2-second poll
 interval (Compose uses `retry: 2000`), and emits:
 
 ```text
+id: eyJ2IjoxLCJ0IjoiODVhYjU0N2JlYWQ2NmE4YSIsInIiOjQxfQ
+
 event: rollup
+id: <opaque position after this change>
 data: {"kind":"gauge","metric":"queue.depth","labels":{"service":"checkout"},"window_start":"2026-10-02T12:01:00Z","window_end":"2026-10-02T12:02:00Z","count":2,"sum":84,"min":42,"max":42,"last":42}
 
 : keep-alive
@@ -237,25 +240,46 @@ previous value would double-count. Streams omit histogram bucket vectors and
 percentiles. Use `/v1/query` for percentile reads.
 
 Changes follow per-tenant committed revision order, including corrections to old
-windows. Updates between polls may coalesce. The cursor is internal: events have
-no `id`, `Last-Event-ID` is not a replay mechanism, and a new connection starts at
-the current revision. Reconnect with backoff and periodically reconcile visible
-windows through `/v1/query`. This is a live dashboard feed, not a durable change
-log or an exactly-once event subscription.
+windows. Updates between polls may coalesce. A new connection without
+`Last-Event-ID` starts at the latest revision, so fetch history through
+`/v1/query` first.
+
+**Resuming.** Every frame that moves a client's position carries an `id`: each
+rollup event, each reset, and an id-only frame immediately after the `retry`
+preamble — so even a stream that ends before anything changes leaves a position
+to resume from. Reconnect with the most recent id in `Last-Event-ID` and the
+stream continues with the next change after it: nothing skipped, nothing
+repeated. A series/window that changed again while the client was away arrives
+once, with its current total. Ids are opaque, tenant-bound positions of at most
+512 characters; a value the server could not have issued returns `400`.
+
+**Resets.** If a position cannot be honoured, the first event is `reset` with
+`{"reason": ..., "revision": ...}` data, and the stream carries on live from the
+latest revision. Refetch the visible range through `/v1/query`. The reasons are
+`stale_cursor` (more than `QUERY_STREAM_RESUME_REVISIONS` tenant commits behind,
+10,000 by default), `future_cursor` (ahead of every commit, as after a database
+restore), `foreign_cursor` (issued for another tenant), and `lagging` (a
+connected stream still too far behind after reading its backlog). This is a
+resumable dashboard feed, not a durable change log or an exactly-once event
+subscription: history beyond retention or the resume horizon is reconciled
+through REST.
 
 Default limits per query instance: 100 streams total, 8 per tenant, 30 minutes per
 connection, a heartbeat every 20 seconds, 5-second database polls, and 10-second
-write deadlines. Each poll reads at most 500 rows under a 256 KiB page budget.
+write deadlines. Each read returns at most 500 rows under a 256 KiB page budget;
+while pages come back full, one poll reads up to 20 back to back, so a stream that
+is behind catches up instead of draining one page per interval.
 Tenant capacity returns `429`; instance capacity returns `503`; both supply
 `Retry-After: 5`. Failed database polls are logged and retried on the open stream;
 heartbeats alone do not prove fresh data. After headers are sent, disconnects
 cannot be represented as a fresh JSON error response.
 
 Browser-native `EventSource` cannot attach an arbitrary bearer header. Use a
-fetch-based SSE client or an authenticated backend proxy. Fluxgate does not
-provide cookie sessions, query-string credentials, or a built-in CORS policy;
-keep API keys out of URLs and deploy browser access through an appropriate
-same-origin backend/gateway.
+fetch-based SSE client that tracks `id` and sends `Last-Event-ID` itself — the
+bundled dashboard does — or an authenticated backend proxy. Cross-origin browser
+reads require the origin in `QUERY_ALLOWED_ORIGINS`; its preflight admits
+`Last-Event-ID` on the stream route only. Fluxgate does not provide cookie
+sessions or query-string credentials; keep API keys out of URLs.
 
 ## Errors and response handling
 

@@ -33,17 +33,30 @@ func queryCORS(origins []string) func(http.Handler) http.Handler {
 					w.WriteHeader(http.StatusForbidden)
 					return
 				}
+				// Last-Event-ID is not CORS-safelisted, so a browser resuming a
+				// stream from another origin preflights it. It means something
+				// only on the stream, so it is allowed only there.
+				stream := r.URL.Path == PathStream
 				for _, header := range strings.Split(r.Header.Get("Access-Control-Request-Headers"), ",") {
 					switch strings.ToLower(strings.TrimSpace(header)) {
 					case "", "authorization", "accept":
+					case "last-event-id":
+						if !stream {
+							w.WriteHeader(http.StatusForbidden)
+							return
+						}
 					default:
 						w.WriteHeader(http.StatusForbidden)
 						return
 					}
 				}
+				allowHeaders := "Authorization, Accept"
+				if stream {
+					allowHeaders += ", Last-Event-ID"
+				}
 				w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
 				w.Header().Set("Access-Control-Allow-Methods", "GET")
-				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Accept")
+				w.Header().Set("Access-Control-Allow-Headers", allowHeaders)
 				w.Header().Set("Access-Control-Max-Age", "600")
 				w.WriteHeader(http.StatusNoContent)
 				return

@@ -185,7 +185,8 @@ not a replacement for application admission or the container hard limit.
 | `QUERY_STREAM_MAX_PER_TENANT` | `8` | Positive per-tenant streams; effective limit capped by instance total |
 | `QUERY_STREAM_POLL_INTERVAL` | `2s` | Positive update-poll cadence |
 | `QUERY_STREAM_HEARTBEAT` | `20s` | Positive idle comment cadence, shorter than stream duration |
-| `QUERY_STREAM_MAX_DURATION` | `30m` | Positive connection lifetime; clients reconnect and reconcile |
+| `QUERY_STREAM_MAX_DURATION` | `30m` | Positive connection lifetime; clients reconnect with `Last-Event-ID` and resume |
+| `QUERY_STREAM_RESUME_REVISIONS` | `10000` | Positive count of tenant commits a resume may span; beyond it, a `reset` event |
 
 Fixed implementation bounds include 8 MiB per materialized query read, 256 KiB
 per live-update page, 500 rows per live poll, 5s per stream database operation,

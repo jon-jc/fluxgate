@@ -23,7 +23,7 @@ import (
 // be tested without a database.
 type Reader interface {
 	Query(ctx context.Context, f store.QueryFilter) ([]store.StoredRollup, error)
-	Changed(ctx context.Context, tenantID, metric string, cursor store.Cursor, limit int) ([]store.StoredRollup, store.Cursor, error)
+	ChangedPage(ctx context.Context, tenantID, metric string, cursor store.Cursor, limit int) (store.ChangePage, error)
 	NewestRevision(ctx context.Context, tenantID string) (int64, error)
 	Metrics(ctx context.Context, tenantID string, limit int) ([]store.MetricSummary, error)
 	LabelKeys(ctx context.Context, tenantID, metric string, limit int) ([]string, error)
@@ -64,6 +64,16 @@ type StreamOptions struct {
 	// MaxDuration bounds a single connection, so a forgotten browser tab does
 	// not hold a database poller open indefinitely.
 	MaxDuration time.Duration
+	// MaxResumeRevisions is how many tenant commits a resumed stream may span.
+	// A Last-Event-ID further behind than this, or a stream that falls this far
+	// behind while connected, gets a reset event instead of a replay: past
+	// some point a client is better served by one REST query than by a
+	// trickle of history.
+	MaxResumeRevisions int64
+	// MaxCatchUpPages bounds how many full pages one poll reads back to back
+	// before yielding, so a stream that is behind catches up quickly without
+	// monopolising the database pool.
+	MaxCatchUpPages int
 }
 
 func (o *StreamOptions) applyDefaults() {
@@ -89,7 +99,30 @@ func (o *StreamOptions) applyDefaults() {
 	if o.MaxDuration <= 0 {
 		o.MaxDuration = 30 * time.Minute
 	}
+	if o.MaxResumeRevisions <= 0 {
+		o.MaxResumeRevisions = 10_000
+	}
+	if o.MaxCatchUpPages <= 0 {
+		o.MaxCatchUpPages = 20
+	}
 }
+
+// HeaderLastEventID is sent by a reconnecting SSE client with the id of the
+// last event it received.
+const HeaderLastEventID = "Last-Event-ID"
+
+// streamPageRows is the row bound of one live-tail read.
+const streamPageRows = 500
+
+// Reasons carried by a reset event. Each means the stream cannot account for
+// every change since the client's position, so the client should refetch the
+// range it displays; the stream itself carries on from the latest revision.
+const (
+	resetStale   = "stale_cursor"   // further behind than MaxResumeRevisions
+	resetFuture  = "future_cursor"  // ahead of every commit, e.g. after a restore
+	resetForeign = "foreign_cursor" // issued for another tenant
+	resetLagging = "lagging"        // fell too far behind while connected
+)
 
 // labelParamPrefix marks a query parameter as a label filter, so label names
 // can never collide with the API's own parameters. A metric labelled "agg"
@@ -257,6 +290,23 @@ func handleStream(deps QueryDeps) httpx.Handler {
 			}
 		}
 
+		// Validated before admission: a malformed cursor is a client bug and
+		// should not cost a stream slot to report.
+		var resume *store.Cursor
+		foreign := false
+		if token := r.Header.Get(HeaderLastEventID); token != "" {
+			cursor, err := store.ParseCursorToken(principal.TenantID, token)
+			switch {
+			case errors.Is(err, store.ErrCursorForeign):
+				foreign = true
+			case err != nil:
+				return httpx.BadRequest("Last-Event-ID is not a position issued by this stream. " +
+					"Reconnect without it to start from the latest revision.")
+			default:
+				resume = &cursor
+			}
+		}
+
 		admission.Lock()
 		if perTenant[principal.TenantID] >= opts.MaxPerTenant {
 			admission.Unlock()
@@ -310,22 +360,59 @@ func handleStream(deps QueryDeps) httpx.Handler {
 		); err != nil {
 			return nil
 		}
+
+		// Either confirm the starting position or say why the client's own
+		// cannot be honoured. The id-only frame updates the client's
+		// Last-Event-ID without dispatching an event, so a stream that ends
+		// before anything changes still resumes from here rather than from
+		// whatever the latest revision is by the time it reconnects.
+		start, reason := resumeFrom(seed, resume, foreign, opts.MaxResumeRevisions)
+		var preambleErr error
+		if reason != "" {
+			preambleErr = writeReset(w, principal.TenantID, start, reason)
+		} else {
+			// The id is re-encoded by Token, never the client's header echoed
+			// back, and its base64url alphabet cannot end an SSE field (see
+			// TestCursorTokensCannotBreakAnEventStreamFrame).
+			_, preambleErr = fmt.Fprintf(w, "id: %s\n\n", start.Token(principal.TenantID)) //nolint:gosec // G705: base64url token in text/event-stream
+		}
+		if preambleErr != nil {
+			return nil
+		}
 		flusher.Flush()
 
 		ctx, cancel := context.WithTimeout(r.Context(), opts.MaxDuration)
 		defer cancel()
 
-		return streamRollups(ctx, w, flusher, deps, opts, principal.TenantID, metric, seed)
+		return streamRollups(ctx, w, flusher, deps, opts, principal.TenantID, metric, start)
 	}
+}
+
+// resumeFrom decides where a stream starts. A client position is honoured when
+// it is within reach; otherwise the stream starts at the latest revision and
+// the returned reason is sent as a reset event.
+func resumeFrom(newest int64, resume *store.Cursor, foreign bool, maxLag int64) (start store.Cursor, reason string) {
+	latest := store.Cursor{Revision: newest}
+	switch {
+	case foreign:
+		return latest, resetForeign
+	case resume == nil:
+		return latest, ""
+	case resume.Revision > newest:
+		// Without this check the stream would wait, silently, for a revision
+		// this database may never reach -- the situation after a restore to
+		// an earlier point.
+		return latest, resetFuture
+	case newest-resume.Revision > maxLag:
+		return latest, resetStale
+	}
+	return *resume, ""
 }
 
 func streamRollups(
 	ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
-	deps QueryDeps, opts StreamOptions, tenantID, metric string, seed int64,
+	deps QueryDeps, opts StreamOptions, tenantID, metric string, cursor store.Cursor,
 ) error {
-	log := observability.LoggerFromContext(ctx)
-
-	cursor := store.Cursor{Revision: seed}
 
 	poll := time.NewTicker(opts.PollInterval)
 	defer poll.Stop()
@@ -352,37 +439,86 @@ func streamRollups(
 			flusher.Flush()
 
 		case <-poll.C:
-			pollCtx, pollCancel := context.WithTimeout(ctx, opts.QueryTimeout)
-			changed, next, err := deps.Reader.Changed(pollCtx, tenantID, metric, cursor, 500)
-			pollCancel()
-			if err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
-				// The stream is long-lived; one failed poll should not end it.
-				log.Warn("stream poll failed", slog.Any("error", err))
-				continue
+			next, open := catchUp(ctx, w, flusher, deps, opts, tenantID, metric, cursor)
+			if !open {
+				return nil
 			}
 			cursor = next
+		}
+	}
+}
 
-			if len(changed) > 0 {
-				if err := streamWriteDeadline(w, opts.WriteTimeout); err != nil {
-					return nil
-				}
+// catchUp sends every change since cursor, reading up to MaxCatchUpPages full
+// pages back to back, and reports where it stopped and whether the stream is
+// still open.
+//
+// One page per poll interval capped a stream at 250 rows a second by default,
+// below what a busy tenant writes: such a stream fell further behind on every
+// tick until its connection expired, and the client, reconnecting at the
+// latest revision, never learned what it had missed. Reading on while pages
+// come back full keeps up, and a stream still too far behind after a full
+// burst says so with a reset event rather than lagging silently.
+func catchUp(
+	ctx context.Context, w http.ResponseWriter, flusher http.Flusher,
+	deps QueryDeps, opts StreamOptions, tenantID, metric string, cursor store.Cursor,
+) (store.Cursor, bool) {
+	log := observability.LoggerFromContext(ctx)
+	for pages := 1; ; pages++ {
+		pollCtx, pollCancel := context.WithTimeout(ctx, opts.QueryTimeout)
+		page, err := deps.Reader.ChangedPage(pollCtx, tenantID, metric, cursor, streamPageRows)
+		pollCancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return cursor, false
 			}
-			for i := range changed {
-				if err := writeEvent(w, &changed[i]); err != nil {
+			// The stream is long-lived; one failed poll should not end it.
+			log.Warn("stream poll failed", slog.Any("error", err))
+			return cursor, true
+		}
+		cursor = page.Next
+
+		if len(page.Rows) > 0 {
+			if err = streamWriteDeadline(w, opts.WriteTimeout); err != nil {
+				return cursor, false
+			}
+			for i := range page.Rows {
+				if err = writeEvent(w, tenantID, &page.Rows[i]); err != nil {
 					// A write failure on a stream means the client
 					// disconnected, which is how every stream ends. Reporting
 					// it as an error would fill the logs with the ordinary.
 					log.Debug("stream client disconnected", slog.Any("error", err))
-					return nil //nolint:nilerr // disconnection is the normal exit
+					return cursor, false
 				}
 			}
-			if len(changed) > 0 {
-				flusher.Flush()
-			}
+			flusher.Flush()
 		}
+
+		if !page.More {
+			return cursor, true
+		}
+		if pages < opts.MaxCatchUpPages {
+			continue
+		}
+
+		// A full burst and still more: find out how far behind this is.
+		lagCtx, lagCancel := context.WithTimeout(ctx, opts.QueryTimeout)
+		newest, err := deps.Reader.NewestRevision(lagCtx, tenantID)
+		lagCancel()
+		if err != nil || newest-cursor.Revision <= opts.MaxResumeRevisions {
+			// Within reach, or unknown: carry on from here at the next tick.
+			return cursor, ctx.Err() == nil
+		}
+		latest := store.Cursor{Revision: newest}
+		if err := streamWriteDeadline(w, opts.WriteTimeout); err != nil {
+			return cursor, false
+		}
+		if err := writeReset(w, tenantID, latest, resetLagging); err != nil {
+			return cursor, false
+		}
+		flusher.Flush()
+		log.Info("stream reset after falling behind",
+			slog.Int64("revision", cursor.Revision), slog.Int64("newest", newest))
+		return latest, true
 	}
 }
 
@@ -396,7 +532,21 @@ func streamWriteDeadline(w http.ResponseWriter, timeout time.Duration) error {
 	return err
 }
 
-func writeEvent(w http.ResponseWriter, r *store.StoredRollup) error {
+// writeReset tells the client its position cannot be honoured and the stream
+// continues from latest. The id moves the client's Last-Event-ID there too, so
+// a reconnect after the reset does not repeat it.
+func writeReset(w http.ResponseWriter, tenantID string, latest store.Cursor, reason string) error {
+	payload, err := json.Marshal(map[string]any{"reason": reason, "revision": latest.Revision})
+	if err != nil {
+		return fmt.Errorf("encode reset event: %w", err)
+	}
+	_, err = fmt.Fprintf(w, "event: reset\nid: %s\ndata: %s\n\n", latest.Token(tenantID), payload) //nolint:gosec // G705: base64url token and JSON in text/event-stream
+	return err
+}
+
+// writeEvent sends one rollup. Its id is the position immediately after the
+// row, so a client that reconnects with it resumes with the next change.
+func writeEvent(w http.ResponseWriter, tenantID string, r *store.StoredRollup) error {
 	payload, err := json.Marshal(streamEvent{
 		Kind:        r.Kind,
 		Metric:      r.Metric,
@@ -416,7 +566,8 @@ func writeEvent(w http.ResponseWriter, r *store.StoredRollup) error {
 		return fmt.Errorf("encode stream event: %w", err)
 	}
 
-	_, err = fmt.Fprintf(w, "event: rollup\ndata: %s\n\n", payload)
+	id := store.Cursor{}.After(*r, r.Revision).Token(tenantID)
+	_, err = fmt.Fprintf(w, "event: rollup\nid: %s\ndata: %s\n\n", id, payload)
 	return err
 }
 

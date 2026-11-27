@@ -356,6 +356,9 @@ type StoredRollup struct {
 	Last        float64
 	LastEventAt time.Time
 	Buckets     []int64
+	// Revision is the tenant commit revision that last wrote the row. Only the
+	// live tail reads it; other reads leave it zero.
+	Revision int64
 }
 
 // Mean returns the arithmetic mean over the window.

@@ -60,6 +60,9 @@ const state = {
 let queryController,
   catalogController,
   streamController,
+  // The position of the last live frame received. Reconnects inside one live
+  // session resume from it; a fresh start clears it.
+  streamCursor = "",
   queryVersion = 0,
   liveTimer,
   refreshTimer,
@@ -1024,6 +1027,7 @@ function startLive() {
   }
   if (document.hidden) return;
   state.live = true;
+  streamCursor = "";
   liveStatus(
     state.mode === "demo" ? "Demo live" : "Connecting…",
     state.mode === "demo",
@@ -1076,6 +1080,7 @@ async function streamLoop(attempt = 0) {
         headers: {
           Authorization: `Bearer ${client.token}`,
           Accept: "text/event-stream",
+          ...(streamCursor ? { "Last-Event-ID": streamCursor } : {}),
         },
         credentials: "omit",
         redirect: "error",
@@ -1137,12 +1142,19 @@ async function streamLoop(attempt = 0) {
     }
     liveStatus("Live connected", true);
     attempt = 0;
-    scheduleReconcile();
+    // A resumed stream delivers everything since its position, so only a
+    // fresh one needs the REST view reconciled. A reset says the server could
+    // not honour the position, and asks for exactly that.
+    if (!streamCursor) scheduleReconcile();
     const reader = response.body.getReader(),
       decoder = new TextDecoder(),
-      parser = new SSEParser(addEvent, (value) => {
-        retry = value;
-      });
+      parser = new SSEParser(
+        addEvent,
+        (value) => {
+          retry = value;
+        },
+        () => scheduleReconcile(),
+      );
     try {
       while (state.live && session === state.session) {
         const { done, value } = await reader.read();
@@ -1156,6 +1168,7 @@ async function streamLoop(attempt = 0) {
           break;
         heartbeat();
         parser.push(decoder.decode(value, { stream: true }));
+        if (parser.lastEventId) streamCursor = parser.lastEventId;
       }
     } finally {
       await reader.cancel().catch(() => {});
@@ -1171,7 +1184,9 @@ async function streamLoop(attempt = 0) {
     streamController === controller
   ) {
     liveStatus("Reconnecting…");
-    scheduleReconcile();
+    // With a position the reconnect resumes and loses nothing; without one,
+    // the view may already be missing updates.
+    if (!streamCursor) scheduleReconcile();
     liveTimer = setTimeout(
       () => streamLoop(attempt + 1),
       Math.max(retry, Math.min(30000, 1000 * 2 ** Math.min(attempt, 5))) +
