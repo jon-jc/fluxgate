@@ -453,7 +453,8 @@ logs with HTTP and broker work.
 
 Public HTTP trace parents are linked to a fresh locally sampled trace; arbitrary
 baggage is discarded. Trusted gateways can opt into parent continuation.
-Internal Pub/Sub propagation preserves the edge's sampling decision. Span data
+Internal Pub/Sub propagation carries W3C trace context only and preserves the
+edge's sampling decision; consumers do not parse baggage from messages. Span data
 and export queues are bounded; collector failures are handled without making
 export success a request-path dependency.
 
