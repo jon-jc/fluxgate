@@ -191,7 +191,8 @@ paths:
           $ref: '#/components/responses/RateLimited'
         '503':
           description: |
-            Capacity or a dependency prevented confirmation. Publication may
+            Capacity or a dependency -- the broker, the retry store, or the
+            shared rate-limit store -- prevented confirmation. Publication may
             already have happened. Retry with the same `Idempotency-Key` and
             identical body; respect `Retry-After` when present.
           $ref: '#/components/responses/Problem'

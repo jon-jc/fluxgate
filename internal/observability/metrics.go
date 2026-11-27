@@ -28,6 +28,7 @@ type Metrics struct {
 	pointsAccepted *prometheus.CounterVec
 	pointsRejected *prometheus.CounterVec
 	batchSize      prometheus.Histogram
+	quotaLeases    *prometheus.CounterVec
 
 	// Pipeline instruments.
 	publishTotal    *prometheus.CounterVec
@@ -124,6 +125,16 @@ func NewMetrics(service string) *Metrics {
 			ConstLabels: labels,
 			Buckets:     prometheus.ExponentialBuckets(1, 2, 12),
 		}),
+
+		quotaLeases: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace:   "fluxgate",
+			Subsystem:   "ratelimit",
+			Name:        "leases_total",
+			Help:        "Tenant-wide quota leases: leased; error, a failed lease answered 503 for retry; fallback, metered per instance while the lease breaker is open.",
+			ConstLabels: labels,
+			// Outcome only. A tenant label would make every tenant a series,
+			// and a fallback is a property of the database, not of a tenant.
+		}, []string{"outcome"}),
 
 		publishTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace:   "fluxgate",
@@ -223,7 +234,7 @@ func NewMetrics(service string) *Metrics {
 
 	registry.MustRegister(
 		m.httpRequests, m.httpDuration, m.httpInFlight,
-		m.pointsAccepted, m.pointsRejected, m.batchSize,
+		m.pointsAccepted, m.pointsRejected, m.batchSize, m.quotaLeases,
 		m.publishTotal, m.publishDuration, m.breakerState,
 		m.messagesTotal, m.windowsFlushed, m.flushDuration,
 		m.rollupsWritten, m.openWindows, m.trackedSeries, m.bufferedBytes, m.watermarkLagSec,
@@ -294,6 +305,14 @@ func (m *Metrics) ObserveIngest(tenant string, accepted, rejected, total int) {
 		m.pointsRejected.WithLabelValues(tenant, "validation").Add(float64(rejected))
 	}
 	m.batchSize.Observe(float64(total))
+}
+
+// ObserveQuotaLease records one lease outcome: "leased", "error" or "fallback".
+func (m *Metrics) ObserveQuotaLease(outcome string) {
+	if m == nil {
+		return
+	}
+	m.quotaLeases.WithLabelValues(outcome).Inc()
 }
 
 // ObservePublish records a publish attempt.

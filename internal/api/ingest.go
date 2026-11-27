@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,7 +80,8 @@ type IngestDeps struct {
 	// Validator applies the domain rules.
 	Validator telemetry.Validator
 	// Limiter meters points per second per tenant.
-	Limiter *ratelimit.Limiter
+	// Either the in-memory per-instance limiter or the tenant-wide leased one.
+	Limiter ratelimit.Meter
 	// Idempotency replays outcomes for repeated requests. Optional.
 	Idempotency idempotency.Repository
 	// MaxRequestBytes caps the request body.
@@ -145,7 +147,7 @@ func handleIngest(deps IngestDeps) httpx.Handler {
 		// and the point count is only knowable once the body is parsed. The
 		// body size cap is what bounds the work an unmetered caller can force
 		// before reaching this line.
-		if meterErr := deps.meter(w, principal, len(req.Points)); meterErr != nil {
+		if meterErr := deps.meter(r.Context(), w, principal, len(req.Points)); meterErr != nil {
 			return meterErr
 		}
 
@@ -232,15 +234,23 @@ func (deps IngestDeps) validate(
 }
 
 // meter applies the tenant's quota and sets the RateLimit response headers.
-func (deps IngestDeps) meter(w http.ResponseWriter, p auth.Principal, cost int) error {
+func (deps IngestDeps) meter(ctx context.Context, w http.ResponseWriter, p auth.Principal, cost int) error {
 	if deps.Limiter == nil {
 		return nil
 	}
 
-	decision := deps.Limiter.AllowN(p.TenantID, cost, ratelimit.Limits{
+	decision, err := deps.Limiter.Meter(ctx, p.TenantID, cost, ratelimit.Limits{
 		Rate:  p.RateLimitPerSecond,
 		Burst: p.Burst,
 	})
+	if err != nil {
+		// The tenant's allowance could not be checked. That is not a denial,
+		// and admitting without it would not be a limit: the client retries,
+		// and its idempotency key keeps the retry the same batch.
+		w.Header().Set("Retry-After", "1")
+		return httpx.Unavailable("The rate limit could not be checked. Retry with the same Idempotency-Key.").
+			WithCause(fmt.Errorf("meter tenant %s: %w", p.TenantID, err))
+	}
 
 	h := w.Header()
 	h.Set("X-RateLimit-Limit", strconv.FormatFloat(decision.Limit.Rate, 'f', -1, 64))

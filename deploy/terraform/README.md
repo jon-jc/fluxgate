@@ -109,6 +109,9 @@ index on `window_end`; plan a maintenance window because index
 creation can block writes on large existing tables. Rerun the migration job's
 runtime-role provisioning with this release to grant the row-lock privileges used
 by cleanup. Verify that expired rows drain before resuming normal traffic.
+Migration 0008 is additive (the tenant quota table), but rerun runtime-role
+provisioning before rolling out ingest so it can lease tenant-wide quotas;
+without the grants it falls back to per-instance limits and says so in its logs.
 Existing deployments must move/import the renamed Cloud Run resource addresses
 into `google_cloud_run_v2_service.service["ingest"|"aggregator"|"query"]` and review
 all state changes. Do not apply the bootstrap defaults to an existing live stack.
