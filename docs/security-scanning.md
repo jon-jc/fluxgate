@@ -17,7 +17,7 @@ green scan, which began failing every pull request:
 | Input | Advisories | Resolution |
 | --- | --- | --- |
 | OpenTelemetry 1.46.0 | [GO-2026-6975](https://pkg.go.dev/vuln/GO-2026-6975), [GO-2026-6974](https://pkg.go.dev/vuln/GO-2026-6974) | 1.47.0, and baggage propagation removed (below) |
-| `golang.org/x/net` 0.58.0 | GO-2026-6603, -6610, -6611, -6612, -6617 | 0.60.0 |
+| `golang.org/x/net` 0.58.0 | GO-2026-6603, -6610, -6611, -6612, -6617; CVE-2026-78661, CVE-2026-97045 | 0.63.0 |
 | Go standard library 1.27.1 in release images | four HIGH, ten MEDIUM image findings | compiler image pinned to 1.27.4 |
 
 GO-2026-6975 is memory amplification in W3C baggage parsing. The public HTTP
@@ -27,6 +27,12 @@ a holder of topic-publish rights can write. Nothing Fluxgate publishes carries
 baggage and nothing reads it, so propagation is now W3C trace context only: the
 parser is not merely patched but unreachable. `TestBrokerMessagesCarryNoBaggage`
 pins both directions.
+
+The two `x/net` CVEs are in `golang.org/x/net/html`, which Fluxgate does not
+import; `govulncheck` correctly reports them unreachable and was satisfied by
+0.60.0. The image audit gates on the module inventory with no ignore list, by
+design, and its advisory data places the fix at 0.62.0. Taking the release is
+cheaper and more honest than arguing with the gate, so the module is on 0.63.0.
 
 CI's Go setup resolves the newest 1.27 patch while the image pin is fixed, so
 `govulncheck` and the image scan can disagree about the standard library. The
