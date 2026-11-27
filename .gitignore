@@ -52,3 +52,6 @@ site/dist/
 site/test-results/
 site/playwright-report/
 site/.build-manifest.json
+
+# Local output of scripts/fuzz_nightly.py.
+fuzz-out/

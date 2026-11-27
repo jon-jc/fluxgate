@@ -59,92 +59,55 @@ jobs:
           key: fuzz-${{ github.run_id }}
           restore-keys: fuzz-
 
+      # A failing `go test -fuzz` is not necessarily a finding. The script
+      # classifies each target by whether Go wrote a new reproducer to
+      # testdata/ -- the only thing that makes a failure replayable -- retries a
+      # failure that left nothing behind, and collects new reproducers only.
       - name: Fuzz every parser boundary
         id: fuzz
         env:
           FUZZ_BUDGET: ${{ github.event.inputs.fuzztime || '5m' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -uo pipefail
-          # target:package -- one entry per boundary that parses untrusted input.
-          targets=(
-            "FuzzDecodeEnvelope:./internal/pubsubx"
-            "FuzzEnvelopeRoundTrip:./internal/pubsubx"
-            "FuzzParse:./internal/query"
-            "FuzzHashLabels:./internal/aggregate"
-            "FuzzWindowFor:./internal/aggregate"
-            "FuzzVerify:./internal/auth"
-            "FuzzParseKeys:./internal/auth"
-            "FuzzValidatePoint:./internal/telemetry"
-          )
-          budget="$FUZZ_BUDGET"
-          failed=()
-          for entry in "${targets[@]}"; do
-            target="${entry%%:*}"
-            pkg="${entry#*:}"
-            echo "::group::$target ($budget)"
-            # Every target runs even after one fails, so a single night
-            # reports every boundary that is broken rather than just the
-            # first one in the list.
-            if ! go test -run '^$' -fuzz "^${target}$" -fuzztime "$budget" "$pkg"; then
-              failed+=("$target")
-              echo "::error title=$target::fuzzing found a failing input"
-            fi
-            echo "::endgroup::"
-          done
-          if [ ${#failed[@]} -gt 0 ]; then
-            echo "targets=${failed[*]}" >> "$GITHUB_OUTPUT"
-            exit 1
-          fi
+          # Target:package -- one entry per boundary that parses untrusted input.
+          python3 scripts/fuzz_nightly.py --out "$RUNNER_TEMP/fuzz-out" "$FUZZ_BUDGET" \
+            FuzzDecodeEnvelope:./internal/pubsubx \
+            FuzzEnvelopeRoundTrip:./internal/pubsubx \
+            FuzzParse:./internal/query \
+            FuzzHashLabels:./internal/aggregate \
+            FuzzWindowFor:./internal/aggregate \
+            FuzzVerify:./internal/auth \
+            FuzzParseKeys:./internal/auth \
+            FuzzValidatePoint:./internal/telemetry
 
-      # Go writes a crasher into testdata/, where committing it turns it into a
-      # permanent regression test. Uploading it means the reproducer survives
-      # even if the corpus cache is evicted before anyone looks.
-      - name: Upload the reproducers
+      # Only reproducers written tonight. Committed corpus files are already
+      # in the repository and would make a stale fix look like a new finding.
+      - name: Upload new reproducers
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: fuzz-crashers
-          path: internal/**/testdata/fuzz/**
+          name: fuzz-reproducers
+          path: ${{ runner.temp }}/fuzz-out/crashers/
           if-no-files-found: ignore
 
-      # A nightly job that only turns a square red is a job nobody reads.
-      - name: Open an issue
-        if: failure()
+      # A nightly job that only turns a square red is a job nobody reads. The
+      # body carries the reproducer itself, so the issue stays actionable after
+      # the artifact expires.
+      - name: Open or update the issue
+        if: failure() && steps.fuzz.outputs.issue == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGETS: ${{ steps.fuzz.outputs.targets }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          OUT: ${{ runner.temp }}/fuzz-out
         run: |
-          set -uo pipefail
-          # The label may not exist yet in a fresh repository, and both the
-          # list and the create below fail outright without it.
+          set -euo pipefail
+          label=$(cat "$OUT/issue-label")
           gh label create fuzz --color B60205 --description "Found by fuzzing" >/dev/null 2>&1 || true
-          # One open issue at a time: a search that fails every night should
-          # not file an identical report every night.
-          existing=$(gh issue list --label fuzz --state open \
-            --json number --jq '.[0].number // empty' 2>/dev/null || true)
+          gh label create fuzz-infra --color FBCA04 --description "Nightly fuzzing could not run" >/dev/null 2>&1 || true
+          # One open issue per kind: a search that keeps failing should not
+          # file an identical report every night.
+          existing=$(gh issue list --label "$label" --state open             --json number --jq '.[0].number // empty' 2>/dev/null || true)
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body \
-              "Still failing on \`${TARGETS:-unknown}\`. Run: ${RUN_URL}"
-            exit 0
+            gh issue comment "$existing" --body-file "$OUT/issue.md"
+          else
+            gh issue create --title "$(cat "$OUT/issue-title")" --label "$label" --body-file "$OUT/issue.md"
           fi
-          gh issue create \
-            --title "Fuzzing found a failing input in ${TARGETS:-a target}" \
-            --label fuzz \
-            --body "$(cat <<BODY
-          Nightly fuzzing failed on: \`${TARGETS:-unknown}\`
-
-          The reproducer is attached to the run as the \`fuzz-crashers\`
-          artifact, under \`internal/<pkg>/testdata/fuzz/<Target>/\`.
-
-          To reproduce and fix:
-
-          1. Download the artifact and copy the file into the matching
-             \`testdata/fuzz/<Target>/\` directory in a branch.
-          2. \`go test -run '<Target>/<file>' ./internal/<pkg>\` — it should fail.
-          3. Fix the bug, then commit the reproducer alongside the fix. It then
-             runs on every pull request as an ordinary deterministic test.
-
-          Run: ${RUN_URL}
-          BODY
-          )"
