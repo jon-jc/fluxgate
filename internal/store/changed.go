@@ -38,7 +38,35 @@ func (c Cursor) After(r StoredRollup, revision int64) Cursor {
 	}
 }
 
+// ChangePage is one page of the live tail.
+type ChangePage struct {
+	// Rows are in commit order. Each carries the revision that wrote it, so a
+	// caller can issue a resume position for every row, not only the last.
+	Rows []StoredRollup
+	// Next is positioned immediately after the last row in Rows.
+	Next Cursor
+	// More reports that the page stopped at its row or byte bound while further
+	// committed changes remained. A caller trying to keep up should read again
+	// now rather than on its next schedule: waiting a full poll per page caps a
+	// tail at one page per interval, however fast the tenant is writing.
+	More bool
+}
+
 // Changed reads rollups written since a cursor, oldest write first.
+//
+// It is ChangedPage without the per-page detail, for callers that only need
+// the rows and the next position.
+func (db *DB) Changed(
+	ctx context.Context, tenantID, metric string, cursor Cursor, limit int,
+) ([]StoredRollup, Cursor, error) {
+	page, err := db.ChangedPage(ctx, tenantID, metric, cursor, limit)
+	if err != nil {
+		return nil, cursor, err
+	}
+	return page.Rows, page.Next, nil
+}
+
+// ChangedPage reads one page of rollups written since a cursor.
 //
 // The live tail polls this rather than subscribing to a topic. A per-instance
 // Pub/Sub subscription would deliver changes with lower latency, but every
@@ -49,12 +77,13 @@ func (c Cursor) After(r StoredRollup, revision int64) Cursor {
 // The cursor advances on commit revision, not event time: a late arrival updates a
 // window that closed minutes ago, and a tail ordered by event time would never
 // show it.
-func (db *DB) Changed(
+func (db *DB) ChangedPage(
 	ctx context.Context, tenantID, metric string, cursor Cursor, limit int,
-) ([]StoredRollup, Cursor, error) {
+) (ChangePage, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 1000
 	}
+	none := ChangePage{Next: cursor}
 
 	args := []any{tenantID, cursor.Revision}
 
@@ -78,7 +107,8 @@ func (db *DB) Changed(
 		metricClause = fmt.Sprintf(" AND metric = $%d", len(args))
 	}
 
-	args = append(args, limit)
+	// One row past the limit answers "is there more?" without a second query.
+	args = append(args, limit+1)
 
 	sql := `
 		SELECT tenant_id, metric, kind, label_hash, labels,
@@ -91,15 +121,20 @@ func (db *DB) Changed(
 
 	rows, err := db.pool.Query(ctx, sql, args...)
 	if err != nil {
-		return nil, cursor, fmt.Errorf("query changes: %w", err)
+		return none, fmt.Errorf("query changes: %w", err)
 	}
 	defer rows.Close()
 
 	var out []StoredRollup
 	var usedBytes int
 	next := cursor
+	more := false
 
 	for rows.Next() {
+		if len(out) == limit {
+			more = true
+			break
+		}
 		var (
 			r         StoredRollup
 			rawLabels []byte
@@ -111,34 +146,36 @@ func (db *DB) Changed(
 			&r.Count, &r.Sum, &r.Min, &r.Max, &r.Last, &r.LastEventAt, &r.Buckets,
 			&revision,
 		); err != nil {
-			return nil, cursor, fmt.Errorf("query changes: scan: %w", err)
+			return none, fmt.Errorf("query changes: scan: %w", err)
 		}
 		rowBytes := readRowBytes(r, rawLabels)
 		if rowBytes > maxChangeBytes {
-			return nil, cursor, ErrReadBudget
+			return none, ErrReadBudget
 		}
 		if usedBytes+rowBytes > maxChangeBytes {
 			// Keep the cursor on the last returned row. The next poll includes
 			// this row; a byte-limited page must never skip a change.
+			more = true
 			break
 		}
 		usedBytes += rowBytes
 		if len(rawLabels) > 0 {
 			if err := json.Unmarshal(rawLabels, &r.Labels); err != nil {
-				return nil, cursor, fmt.Errorf("query changes: decode labels: %w", err)
+				return none, fmt.Errorf("query changes: decode labels: %w", err)
 			}
 		}
 
+		r.Revision = revision
 		out = append(out, r)
 		// Advanced per row rather than to the page's maximum revision, so the
 		// next page resumes exactly where this one stopped.
 		next = next.After(r, revision)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, cursor, fmt.Errorf("query changes: %w", err)
+		return none, fmt.Errorf("query changes: %w", err)
 	}
 
-	return out, next, nil
+	return ChangePage{Rows: out, Next: next, More: more}, nil
 }
 
 // NewestRevision seeds a new live tail at the latest committed tenant revision.

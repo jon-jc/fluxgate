@@ -78,7 +78,8 @@ jobs:
             FuzzWindowFor:./internal/aggregate \
             FuzzVerify:./internal/auth \
             FuzzParseKeys:./internal/auth \
-            FuzzValidatePoint:./internal/telemetry
+            FuzzValidatePoint:./internal/telemetry \
+            FuzzParseCursorToken:./internal/store
 
       # Only reproducers written tonight. Committed corpus files are already
       # in the repository and would make a stale fix look like a new finding.

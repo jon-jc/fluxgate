@@ -123,6 +123,9 @@ type QueryConfig struct {
 	// StreamMaxDuration bounds one streaming connection, so a forgotten
 	// browser tab does not hold a database poller open indefinitely.
 	StreamMaxDuration time.Duration
+	// StreamResumeRevisions is how many tenant commits a resumed stream may
+	// span before the client is told to refetch instead of replaying them.
+	StreamResumeRevisions int
 }
 
 // DatabaseConfig configures Postgres.
@@ -469,6 +472,8 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			StreamPollInterval: l.duration("QUERY_STREAM_POLL_INTERVAL", 2*time.Second),
 			StreamHeartbeat:    l.duration("QUERY_STREAM_HEARTBEAT", 20*time.Second),
 			StreamMaxDuration:  l.duration("QUERY_STREAM_MAX_DURATION", 30*time.Minute),
+
+			StreamResumeRevisions: l.integer("QUERY_STREAM_RESUME_REVISIONS", 10_000),
 		},
 		Telemetry: TelemetryConfig{
 			TracingEnabled: l.boolean("TRACING_ENABLED", otlpEndpoint != ""),
@@ -661,6 +666,9 @@ func (c Config) validateQuery(l *loader) {
 	}
 	if c.Query.StreamMaxConcurrent <= 0 {
 		l.reject("QUERY_STREAM_MAX_CONCURRENT", "must be greater than zero")
+	}
+	if c.Query.StreamResumeRevisions <= 0 {
+		l.reject("QUERY_STREAM_RESUME_REVISIONS", "must be greater than zero")
 	}
 	if c.Query.MaxPoints > 50_000 {
 		l.reject("QUERY_MAX_POINTS", "must not exceed 50000")

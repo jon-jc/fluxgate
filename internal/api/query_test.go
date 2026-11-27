@@ -52,14 +52,14 @@ func (f *fakeReader) Query(_ context.Context, filter store.QueryFilter) ([]store
 	return f.rollups, nil
 }
 
-func (f *fakeReader) Changed(
+func (f *fakeReader) ChangedPage(
 	_ context.Context, _, _ string, cursor store.Cursor, _ int,
-) ([]store.StoredRollup, store.Cursor, error) {
+) (store.ChangePage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	if f.err != nil {
-		return nil, cursor, f.err
+		return store.ChangePage{Next: cursor}, f.err
 	}
 
 	out := f.changed
@@ -70,7 +70,7 @@ func (f *fakeReader) Changed(
 	for i := range out {
 		next = next.After(out[i], 1)
 	}
-	return out, next, nil
+	return store.ChangePage{Rows: out, Next: next}, nil
 }
 
 func (f *fakeReader) NewestRevision(context.Context, string) (int64, error) {
@@ -125,6 +125,10 @@ func newQueryHarness(t *testing.T, opts ...func(*api2Config)) *queryHarness {
 	}
 
 	reader := &fakeReader{}
+	var source Reader = reader
+	if cfg.reader != nil {
+		source = cfg.reader
+	}
 
 	keys := fmt.Sprintf(`[{"key_id":%q,"tenant_id":%q,"secret_sha256":%q}]`,
 		testKeyID, testTenant, auth.HashSecret(testSecret))
@@ -150,7 +154,7 @@ func newQueryHarness(t *testing.T, opts ...func(*api2Config)) *queryHarness {
 		Health: health,
 		Auth:   auth.Options{Store: keyStore},
 		Query: QueryDeps{
-			Reader: reader,
+			Reader: source,
 			Limits: cfg.limits,
 			Stream: cfg.stream,
 			Now:    func() time.Time { return queryNow },
@@ -164,6 +168,9 @@ type api2Config struct {
 	limits  query.Limits
 	stream  StreamOptions
 	origins []string
+	// reader replaces the default fake for tests that need a faithful model
+	// of the table rather than canned rows.
+	reader Reader
 }
 
 func TestDashboardAndCORSKeepTenantAuthentication(t *testing.T) {

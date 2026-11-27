@@ -81,6 +81,43 @@ test("SSE tolerates chunk boundaries, heartbeats, retry advice, and replacement 
   assert.deepEqual(retries, [4000]);
   assert.throws(() => parser.push("a".repeat(262145)));
 });
+test("SSE tracks the resume position the way a browser does", () => {
+  const events = [],
+    resets = [],
+    parser = new SSEParser(
+      (event) => events.push(event),
+      () => {},
+      (reset) => resets.push(reset),
+    );
+  // An id-only frame hands over a position without dispatching anything.
+  parser.push("retry: 4000\n\nid: start\n\n");
+  assert.equal(parser.lastEventId, "start");
+  assert.deepEqual(events, []);
+  // Each rollup moves it; a frame without an id keeps the last one.
+  parser.push('event: rollup\nid: after-a\ndata: {"metric":"a"}\n\n');
+  parser.push(": keep-alive\n\n");
+  assert.equal(parser.lastEventId, "after-a");
+  parser.push('event: rollup\ndata: {"metric":"b"}\n\n');
+  assert.equal(parser.lastEventId, "after-a");
+  // An id is not adopted until its frame ends, so a torn frame cannot
+  // advance the position past an event that never arrived.
+  parser.push('event: rollup\nid: after-c\ndata: {"metric":"c"}');
+  assert.equal(parser.lastEventId, "after-a");
+  parser.push("\n\n");
+  assert.equal(parser.lastEventId, "after-c");
+  // A reset is surfaced, and its id becomes the new position.
+  parser.push('event: reset\nid: latest\ndata: {"reason":"stale_cursor","revision":9}\n\n');
+  assert.deepEqual(resets, [{ reason: "stale_cursor", revision: 9 }]);
+  assert.equal(parser.lastEventId, "latest");
+  assert.deepEqual(
+    events.map((event) => event.metric),
+    ["a", "b", "c"],
+  );
+  // Ids the server could not have issued are ignored, not adopted.
+  parser.push("id: bad\0id\n\n");
+  parser.push(`id: ${"x".repeat(513)}\n\n`);
+  assert.equal(parser.lastEventId, "latest");
+});
 test("results are bounded and CSV escapes spreadsheet formulas", () => {
   const result = normalizeResult({
     metric: "=EVIL()",

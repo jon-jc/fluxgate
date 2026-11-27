@@ -167,7 +167,9 @@ sample before changing concurrency or restarting workers.
 | Query 500/504 | SQL reachability, schema/grants, locks, pool pressure, handler deadline | Fix the dependency or reduce read cost; persistent timeouts are not solved by retries alone |
 | Stream opens but shows no historical points | Stream starts at current revision | Fetch history via REST and watch future updates |
 | Stream has heartbeats but stale data | Worker backlog and logged stream poll errors | Check durable progress and reconcile REST; heartbeat is only connection activity |
-| Stream 429/503 or frequent reconnects | Tenant/instance slots, slow reader, proxy buffering/timeouts, maximum duration | Close unused streams, back off, disable proxy buffering, reconcile on reconnect |
+| Stream 429/503 or frequent reconnects | Tenant/instance slots, slow reader, proxy buffering/timeouts, maximum duration | Close unused streams, back off, disable proxy buffering; resume with `Last-Event-ID` |
+| Stream sends `reset` events | Client away longer than the resume horizon, a restored database, a changed credential, or a tenant changing rows faster than a stream drains (`lagging`) | Refetch through REST; raise `QUERY_STREAM_RESUME_REVISIONS` only after measuring catch-up cost |
+| Stream returns 400 on reconnect | `Last-Event-ID` altered, truncated, or not issued by this service | Reconnect without it, then refetch through REST |
 | Aggregate memory/receive budget fills | Pending encoded bytes vs buffered estimate vs process RSS, flush durations, database locks | Reduce load/cardinality, inspect database bottleneck; measure before raising bounds |
 | Ledger/retention failures | Schema 0007, runtime grants, lock waits, cleanup duration, disk growth | Run reviewed migration/provisioning; protect replay coverage while fixing cleanup |
 | Duplicate-looking totals | New HTTP keys, expired reservation/ledger, changed window policy, adding SSE totals as deltas | Trace original identities and client behavior; stop unsafe replay until reconciled |

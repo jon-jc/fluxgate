@@ -307,6 +307,64 @@ test("authenticated live events reconcile through REST and activity can pause", 
   await expect(page.locator("#toast")).toContainText("rolling time range");
 });
 
+test("live reconnects resume from the last event, and a reset refetches", async ({
+  page,
+}) => {
+  test.setTimeout(45000);
+  const streams = [];
+  let queryCount = 0,
+    queriesAtReset;
+  const rollup = (id, metric, sum) =>
+    `event: rollup\r\nid: ${id}\r\ndata: ${JSON.stringify({
+      metric,
+      kind: "counter",
+      labels: { region: "west" },
+      window_start: new Date().toISOString(),
+      count: 1,
+      sum,
+      min: sum,
+      max: sum,
+    })}\r\n\r\n`;
+  await apiFixture(page, async (route, url) => {
+    if (url.pathname === "/v1/query") queryCount++;
+    if (url.pathname !== "/v1/stream") return false;
+    const n = streams.push(route.request().headers()["last-event-id"]),
+      metric = url.searchParams.get("metric");
+    let body;
+    if (n === 1)
+      // A fresh stream: a position frame, then one event.
+      body = `retry: 1000\r\n\r\nid: start\r\n\r\n${rollup("after-41", metric, 41)}`;
+    else if (n === 2)
+      // A resumed stream confirms the position it was given, then continues.
+      body = `retry: 1000\r\n\r\nid: after-41\r\n\r\n${rollup("after-42", metric, 42)}`;
+    else {
+      // Hold the reset until any refetch scheduled by earlier connections
+      // (at most five seconds out) has run, so a later query can only be
+      // the reset's.
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+      queriesAtReset = queryCount;
+      body =
+        'retry: 60000\r\n\r\nevent: reset\r\nid: latest\r\ndata: {"reason":"stale_cursor","revision":9}\r\n\r\n';
+    }
+    await route.fulfill({ contentType: "text/event-stream", body });
+    return true;
+  });
+  await page.goto("/dashboard/");
+  await connect(page);
+  await page.locator("[data-view=activity]").click();
+  await expect(page.locator(".activity-event").first()).toContainText("42", {
+    timeout: 15000,
+  });
+  await expect.poll(() => streams.length, { timeout: 15000 }).toBe(3);
+  // Each reconnect carries the id of the last frame the browser received.
+  expect(streams).toEqual([undefined, "after-41", "after-42"]);
+  await expect
+    .poll(() => queriesAtReset !== undefined && queryCount > queriesAtReset, {
+      timeout: 15000,
+    })
+    .toBe(true);
+});
+
 test("dashboard is accessible in both themes and dialogs", async ({ page }) => {
   await page.goto("/dashboard/");
   await expect(page.locator(".stat-card")).toHaveCount(4);

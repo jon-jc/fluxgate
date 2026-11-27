@@ -140,6 +140,8 @@ func run() error {
 				PollInterval:      cfg.Query.StreamPollInterval,
 				HeartbeatInterval: cfg.Query.StreamHeartbeat,
 				MaxDuration:       cfg.Query.StreamMaxDuration,
+
+				MaxResumeRevisions: int64(cfg.Query.StreamResumeRevisions),
 			},
 			Now: time.Now,
 		},

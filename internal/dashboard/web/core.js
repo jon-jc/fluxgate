@@ -236,9 +236,15 @@ export class SSEParser {
   data = [];
   type = "";
   size = 0;
-  constructor(onEvent, onRetry = () => {}) {
+  // Per the SSE specification the id buffer survives across events, and the
+  // last event ID is updated whenever a frame ends -- including a frame with
+  // an id and no data, which the server sends to hand over a position.
+  idBuffer = "";
+  lastEventId = "";
+  constructor(onEvent, onRetry = () => {}, onReset = () => {}) {
     this.onEvent = onEvent;
     this.onRetry = onRetry;
+    this.onReset = onReset;
   }
   push(chunk) {
     this.buffer += chunk;
@@ -249,8 +255,11 @@ export class SSEParser {
       const line = this.buffer.slice(0, end).replace(/\r$/, "");
       this.buffer = this.buffer.slice(end + 1);
       if (!line) {
+        this.lastEventId = this.idBuffer;
         if (this.type === "rollup" && this.data.length)
           this.onEvent(JSON.parse(this.data.join("\n")));
+        if (this.type === "reset" && this.data.length)
+          this.onReset(JSON.parse(this.data.join("\n")));
         this.data = [];
         this.type = "";
         this.size = 0;
@@ -262,6 +271,8 @@ export class SSEParser {
       const value =
         separator < 0 ? "" : line.slice(separator + 1).replace(/^ /, "");
       if (field === "event") this.type = value;
+      if (field === "id" && !value.includes("\0") && value.length <= 512)
+        this.idBuffer = value;
       if (field === "data") {
         this.size += value.length;
         if (this.size > 131072)

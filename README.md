@@ -274,8 +274,11 @@ results are cut short. Reads that exceed the materialization byte budget return
 
 SSE follows committed tenant revisions, so a slow transaction cannot commit
 behind an already advanced cursor. Updates to the same rollup between polls may
-coalesce. Reconnects begin at the current revision; refresh REST queries to
-reconcile missed updates. Streams have separate connection quotas, bounded
+coalesce. Every event carries an `id`: a client that reconnects with
+`Last-Event-ID` resumes exactly after the last change it received, and a
+position that cannot be honoured receives an explicit `reset` event telling it
+to refetch through REST. A stream that falls behind reads its backlog back to
+back instead of one page per poll. Streams have separate connection quotas, bounded
 polls, socket-write deadlines, and maximum lifetimes.
 
 ## Verification
@@ -527,7 +530,7 @@ packaged verification described above.
 
 [Fuzzing](.github/workflows/fuzz.yml) runs nightly across envelope parsing,
 query parsing, label identity, window boundaries, credentials, key documents,
-and point validation. Committed seeds and crash reproducers run with ordinary
+point validation, and stream resume positions. Committed seeds and crash reproducers run with ordinary
 tests on every PR. To fuzz one boundary locally:
 
 ```sh

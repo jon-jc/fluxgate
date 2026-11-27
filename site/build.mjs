@@ -460,8 +460,15 @@ function operationContent(operation) {
             : JSON.stringify(content.example, null, 2),
           mime === "text/event-stream" ? "text" : "json",
         );
+      // A transcript such as an event stream is text, not a JSON string to
+      // be quoted and escaped onto one line.
       for (const example of Object.values(content.examples || {}))
-        html += `<h4>${e(example.summary || "Example")}</h4>${code(JSON.stringify(example.value, null, 2), "json")}`;
+        html += `<h4>${e(example.summary || "Example")}</h4>${code(
+          typeof example.value === "string"
+            ? example.value
+            : JSON.stringify(example.value, null, 2),
+          mime === "text/event-stream" ? "text" : "json",
+        )}`;
       if (status === "200" && responseExamples[operation.operationId])
         html += `<h4>Illustrative response</h4><p>Values are examples; they are not a response from a hosted Fluxgate service.</p>${code(JSON.stringify(responseExamples[operation.operationId], null, 2), "json")}`;
     }

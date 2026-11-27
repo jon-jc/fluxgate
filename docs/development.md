@@ -217,7 +217,7 @@ go test -run '^$' -fuzz FuzzValidatePoint -fuzztime 60s ./internal/telemetry
 
 The [fuzz workflow](../.github/workflows/fuzz.yml) runs nightly and manually across
 point validation, credentials, key documents, envelopes, queries, label identity,
-and windows. Preserve minimized reproducers as regression seeds.
+windows, and stream resume positions (`Last-Event-ID`). Preserve minimized reproducers as regression seeds.
 
 [`scripts/fuzz_nightly.py`](../scripts/fuzz_nightly.py) drives it and decides what
 a failure means. A target that fails and writes a new file under

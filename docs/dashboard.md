@@ -76,9 +76,12 @@ not deltas, and may include late corrections. They do not contain histogram
 buckets, so the dashboard re-queries REST instead of fabricating live percentiles.
 Refreshes are coalesced to at most one query every five seconds.
 
-After reconnects, REST reconciliation fills the current chart range. SSE itself
-has no replay cursor or historical backlog. Idle connections time out and retry
-with backoff; server retry advice is honored. Hidden browser tabs release their
+Reconnects within a live session resume from the last event received, by
+sending its id as `Last-Event-ID`, so a dropped connection, a deploy, or the
+30-minute connection limit loses no updates and needs no refetch. The dashboard
+refetches through REST when it starts a fresh stream, has no position yet, or
+receives a `reset` event. Idle connections time out and retry with backoff;
+server retry advice is honored. Hidden browser tabs release their
 stream and reconcile when visible again. Custom historical ranges disable live
 mode. Busy query responses pause automatic refresh so the dashboard does not
 amplify overload.
