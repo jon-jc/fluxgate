@@ -54,12 +54,13 @@ func InitTracing(ctx context.Context, cfg config.Config, tracing TracingConfig, 
 		log = slog.Default()
 	}
 
-	// W3C trace context, plus baggage for the few attributes worth carrying
-	// across a service boundary.
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
+	// W3C trace context only. Baggage is deliberately not propagated: the HTTP
+	// edge discards it from public callers, so nothing Fluxgate publishes ever
+	// carries any, and a baggage propagator here would only parse whatever a
+	// broker message's attributes contain. Broker messages are untrusted input
+	// like any other, and GO-2026-6975 was a memory-amplification bug in
+	// exactly that parser. Not parsing it at all is the stronger fix.
+	otel.SetTextMapPropagator(Propagator())
 
 	// Instrumentation errors must never become application errors. A collector
 	// that is down should cost visibility, not availability.
@@ -181,6 +182,10 @@ func LoggerWithTrace(ctx context.Context) *slog.Logger {
 		slog.String("span_id", sc.SpanID().String()),
 	)
 }
+
+// Propagator is the trace propagation used on every Fluxgate boundary: W3C
+// trace context, and nothing else. See InitTracing for why baggage is excluded.
+func Propagator() propagation.TextMapPropagator { return propagation.TraceContext{} }
 
 // MapCarrier adapts a plain string map to the OpenTelemetry propagation
 // interface.

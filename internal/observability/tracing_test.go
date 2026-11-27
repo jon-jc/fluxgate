@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/baggage"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
@@ -24,8 +25,7 @@ func withTracing(t *testing.T) trace.Tracer {
 	previousPropagator := otel.GetTextMapPropagator()
 
 	otel.SetTracerProvider(provider)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{}, propagation.Baggage{}))
+	otel.SetTextMapPropagator(Propagator())
 
 	t.Cleanup(func() {
 		otel.SetTracerProvider(previousProvider)
@@ -228,4 +228,39 @@ func TestShutdownIsSafeWithoutAProvider(t *testing.T) {
 		t.Fatalf("InitTracing: %v", err)
 	}
 	disabled.Shutdown(context.Background())
+}
+
+// TestBrokerMessagesCarryNoBaggage pins the boundary from both sides. Nothing
+// Fluxgate publishes carries baggage, even from a context that holds some, and
+// a consumer does not parse baggage a message arrives with: such a message was
+// not written by Fluxgate, and that parser was the reachable path of
+// GO-2026-6975. The trace itself must still continue across the broker.
+func TestBrokerMessagesCarryNoBaggage(t *testing.T) {
+	tracer := withTracing(t)
+
+	member, err := baggage.NewMember("tenant", "acme")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bag, err := baggage.New(member)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, span := tracer.Start(baggage.ContextWithBaggage(context.Background(), bag), "publish")
+	attributes := MapCarrier{}
+	InjectTrace(ctx, attributes)
+	span.End()
+
+	if got, ok := attributes["baggage"]; ok {
+		t.Fatalf("publisher injected baggage %q into a broker message", got)
+	}
+
+	attributes["baggage"] = "tenant=other," + strings.Repeat("k=v,", 500)
+	consumed := ExtractTrace(context.Background(), attributes)
+	if n := baggage.FromContext(consumed).Len(); n != 0 {
+		t.Fatalf("consumer parsed %d baggage members from a broker message", n)
+	}
+	if got, want := trace.SpanContextFromContext(consumed).TraceID(), span.SpanContext().TraceID(); got != want {
+		t.Fatalf("trace did not continue across the broker: got %s, want %s", got, want)
+	}
 }
