@@ -219,6 +219,20 @@ The [fuzz workflow](../.github/workflows/fuzz.yml) runs nightly and manually acr
 point validation, credentials, key documents, envelopes, queries, label identity,
 and windows. Preserve minimized reproducers as regression seeds.
 
+[`scripts/fuzz_nightly.py`](../scripts/fuzz_nightly.py) drives it and decides what
+a failure means. A target that fails and writes a new file under
+`testdata/fuzz/<Target>/` has a **finding**: the issue labelled `fuzz` inlines
+the reproducer, and committing that file with the fix makes it an ordinary test.
+A failure that leaves no file is not a finding — no input fails — so it is
+retried once, and if it fails again it is reported under `fuzz-infra` with the
+end of the log. The usual cause is the coordinator reporting its own `-fuzztime`
+deadline as `context deadline exceeded`. Every night's per-target executions and
+new coverage appear in the run summary. The same script runs locally:
+
+```sh
+python scripts/fuzz_nightly.py --out fuzz-out 30s FuzzParse:./internal/query
+```
+
 ```sh
 go test -run '^$' -bench . -benchmem ./internal/aggregate/...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
