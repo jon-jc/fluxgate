@@ -104,6 +104,7 @@ and rerun runtime-role provisioning whenever grants change.
 | 0005 | Tenant commit revisions; stop old aggregators first |
 | 0006 | Historical retention-index change; superseded by 0007 correction |
 | 0007 | Correct `window_end` retention index; can block writes, so schedule maintenance |
+| 0008 | Tenant-wide quota buckets; additive, safe with running services. Rerun runtime-role provisioning before ingest uses tenant scope |
 
 Existing Terraform deployments may need state moves/imports for the service
 resource addresses; see the [upgrade procedure](../deploy/terraform/README.md#upgrades-and-rollback).

@@ -159,7 +159,9 @@ sample before changing concurrency or restarting workers.
 | 401 for every request | Correct API URL, Bearer format, enabled key ID/hash, secret version on every revision | Verify local fixture or rotate/fix deployed document; never log the token |
 | Ingest 409 | Client key/body persistence and JSON reserialization | Recover original bytes; investigate before assigning a new identity |
 | Ingest 422 | Field errors, point count, timestamps, metric/label bounds | Correct invalid observations; preserve accepted subsets on partial responses |
-| Ingest 429 | Rate headers and presence of Retry-After | Back off, or split a batch larger than burst; account for per-instance quota |
+| Ingest 429 | Rate headers and presence of Retry-After | Back off, or split a batch larger than burst; tenant-wide limits apply across all replicas |
+| `fluxgate_ratelimit_leases_total{outcome="error"}` rising, ingest `503`s | Lease latency against the 250ms lease timeout, pool saturation, `tenant_quota_buckets` lock waits, runtime grants | Clients retry safely with the same key; fix the latency before the breaker opens |
+| `fluxgate_ratelimit_leases_total{outcome="fallback"}` rising, "degraded to per-instance limits" warnings | The lease breaker is open: ingest's database is persistently unreachable or failing | Restore the database path; until then each replica enforces limits alone, so tenants may exceed their allowance by the replica count |
 | Ingest 503 | Admission concurrency, publisher circuit, Pub/Sub permissions, SQL retry-store health | Retry same bytes/key; reduce pressure and repair the failing dependency |
 | 202 but query is empty | Same tenant/key, correct query service, checkpoint delay, window-start range, label filters, worker logs/backlog/DLQ | Wait for normal checkpoint, then locate the stalled stage; do not republish under a new key |
 | Query 200 is incomplete | `truncated`, series/point limits | Narrow range and labels; aggregate only complete responses |

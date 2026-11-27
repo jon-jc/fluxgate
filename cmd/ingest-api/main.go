@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -120,6 +121,11 @@ func run() error {
 	defer closeSink()
 
 	var retries idempotency.Repository = idempotency.New(cfg.Ingest.IdempotencyTTL)
+	limits := ratelimit.Limits{
+		Rate:  cfg.Ingest.RateLimitPointsPerSecond,
+		Burst: cfg.Ingest.RateLimitBurst,
+	}
+	var limiter ratelimit.Meter = ratelimit.New(limits)
 	if cfg.Database.DSN != "" {
 		db, openErr := store.Open(ctx, store.Config{Instance: cfg.Database.Instance, DSN: cfg.Database.DSN, MaxConns: cfg.Database.MaxConns, MinConns: cfg.Database.MinConns, MaxConnLifetime: cfg.Database.MaxConnLifetime, ConnectTimeout: cfg.Database.ConnectTimeout}, logger)
 		if openErr != nil {
@@ -139,6 +145,9 @@ func run() error {
 		persistent := idempotency.NewPostgres(db.Pool(), cfg.Ingest.IdempotencyTTL)
 		health.Register(persistent)
 		retries = persistent
+		if cfg.Ingest.RateLimitScope == config.RateLimitScopeTenant {
+			limiter = tenantWideLimiter(db, limits, cfg.Ingest.RateLimitLease, metrics, logger)
+		}
 	} else {
 		logger.Warn("idempotency is local to this process; configure DATABASE_URL for shared retries")
 	}
@@ -163,10 +172,7 @@ func run() error {
 				},
 				Clock: time.Now,
 			},
-			Limiter: ratelimit.New(ratelimit.Limits{
-				Rate:  cfg.Ingest.RateLimitPointsPerSecond,
-				Burst: cfg.Ingest.RateLimitBurst,
-			}),
+			Limiter:         limiter,
 			Idempotency:     retries,
 			MaxRequestBytes: cfg.HTTP.MaxRequestBytes,
 		},
@@ -198,6 +204,43 @@ func run() error {
 
 	logger.Info("shutdown complete")
 	return nil
+}
+
+// tenantWideLimiter meters every replica against one PostgreSQL bucket per
+// tenant, falling back to per-instance limits if leasing fails.
+func tenantWideLimiter(
+	db *store.DB, limits ratelimit.Limits, lease time.Duration,
+	metrics *observability.Metrics, logger *slog.Logger,
+) ratelimit.Meter {
+	var leased *ratelimit.Leased
+	var lastWarning atomic.Int64
+	leased = ratelimit.NewLeased(
+		ratelimit.LessorFunc(func(ctx context.Context, key string, want int, l ratelimit.Limits) (ratelimit.Lease, error) {
+			grant, err := db.LeaseQuota(ctx, key, want, l.Rate, l.Burst)
+			return ratelimit.Lease{Granted: grant.Granted, Remaining: grant.Remaining}, err
+		}),
+		ratelimit.New(limits),
+		ratelimit.LeasedOptions{
+			Defaults: limits,
+			Horizon:  lease,
+			OnLease: func(outcome string, err error) {
+				metrics.ObserveQuotaLease(outcome)
+				metrics.SetBreakerState("quota-lease", int(leased.Breaker().State()))
+				// A database outage would otherwise log once per request.
+				if err == nil || time.Since(time.Unix(0, lastWarning.Load())) <= time.Minute {
+					return
+				}
+				lastWarning.Store(time.Now().UnixNano())
+				message := "tenant-wide rate-limit lease failed; request answered 503 for retry"
+				if outcome == "fallback" {
+					message = "tenant-wide rate limiting degraded to per-instance limits"
+				}
+				logger.Warn(message, slog.String("outcome", outcome), slog.Any("error", err))
+			},
+		},
+	)
+	logger.Info("rate limits are tenant-wide across replicas", slog.Duration("lease", lease))
+	return leased
 }
 
 // buildAuth resolves the API key store, or confirms that running without one

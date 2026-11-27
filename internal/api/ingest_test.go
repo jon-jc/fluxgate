@@ -42,10 +42,17 @@ type harnessOption func(*harnessConfig)
 
 type harnessConfig struct {
 	limits      ratelimit.Limits
+	meter       ratelimit.Meter
 	authDisable bool
 	idempotency bool
 	sink        ingest.Sink
 	now         time.Time
+}
+
+// withMeter replaces the in-memory limiter, for tests of how the handler
+// treats a meter's answers rather than of the limiter itself.
+func withMeter(m ratelimit.Meter) harnessOption {
+	return func(c *harnessConfig) { c.meter = m }
 }
 
 func withRateLimits(l ratelimit.Limits) harnessOption {
@@ -95,6 +102,11 @@ func newHarness(t *testing.T, opts ...harnessOption) *harness {
 
 	now := func() time.Time { return cfg.now }
 
+	var meter ratelimit.Meter = ratelimit.New(cfg.limits, ratelimit.WithClock(now))
+	if cfg.meter != nil {
+		meter = cfg.meter
+	}
+
 	var idem idempotency.Repository
 	if cfg.idempotency {
 		idem = idempotency.New(time.Hour, idempotency.WithClock(now))
@@ -118,7 +130,7 @@ func newHarness(t *testing.T, opts ...harnessOption) *harness {
 				Limits: telemetry.DefaultLimits(),
 				Clock:  now,
 			},
-			Limiter:         ratelimit.New(cfg.limits, ratelimit.WithClock(now)),
+			Limiter:         meter,
 			Idempotency:     idem,
 			MaxRequestBytes: 1 << 20,
 		},
@@ -713,5 +725,35 @@ func TestValidMultiByteUTF8IsAccepted(t *testing.T) {
 	}
 	if got := batches[0].Points[0].Labels["emoji"]; got != "🚀" {
 		t.Errorf("label = %q, want the rocket", got)
+	}
+}
+
+type failingMeter struct{ err error }
+
+func (f failingMeter) Meter(context.Context, string, int, ratelimit.Limits) (ratelimit.Decision, error) {
+	return ratelimit.Decision{}, f.err
+}
+
+// When a tenant's allowance cannot be checked -- a tenant-wide lease timed out
+// -- the request is neither denied nor admitted unmetered. It gets a retryable
+// 503 and publishes nothing; the client's retry, under the same idempotency
+// key, is the same batch.
+func TestUncheckableRateLimitIsRetryableAndPublishesNothing(t *testing.T) {
+	h := newHarness(t, withMeter(failingMeter{errors.New("lease timed out")}))
+
+	rec := h.post(t, `{"points":[{"metric":"a.b","kind":"gauge","value":1}]}`,
+		map[string]string{"Idempotency-Key": "meter-blip-1"})
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (%s)", rec.Code, rec.Body)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("503 without Retry-After")
+	}
+	if !strings.Contains(rec.Body.String(), "Idempotency-Key") {
+		t.Errorf("the response does not tell the client how to retry safely: %s", rec.Body)
+	}
+	if h.sink.PointCount() != 0 {
+		t.Fatal("a batch whose rate limit could not be checked was published")
 	}
 }

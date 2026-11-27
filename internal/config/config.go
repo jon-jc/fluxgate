@@ -128,6 +128,12 @@ type QueryConfig struct {
 	StreamResumeRevisions int
 }
 
+// Rate-limit scopes; see IngestConfig.RateLimitScope.
+const (
+	RateLimitScopeTenant   = "tenant"
+	RateLimitScopeInstance = "instance"
+)
+
 // DatabaseConfig configures Postgres.
 type DatabaseConfig struct {
 	// Instance is the optional Cloud SQL project:region:instance connection name.
@@ -257,6 +263,14 @@ type IngestConfig struct {
 	RateLimitPointsPerSecond float64
 	// RateLimitBurst is the default per-tenant burst allowance.
 	RateLimitBurst int
+	// RateLimitScope is "tenant", enforcing each allowance across every
+	// replica through a shared bucket in PostgreSQL, or "instance", enforcing
+	// it per process. Defaults to tenant whenever a database is configured.
+	RateLimitScope string
+	// RateLimitLease sizes a replica's lease from the shared bucket: this
+	// long's worth of the tenant's rate. Longer means fewer database round
+	// trips and more unspent tokens a replica may hold.
+	RateLimitLease time.Duration
 	// IdempotencyTTL is how long a completed outcome is replayable. Zero
 	// disables idempotency handling.
 	IdempotencyTTL time.Duration
@@ -406,6 +420,8 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			MaxBackfill:              l.duration("INGEST_MAX_BACKFILL", 7*24*time.Hour),
 			RateLimitPointsPerSecond: l.float("RATE_LIMIT_POINTS_PER_SECOND", 10_000),
 			RateLimitBurst:           l.integer("RATE_LIMIT_BURST", 20_000),
+			RateLimitScope:           l.str("RATE_LIMIT_SCOPE", ""),
+			RateLimitLease:           l.duration("RATE_LIMIT_LEASE", 250*time.Millisecond),
 			IdempotencyTTL:           l.duration("IDEMPOTENCY_TTL", 24*time.Hour),
 		},
 		PubSub: PubSubConfig{
@@ -486,6 +502,15 @@ func load(lookup lookupFunc, service string, req Requirements) (Config, error) {
 			MetricsEnabled:     l.boolean("METRICS_ENABLED", !env.IsProduction()),
 			MetricsPath:        l.str("METRICS_PATH", "/metrics"),
 		},
+	}
+
+	// Enforcing a tenant's allowance across replicas needs somewhere shared
+	// to keep it; without a database the only honest scope is the process.
+	if cfg.Ingest.RateLimitScope == "" {
+		cfg.Ingest.RateLimitScope = RateLimitScopeInstance
+		if cfg.Database.DSN != "" {
+			cfg.Ingest.RateLimitScope = RateLimitScopeTenant
+		}
 	}
 
 	// Cloud Run and several other managed platforms inject the listener port
@@ -867,6 +892,19 @@ func (c Config) validateIngest(l *loader) {
 	}
 	if c.Ingest.RateLimitBurst <= 0 {
 		l.reject("RATE_LIMIT_BURST", "must be greater than zero")
+	}
+	switch c.Ingest.RateLimitScope {
+	case RateLimitScopeInstance:
+	case RateLimitScopeTenant:
+		if c.Database.DSN == "" {
+			l.reject("RATE_LIMIT_SCOPE",
+				"tenant scope keeps each allowance in PostgreSQL; set DATABASE_URL or use instance")
+		}
+	default:
+		l.reject("RATE_LIMIT_SCOPE", "must be tenant or instance")
+	}
+	if c.Ingest.RateLimitLease < 10*time.Millisecond || c.Ingest.RateLimitLease > 5*time.Second {
+		l.reject("RATE_LIMIT_LEASE", "must be between 10ms and 5s")
 	}
 	// A burst below one batch means a full-sized batch can never be admitted,
 	// no matter how long the client waits -- a quota that rejects every

@@ -19,3 +19,4 @@ directory depends entirely on every entry being worth reading.
 | [0005](0005-postgres-not-a-tsdb.md) | Postgres rather than a purpose-built time-series database | Accepted |
 | [0006](0006-separate-read-and-write-services.md) | Separate read and write services | Accepted |
 | [0007](0007-deferred-alerting.md) | Alerting deferred | Accepted |
+| [0008](0008-tenant-wide-quotas-by-leasing.md) | Tenant-wide rate limits by leasing from a shared bucket | Accepted |

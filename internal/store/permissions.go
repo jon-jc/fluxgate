@@ -52,6 +52,8 @@ func (db *DB) ProvisionRuntimeRoles(ctx context.Context) error {
 		REVOKE ALL ON ALL TABLES IN SCHEMA public FROM fluxgate_ingest, fluxgate_aggregator, fluxgate_query;
 		GRANT USAGE ON SCHEMA public TO fluxgate_ingest, fluxgate_aggregator, fluxgate_query;
 		GRANT SELECT, INSERT, UPDATE ON ingest_requests TO fluxgate_ingest;
+		-- Leasing locks a tenant's bucket row with SELECT FOR UPDATE.
+		GRANT SELECT, INSERT, UPDATE ON tenant_quota_buckets TO fluxgate_ingest;
 		GRANT SELECT, INSERT, UPDATE, DELETE ON rollups TO fluxgate_aggregator;
 		GRANT SELECT, INSERT, DELETE ON processed_batches TO fluxgate_aggregator;
 		GRANT SELECT, INSERT, UPDATE ON tenant_revisions TO fluxgate_aggregator;

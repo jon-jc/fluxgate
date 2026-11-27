@@ -76,8 +76,10 @@ not cancel an already committed publish. Use [safe retries](api.md#safe-retries)
 | `INGEST_MAX_POINTS_PER_BATCH` | `1000` | 1–1,000 points |
 | `INGEST_MAX_CLOCK_SKEW` | `5m` | Nonnegative allowed future timestamp offset |
 | `INGEST_MAX_BACKFILL` | `168h` | Positive allowed age at HTTP admission |
-| `RATE_LIMIT_POINTS_PER_SECOND` | `10000` | Positive default sustained tenant rate per instance |
+| `RATE_LIMIT_POINTS_PER_SECOND` | `10000` | Positive default sustained tenant rate |
 | `RATE_LIMIT_BURST` | `20000` | Positive default burst; at least maximum batch size |
+| `RATE_LIMIT_SCOPE` | `tenant` with `DATABASE_URL`, else `instance` | `tenant` enforces each allowance across replicas by leasing from PostgreSQL ([ADR 8](adr/0008-tenant-wide-quotas-by-leasing.md)); `instance` enforces it per process, so replicas multiply it. `tenant` requires `DATABASE_URL` |
+| `RATE_LIMIT_LEASE` | `250ms` | 10ms–5s of a tenant's rate per lease; bounds the unspent tokens a replica may hold |
 | `IDEMPOTENCY_TTL` | `24h` | Positive for ingest; at most `168h`; reservation expiry is measured from initial reservation |
 
 Metric/label length, value magnitude, and label-count bounds are fixed domain

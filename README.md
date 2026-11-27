@@ -247,9 +247,14 @@ internal causes are logged rather than exposed.
   validates structure without rejecting retained messages for their age.
 - A point has at most 20 labels. Names, label sizes, and UTF-8 are validated;
   labels beginning with `__` are reserved.
-- Point-rate limits and stream quotas apply per tenant **per instance**. Scaling
-  replicas multiplies the allowance. Hard tenant-wide quotas require a shared
-  gateway or another coordinated mechanism.
+- Point-rate limits are **tenant-wide across replicas** when ingest has a
+  database: replicas lease tokens from one PostgreSQL bucket per tenant, so
+  scaling the service does not scale anyone's allowance. Over any interval the
+  bound is the tenant's burst plus its rate, plus at most one small lease per
+  replica ([ADR 8](docs/adr/0008-tenant-wide-quotas-by-leasing.md)). A failed lease
+  is answered with a retryable `503`; only if the database stays unavailable
+  do replicas fall back to per-instance limits. Concurrent-stream quotas remain
+  per instance.
 - Honor `Retry-After` on `429`/`503` responses. Preserve the same body and
   idempotency key across retries, including ambiguous publication failures.
 
@@ -390,7 +395,8 @@ are not production credentials or deployment settings.
 | `CLOUD_SQL_INSTANCE` | Enables the IAM-authorized private-IP Cloud SQL connector |
 | `DATABASE_MIGRATE` | False and required to remain false on staging/prod; use the migration job |
 | `IDEMPOTENCY_TTL` | `24h`; retry identities must survive the client's retry horizon |
-| `RATE_LIMIT_POINTS_PER_SECOND` / `RATE_LIMIT_BURST` | `10000` / `20000` per tenant per instance; key configuration can override |
+| `RATE_LIMIT_POINTS_PER_SECOND` / `RATE_LIMIT_BURST` | `10000` / `20000` per tenant; key configuration can override |
+| `RATE_LIMIT_SCOPE` / `RATE_LIMIT_LEASE` | `tenant` across replicas when a database is configured, else `instance` / `250ms` of rate per lease |
 | `HTTP_MAX_CONCURRENT` | 4 active non-stream data requests per API instance; excess receives `503` |
 | `AGGREGATOR_WINDOW_SIZE` / `AGGREGATOR_ALLOWED_LATENESS` | `1m` / `30s` |
 | `AGGREGATOR_MAX_SERIES` | 100,000 tracked series |
@@ -447,6 +453,7 @@ for its four operational alert policies.
 | `fluxgate_aggregate_tracked_series` | Cardinality pressure |
 | `fluxgate_aggregate_buffered_bytes` | Estimated accumulation memory |
 | `fluxgate_publish_batches_total` | Successful, failed, or shed publishes |
+| `fluxgate_ratelimit_leases_total` | Tenant-wide quota leases: `leased`, `error` (request answered 503 for retry), `fallback` (breaker open; per-instance limits in force) |
 | `fluxgate_consume_messages_total` | Accepted, retried, or rejected deliveries |
 | `fluxgate_resilience_breaker_state` | Closed, half-open, or open publish circuit |
 
@@ -492,8 +499,10 @@ Before production traffic, validate in a real staging project:
 For existing deployments, take a verified backup and stop old aggregators before
 migrations **0003 and 0005**. Migration **0007** corrects the retention-index
 collision in 0006; index creation can block writes, so schedule a maintenance
-window. Rerun runtime-role provisioning. Changing an image does not undo an
-incompatible schema change.
+window. Migration **0008** only adds the tenant quota table, but ingest needs its
+grants: rerun runtime-role provisioning before deploying an ingest image that
+uses tenant scope, or its leases fail and it meters per instance until you do.
+Changing an image does not undo an incompatible schema change.
 
 A database restore does not rewind Pub/Sub acknowledgments. Restore rollups,
 delivery claims, retry reservations, stream revisions, and migration records
@@ -541,7 +550,7 @@ go test -run '^$' -fuzz FuzzValidatePoint -fuzztime 60s ./internal/telemetry
 
 [Architecture decisions](docs/adr) cover the asynchronous pipeline, delivery
 ledger, JSON envelopes, fixed histograms, PostgreSQL, separate read/write
-services, and deferred tenant alerting.
+services, deferred tenant alerting, and tenant-wide quotas by leasing.
 
 | Path | Contents |
 | --- | --- |
